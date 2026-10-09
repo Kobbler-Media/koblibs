@@ -1,0 +1,30 @@
+[package]
+name = "kob-ebook"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "Native ebook conversion: source formats -> EPUB via boko, EPUB -> KEPUB via in-process koboSpan injection"
+license = "AGPL-3.0-only"
+
+[dependencies]
+# Fork of zacharydenton/boko, pinned to upstream master plus PR #25.
+#
+# 0.5.0 (the crates.io release) drops every KF8 stylesheet flow on AZW3/MOBI
+# import: it rewrites `kindle:flow:NNNN` refs into `styles/styleNNNN.css` but
+# never emits the flows, so every converted book links a stylesheet that is not
+# in the archive. Reflowable books lose their styling quietly; fixed-layout
+# books are destroyed, since their whole layout lives in `position:absolute`
+# rules there. Upstream fixed it one day after the release (b21f08e) and has
+# not cut another, and that fix alone is not enough: the served CSS still
+# carries unresolved `kindle:embed:` image refs (362 on the book that surfaced
+# this), which PR #25 resolves.
+#
+# Drop the fork when 0.6.0 ships with both.
+boko = { git = "https://github.com/tinyfiddler/boko", rev = "f0474821ea2d7b8076fd346fdf44102b73046cc9", default-features = false }
+quick-xml = "0.41"
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+thiserror = "2.0.20"
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"

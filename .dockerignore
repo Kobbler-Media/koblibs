@@ -1,0 +1,28 @@
+# Rust build artifacts (massive — target dirs are multi-GB each)
+**/target/
+
+# Node
+**/node_modules/
+
+# VCS + IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Claude / agent metadata — not needed in build context
+.claude/
+CLAUDE.md
+AGENTS.md
+
+# Docs
+README.md

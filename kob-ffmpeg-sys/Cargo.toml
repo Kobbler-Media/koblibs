@@ -1,0 +1,13 @@
+[package]
+name = "kob-ffmpeg-sys"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "Raw FFI bindings to FFmpeg libraries (libavformat, libavcodec, libavutil, libavfilter, libswresample, libswscale) generated via bindgen"
+license = "AGPL-3.0-only"
+links = "ffmpeg"
+
+[build-dependencies]
+bindgen = "0.72.1"
+cc = "1.4.2"
+pkg-config = "0.3.33"

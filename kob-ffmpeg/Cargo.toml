@@ -1,0 +1,23 @@
+[package]
+name = "kob-ffmpeg"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "Safe Rust wrappers and high-level operations for FFmpeg libraries"
+license = "AGPL-3.0-only"
+
+[dependencies]
+kob-ffmpeg-sys = { path = "../kob-ffmpeg-sys" }
+tracing = "0.1.44"
+tokio-util = "0.7.19"
+rayon = "1.12.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"], optional = true }
+
+[features]
+default = ["hybrid-io"]
+hybrid-io = ["reqwest"]
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tiny_http = "0.12.0"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

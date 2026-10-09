@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE job_status SET\n                status = $2,\n                updated_at = NOW(),\n                -- When transitioning to running, clear stale fields from\n                -- previous failure (e.g. NATS redelivery after orphan cleanup)\n                result = CASE\n                    WHEN $2 = 'running' THEN NULL\n                    ELSE COALESCE($3, result)\n                END,\n                error = CASE\n                    WHEN $2 = 'running' THEN NULL\n                    ELSE COALESCE($4, error)\n                END,\n                progress = CASE\n                    WHEN $2 = 'running' THEN 0\n                    ELSE progress\n                END,\n                started_at = CASE\n                    WHEN $2 = 'running' THEN $5\n                    ELSE started_at\n                END,\n                completed_at = CASE\n                    WHEN $2 = 'running' THEN NULL\n                    WHEN $2 IN ('completed', 'failed') THEN $5\n                    ELSE completed_at\n                END\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7c076c19c6c377c00b1c973ed7c54f75779afc284d4e841c4886b4e9c7fa9894"
+}

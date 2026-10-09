@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE job_status SET\n                progress = $2,\n                result = COALESCE($3, result),\n                updated_at = NOW()\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int2",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f3f6d1b5f1fec69372bb79abde31ddad7c414f96243da76bf33ec5a25f28472d"
+}

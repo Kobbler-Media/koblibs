@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                COUNT(*) FILTER (WHERE status = 'pending') as \"pending!\",\n                COUNT(*) FILTER (WHERE status = 'running') as \"running!\",\n                COUNT(*) FILTER (WHERE status = 'completed') as \"completed!\",\n                COUNT(*) FILTER (WHERE status = 'failed') as \"failed!\",\n                COUNT(*) FILTER (WHERE status = 'retrying') as \"retrying!\"\n            FROM job_status\n            WHERE created_at > NOW() - INTERVAL '24 hours'\n              AND (NOT $1 OR NOT (scheduled = true AND status IN ('completed', 'pending')))\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pending!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "running!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "completed!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "failed!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "retrying!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bool"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "78dfc60e496b6ed9e3179b42c65f0c7c9e0b4432c90f7bd2b9cfc61f016e3723"
+}

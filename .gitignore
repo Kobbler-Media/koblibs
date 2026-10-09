@@ -1,0 +1,46 @@
+# Rust
+**/target/
+**/*.rs.bk
+
+# Cargo.lock - not committed for libraries (per Rust convention)
+# Remove this line if you add binary crates
+**/Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+
+# Local agent context — machine/deploy specific, never public
+CLAUDE.local.md
+AGENTS.local.md
+.claude/
+.agents/
+
+# Local compose overrides
+docker-compose.override.yml
+docker-compose.local.yml
+
+# Node / Svelte build output
+dist/
+.svelte-kit/
+
+# Signing / credential material
+*.jks
+*.keystore
+*.p12
+*.pem

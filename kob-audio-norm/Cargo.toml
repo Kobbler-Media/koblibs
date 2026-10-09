@@ -1,0 +1,10 @@
+[package]
+name = "kob-audio-norm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "Pure-Rust peak loudness normalisation for voice-clone reference clips"
+license = "AGPL-3.0-only"
+
+[dependencies]
+thiserror = "2.0.20"

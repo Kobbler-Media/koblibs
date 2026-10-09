@@ -1,0 +1,23 @@
+# Shared NATS for local development
+# Used by both Kobbler and Kobload via kob_dev network
+
+networks:
+  kob_dev:
+    name: kob_dev
+
+services:
+  nats:
+    image: nats:2.14.2-alpine
+    container_name: nats
+    restart: unless-stopped
+    command: ["--jetstream", "--store_dir=/data", "-m", "8222", "--auth", "${NATS_TOKEN:-devtoken}"]
+    volumes:
+      - nats_data:/data
+    ports:
+      - "${NATS_PORT:-4222}:4222"
+      - "${NATS_MONITOR_PORT:-8222}:8222"
+    networks:
+      - kob_dev
+
+volumes:
+  nats_data:

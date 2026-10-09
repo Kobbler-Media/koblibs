@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  crates:
+    name: ${{ matrix.crate }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - kob-audio-norm
+          - kob-ebook
+          - kob-ffmpeg
+          - kob-gpu-gate
+          - kob-normalize
+          - kob-providers
+          - koblem-client
+          - nats-jobs
+    defaults:
+      run:
+        working-directory: ${{ matrix.crate }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: System build deps (ffmpeg headers + libclang for bindgen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libavformat-dev libavcodec-dev libavutil-dev libavfilter-dev \
+            libswresample-dev libswscale-dev libchromaprint-dev \
+            clang libclang-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.96"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test

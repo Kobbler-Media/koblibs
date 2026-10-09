@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO job_status (\n                id, job_type, status, payload, result, error, progress,\n                entity_type, entity_id, description, display, scheduled,\n                created_at, started_at, completed_at\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)\n            ON CONFLICT (id) DO UPDATE SET\n                status = EXCLUDED.status,\n                updated_at = NOW(),\n                -- When transitioning to running, clear stale fields from\n                -- previous failure (e.g. NATS redelivery after orphan cleanup)\n                result = CASE\n                    WHEN EXCLUDED.status = 'running' THEN NULL\n                    ELSE COALESCE(EXCLUDED.result, job_status.result)\n                END,\n                error = CASE\n                    WHEN EXCLUDED.status = 'running' THEN NULL\n                    ELSE COALESCE(EXCLUDED.error, job_status.error)\n                END,\n                progress = CASE\n                    WHEN EXCLUDED.status = 'running' THEN 0\n                    ELSE EXCLUDED.progress\n                END,\n                started_at = CASE\n                    WHEN EXCLUDED.status = 'running' THEN EXCLUDED.started_at\n                    ELSE job_status.started_at\n                END,\n                completed_at = CASE\n                    WHEN EXCLUDED.status = 'running' THEN NULL\n                    WHEN EXCLUDED.status IN ('completed', 'failed')\n                    THEN EXCLUDED.completed_at\n                    ELSE job_status.completed_at\n                END\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Jsonb",
+        "Text",
+        "Int2",
+        "Text",
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "Bool",
+        "Timestamptz",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "015cfb179168d3477dbad41fb5ca1be19d527b5d900d45d610bfe285d97987f0"
+}
