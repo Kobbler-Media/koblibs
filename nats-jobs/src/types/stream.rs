@@ -24,6 +24,27 @@ pub struct StreamSearchRequest {
     /// Whether to include uncached results (default: false).
     #[serde(default)]
     pub include_uncached: Option<bool>,
+    /// A release the caller already played for this title, or for the previous episode of
+    /// the same show. Ranking favours the same pack, then the same binge group, then the
+    /// same release group, within each availability tier.
+    #[serde(default)]
+    pub prefer: Option<StreamPreference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamPreference {
+    pub info_hash: String,
+    #[serde(default)]
+    pub file_id: Option<i32>,
+    #[serde(default)]
+    pub release_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamPlayback {
+    Worked,
+    Failed,
 }
 
 /// Source type of a stream option.
@@ -88,6 +109,11 @@ pub struct StreamOption {
     /// When this release was published.
     #[serde(default)]
     pub publish_date: Option<String>,
+    /// Torrentio's `behaviorHints.bingeGroup`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binge_group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playback: Option<StreamPlayback>,
 }
 
 /// Response from stream search.
@@ -98,6 +124,24 @@ pub struct StreamSearchResponse {
     /// Non-fatal errors encountered during search (e.g., one indexer timed out).
     #[serde(default)]
     pub errors: Vec<String>,
+}
+
+/// What happened when a client played (or failed to play) a resolved release.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamOutcomeReport {
+    /// Falls back to the first enabled provider when absent.
+    #[serde(default)]
+    pub debrid_provider_id: Option<Uuid>,
+    pub info_hash: String,
+    #[serde(default)]
+    pub file_id: Option<i32>,
+    pub ok: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub release_title: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 /// Request to resolve a stream option into a playable URL.
