@@ -29,6 +29,10 @@ pub struct StreamSearchRequest {
     /// same release group, within each availability tier.
     #[serde(default)]
     pub prefer: Option<StreamPreference>,
+    /// Preferred audio languages, most preferred first: English names ("italian") or
+    /// ISO 639-1/639-2 codes.
+    #[serde(default)]
+    pub audio_languages: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +42,15 @@ pub struct StreamPreference {
     pub file_id: Option<i32>,
     #[serde(default)]
     pub release_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamAvailability {
+    Ready,
+    Likely,
+    Unknown,
+    Uncached,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +127,13 @@ pub struct StreamOption {
     pub binge_group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playback: Option<StreamPlayback>,
+    /// `ready`: we resolved it on this account recently. `likely`: a third party reports it
+    /// cached. `uncached`: it would have to download first. `cached` is `availability == ready`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<StreamAvailability>,
+    /// Audio languages the release name lists, in its order, as ISO 639-1 codes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio_languages: Vec<String>,
 }
 
 /// Response from stream search.
@@ -161,6 +181,17 @@ pub struct StreamResolveRequest {
     /// Specific file to stream (for multi-file torrents).
     #[serde(default)]
     pub file_id: Option<i32>,
+    /// `warm` resolves ahead of a tap and yields to `user` resolves. Absent means `user`.
+    #[serde(default)]
+    pub priority: Option<StreamPriority>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamPriority {
+    #[default]
+    User,
+    Warm,
 }
 
 /// Response with a resolved direct stream URL.
@@ -190,4 +221,50 @@ pub struct StreamResolveResponse {
 
 fn default_cached() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn availability_is_lowercase_and_optional() {
+        for (value, json) in [
+            (StreamAvailability::Ready, "\"ready\""),
+            (StreamAvailability::Likely, "\"likely\""),
+            (StreamAvailability::Unknown, "\"unknown\""),
+            (StreamAvailability::Uncached, "\"uncached\""),
+        ] {
+            assert_eq!(serde_json::to_string(&value).unwrap(), json);
+        }
+        let option: StreamOption = serde_json::from_value(serde_json::json!({
+            "id": "x", "release_title": "t", "size": 1, "indexer": "i", "total_score": 0.0,
+            "match_score": 0.0, "quality_score": 0.0, "debrid_provider": "real_debrid",
+            "debrid_provider_id": Uuid::nil(), "cached": false, "source_type": "torrent"
+        }))
+        .unwrap();
+        assert_eq!(option.availability, None);
+        assert!(
+            !serde_json::to_string(&option)
+                .unwrap()
+                .contains("availability")
+        );
+        assert!(option.audio_languages.is_empty());
+    }
+
+    #[test]
+    fn new_request_fields_default_when_absent() {
+        let search: StreamSearchRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(search.audio_languages.is_empty());
+        let resolve: StreamResolveRequest =
+            serde_json::from_value(serde_json::json!({ "debrid_provider_id": Uuid::nil() }))
+                .unwrap();
+        assert_eq!(resolve.priority, None);
+        assert_eq!(resolve.priority.unwrap_or_default(), StreamPriority::User);
+        let warm: StreamResolveRequest = serde_json::from_value(
+            serde_json::json!({ "debrid_provider_id": Uuid::nil(), "priority": "warm" }),
+        )
+        .unwrap();
+        assert_eq!(warm.priority, Some(StreamPriority::Warm));
+    }
 }

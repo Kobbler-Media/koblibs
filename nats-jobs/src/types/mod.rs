@@ -41,9 +41,9 @@ pub use scoring::{
 };
 pub use search::{SearchRequest, SearchResponse, SearchResult};
 pub use stream::{
-    StreamFile, StreamOption, StreamOutcomeReport, StreamPlayback, StreamPreference,
-    StreamResolveRequest, StreamResolveResponse, StreamSearchRequest, StreamSearchResponse,
-    StreamSourceType,
+    StreamAvailability, StreamFile, StreamOption, StreamOutcomeReport, StreamPlayback,
+    StreamPreference, StreamPriority, StreamResolveRequest, StreamResolveResponse,
+    StreamSearchRequest, StreamSearchResponse, StreamSourceType,
 };
 pub use want::{ExcludedRelease, WantRequest, WantResponse, WantStatus};
 pub use watch::{
