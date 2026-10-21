@@ -62,6 +62,62 @@ pub struct MovieIdentifiers {
     pub imdb_id: Option<String>,
 }
 
+/// Flattened into the event, so the wire format stays flat.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SportEventMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub venue: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    /// ISO 3166-1 alpha-2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country_iso: Option<String>,
+    /// Each alias is a separate place name and must be matched on its own:
+    /// joined, "Emilia Romagna Misano" no longer word-matches `Italy.Misano`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_aliases: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_aliases: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub league_aliases: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teams: Option<Vec<SportTeam>>,
+    /// RFC 3339 instant the session starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifiers: Option<SportIdentifiers>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SportTeam {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SportIdentifiers {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thesportsdb_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sportarr_id: Option<String>,
+    /// The organiser's own id for the event (the MotoGP event uuid).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_id: Option<String>,
+}
+
 /// A reference to a specific episode within a season.
 ///
 /// Uses strings throughout to support daily shows ("2024-01-15"),
@@ -112,6 +168,8 @@ pub enum MediaWant {
         /// Publication date as ISO 8601 string (e.g. "2024-03-15").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         release_date: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alternate_titles: Option<Vec<String>>,
     },
     Audiobook {
         title: String,
@@ -128,6 +186,8 @@ pub enum MediaWant {
         /// Publication date as ISO 8601 string (e.g. "2024-03-15").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         release_date: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alternate_titles: Option<Vec<String>>,
     },
     TvEpisode {
         show_name: String,
@@ -241,11 +301,15 @@ pub enum MediaWant {
         /// Video height of the best library file (e.g. 1080, 2160).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         library_video_height: Option<i32>,
+        #[serde(flatten)]
+        meta: Box<SportEventMeta>,
     },
     SportSeason {
         league_name: String,
         /// Season year as string (e.g. "2025").
         season: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        league_aliases: Option<Vec<String>>,
         quality_profile_id: Option<Uuid>,
         quality_overrides: Option<QualityOverrides>,
     },
@@ -466,6 +530,265 @@ mod tests {
         match want {
             MediaWant::SportEvent { event_date, .. } => assert_eq!(event_date, None),
             _ => panic!("expected SportEvent"),
+        }
+    }
+
+    fn sport_event_with_every_alias_field() -> MediaWant {
+        MediaWant::SportEvent {
+            league_name: "MotoGP".into(),
+            season: "2026".into(),
+            round: Some(3),
+            location: Some("USA".into()),
+            session_type: Some("Race".into()),
+            event_title: Some("USA - Race".into()),
+            event_date: Some("2026-03-29".into()),
+            quality_profile_id: None,
+            quality_overrides: None,
+            in_library: None,
+            library_video_height: None,
+            meta: Box::new(SportEventMeta {
+                venue: Some("Circuit of the Americas".into()),
+                city: Some("Austin".into()),
+                region: Some("Texas".into()),
+                country: Some("United States".into()),
+                country_iso: Some("US".into()),
+                location_aliases: Some(vec!["COTA".into(), "Austin".into(), "Texas".into()]),
+                event_aliases: Some(vec!["Red Bull Grand Prix of The United States".into()]),
+                league_aliases: Some(vec!["Moto GP".into()]),
+                teams: Some(vec![SportTeam {
+                    name: "Ducati Lenovo Team".into(),
+                    short: Some("Ducati".into()),
+                    aliases: vec!["Ducati Corse".into()],
+                }]),
+                session_start: Some("2026-03-29T19:00:00Z".into()),
+                class: Some("MotoGP".into()),
+                identifiers: Some(SportIdentifiers {
+                    thesportsdb_id: Some("2424575".into()),
+                    sportarr_id: Some("ev-361462".into()),
+                    official_id: Some("782c929d-faaf-44e2-9d6f-0fde033855be".into()),
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn sport_event_alias_fields_default_to_none_on_old_payloads() {
+        let json = r#"{"kind":"sport_event","league_name":"SBK","season":"2026","round":12,"location":"Spain","session_type":"Race 1"}"#;
+        let want: MediaWant = serde_json::from_str(json).unwrap();
+        let MediaWant::SportEvent { meta, .. } = want else {
+            panic!("expected SportEvent");
+        };
+        let SportEventMeta {
+            venue,
+            city,
+            region,
+            country,
+            country_iso,
+            location_aliases,
+            event_aliases,
+            league_aliases,
+            teams,
+            session_start,
+            class,
+            identifiers,
+        } = *meta;
+        assert_eq!(venue, None);
+        assert_eq!(city, None);
+        assert_eq!(region, None);
+        assert_eq!(country, None);
+        assert_eq!(country_iso, None);
+        assert_eq!(location_aliases, None);
+        assert_eq!(event_aliases, None);
+        assert_eq!(league_aliases, None);
+        assert!(teams.is_none());
+        assert_eq!(session_start, None);
+        assert_eq!(class, None);
+        assert!(identifiers.is_none());
+    }
+
+    #[test]
+    fn sport_event_roundtrips_every_alias_field() {
+        let json = serde_json::to_value(sport_event_with_every_alias_field()).unwrap();
+        let decoded: MediaWant = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), json);
+        assert_eq!(json["location_aliases"][0], "COTA");
+        assert_eq!(json["teams"][0]["short"], "Ducati");
+        assert_eq!(
+            json["identifiers"]["official_id"],
+            "782c929d-faaf-44e2-9d6f-0fde033855be"
+        );
+        assert_eq!(json["class"], "MotoGP");
+    }
+
+    #[test]
+    fn sport_event_omits_unset_alias_fields() {
+        let want = MediaWant::SportEvent {
+            league_name: "SBK".into(),
+            season: "2026".into(),
+            round: None,
+            location: None,
+            session_type: None,
+            event_title: None,
+            event_date: None,
+            quality_profile_id: None,
+            quality_overrides: None,
+            in_library: None,
+            library_video_height: None,
+            meta: Box::default(),
+        };
+        let json = serde_json::to_value(want).unwrap();
+        let keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for absent in [
+            "venue",
+            "city",
+            "region",
+            "country",
+            "country_iso",
+            "location_aliases",
+            "event_aliases",
+            "league_aliases",
+            "teams",
+            "session_start",
+            "class",
+            "identifiers",
+        ] {
+            assert!(!keys.contains(&absent), "{absent} serialised while unset");
+        }
+    }
+
+    /// What a consumer built before these fields existed sees: the variant as
+    /// it was, which must still accept a payload carrying all of them.
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum PreAliasWant {
+        SportEvent {
+            league_name: String,
+            season: String,
+            round: Option<u32>,
+            location: Option<String>,
+            session_type: Option<String>,
+        },
+        SportSeason {
+            league_name: String,
+            season: String,
+        },
+        Book {
+            title: String,
+        },
+        Audiobook {
+            title: String,
+        },
+    }
+
+    #[test]
+    fn pre_alias_consumers_accept_alias_payloads() {
+        let json = serde_json::to_value(sport_event_with_every_alias_field()).unwrap();
+        let PreAliasWant::SportEvent {
+            league_name,
+            season,
+            round,
+            location,
+            session_type,
+        } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("expected SportEvent");
+        };
+        assert_eq!(league_name, "MotoGP");
+        assert_eq!(season, "2026");
+        assert_eq!(round, Some(3));
+        assert_eq!(location.as_deref(), Some("USA"));
+        assert_eq!(session_type.as_deref(), Some("Race"));
+
+        let season = MediaWant::SportSeason {
+            league_name: "SBK".into(),
+            season: "2026".into(),
+            league_aliases: Some(vec!["WSBK".into()]),
+            quality_profile_id: None,
+            quality_overrides: None,
+        };
+        let PreAliasWant::SportSeason {
+            league_name,
+            season,
+        } = serde_json::from_value(serde_json::to_value(season).unwrap()).unwrap()
+        else {
+            panic!("expected SportSeason");
+        };
+        assert_eq!((league_name.as_str(), season.as_str()), ("SBK", "2026"));
+
+        for kind in ["book", "audiobook"] {
+            let json = serde_json::json!({
+                "kind": kind,
+                "title": "The Fellowship of the Ring",
+                "alternate_titles": ["Fellowship of the Ring"],
+            });
+            let (PreAliasWant::Book { title } | PreAliasWant::Audiobook { title }) =
+                serde_json::from_value(json).unwrap()
+            else {
+                panic!("expected {kind}");
+            };
+            assert_eq!(title, "The Fellowship of the Ring");
+        }
+    }
+
+    #[test]
+    fn sport_season_league_aliases_roundtrip_and_default() {
+        let old: MediaWant =
+            serde_json::from_str(r#"{"kind":"sport_season","league_name":"SBK","season":"2026"}"#)
+                .unwrap();
+        assert!(matches!(
+            old,
+            MediaWant::SportSeason {
+                league_aliases: None,
+                ..
+            }
+        ));
+        let want = MediaWant::SportSeason {
+            league_name: "SBK".into(),
+            season: "2026".into(),
+            league_aliases: Some(vec!["WSBK".into(), "World Superbike".into()]),
+            quality_profile_id: None,
+            quality_overrides: None,
+        };
+        let decoded: MediaWant =
+            serde_json::from_value(serde_json::to_value(want).unwrap()).unwrap();
+        let MediaWant::SportSeason { league_aliases, .. } = decoded else {
+            panic!("expected SportSeason");
+        };
+        assert_eq!(
+            league_aliases,
+            Some(vec!["WSBK".into(), "World Superbike".into()])
+        );
+    }
+
+    #[test]
+    fn book_alternate_titles_roundtrip_and_default() {
+        for kind in ["book", "audiobook"] {
+            let old: MediaWant =
+                serde_json::from_value(serde_json::json!({"kind": kind, "title": "Dune"})).unwrap();
+            let json = serde_json::to_value(&old).unwrap();
+            assert!(json.get("alternate_titles").is_none(), "{kind}");
+
+            let with = serde_json::json!({
+                "kind": kind,
+                "title": "Dune",
+                "alternate_titles": ["Dune (Dune Chronicles 1)"],
+            });
+            let decoded: MediaWant = serde_json::from_value(with.clone()).unwrap();
+            let titles = match decoded {
+                MediaWant::Book {
+                    alternate_titles, ..
+                }
+                | MediaWant::Audiobook {
+                    alternate_titles, ..
+                } => alternate_titles,
+                _ => panic!("expected {kind}"),
+            };
+            assert_eq!(titles, Some(vec!["Dune (Dune Chronicles 1)".into()]));
         }
     }
 }

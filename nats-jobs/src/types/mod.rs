@@ -29,7 +29,7 @@ pub use ingest::{IngestResultEvent, IngestResultStatus};
 pub use job::{Job, JobContext, JobStatus, JobStatusUpdate};
 pub use media::{
     BookIdentifiers, EpisodeRef, MediaKind, MediaWant, MovieIdentifiers, QualityOverrides,
-    TvIdentifiers,
+    SportEventMeta, SportIdentifiers, SportTeam, TvIdentifiers,
 };
 pub use parsed::{
     AudiobookParsed, BookParsed, GameParsed, MovieParsed, MusicParsed, ParsedMedia, ParsedQuality,

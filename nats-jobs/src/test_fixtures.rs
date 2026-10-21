@@ -82,6 +82,7 @@ pub fn sample_want_request() -> WantRequest {
             series: Some("Mistborn".to_string()),
             series_position: Some("1".to_string()),
             release_date: None,
+            alternate_titles: None,
         }),
         upgrade_allowed: None,
         manual: false,
@@ -182,6 +183,7 @@ pub fn sample_search_request() -> SearchRequest {
             series: None,
             series_position: None,
             release_date: None,
+            alternate_titles: None,
         }),
     }
 }
@@ -226,6 +228,7 @@ pub fn sample_watch_pattern_upsert() -> WatchPatternUpsert {
             series: None,
             series_position: None,
             release_date: None,
+            alternate_titles: None,
         }),
         match_targets: vec![],
         match_mode: "fuzzy".to_string(),
@@ -648,6 +651,7 @@ mod tests {
             series: None,
             series_position: None,
             release_date: None,
+            alternate_titles: None,
         };
         let json = serde_json::to_value(&want).unwrap();
         assert_eq!(json["kind"], "book");
