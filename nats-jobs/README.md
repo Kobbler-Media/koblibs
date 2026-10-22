@@ -153,8 +153,8 @@ CREATE TABLE job_status (
 
 ### Kobbler → Kobload
 
-Watch pattern sync via jobs:
-- `jobs.kobload.watch_pattern_upsert`
+Wants and watch patterns via jobs:
+- `jobs.kobload.want_request` (creates or updates the want's pattern)
 - `jobs.kobload.watch_pattern_delete`
 
 ### Kobload → Kobbler

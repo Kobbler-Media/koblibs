@@ -23,7 +23,7 @@ pub use file_classification::{
 };
 pub use http::{
     CreateDownloadRequest, CreateDownloadResponse, SearchAndDownloadRequest,
-    SearchAndDownloadResponse, WatchSyncItem, WatchSyncRequest, WatchSyncResponse,
+    SearchAndDownloadResponse,
 };
 pub use ingest::{IngestResultEvent, IngestResultStatus};
 pub use job::{Job, JobContext, JobStatus, JobStatusUpdate};
@@ -48,7 +48,7 @@ pub use stream::{
 pub use want::{ExcludedRelease, WantRequest, WantResponse, WantStatus};
 pub use watch::{
     GrabHeldMatch, MatchTarget, SearchPatternNow, WatchMatchedEvent, WatchPatternDelete,
-    WatchPatternDeletedEvent, WatchPatternUpsert,
+    WatchPatternDeletedEvent,
 };
 pub use watch_responses::{
     EpisodeProgress, ListWatchMatchesResponse, ListWatchPatternsResponse, WatchMatchResponse,

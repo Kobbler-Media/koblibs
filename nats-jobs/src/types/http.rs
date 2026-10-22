@@ -39,62 +39,6 @@ pub struct CreateDownloadResponse {
 }
 
 // ============================================================================
-// Watch Sync
-// ============================================================================
-
-/// Request to sync watch patterns.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct WatchSyncRequest {
-    pub source_system: String,
-    pub items: Vec<WatchSyncItem>,
-}
-
-fn default_upgrade_allowed() -> bool {
-    true
-}
-
-/// A single watch pattern to sync.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct WatchSyncItem {
-    pub source_id: String,
-    pub callback_url: String,
-    #[serde(default)]
-    pub patterns: Vec<String>,
-    /// Structured media request (preferred for normal flows).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub media_want: Option<MediaWant>,
-    /// Match targets for scoring results.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub match_targets: Vec<MatchTarget>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub match_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_score: Option<f64>,
-    pub auto_download: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-    pub enabled: bool,
-    /// Whether quality upgrades are allowed for this pattern (default: true).
-    #[serde(default = "default_upgrade_allowed")]
-    pub upgrade_allowed: bool,
-    /// Don't backlog-search before this date (ISO 8601). NULL means search immediately.
-    /// RSS matching is unaffected — only backlog search is gated.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub search_not_before: Option<String>,
-}
-
-/// Response from watch sync.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct WatchSyncResponse {
-    pub created: i32,
-    pub updated: i32,
-    pub deleted: i32,
-}
-
-// ============================================================================
 // Search and Download
 // ============================================================================
 

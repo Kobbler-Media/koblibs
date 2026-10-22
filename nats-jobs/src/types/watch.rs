@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::media::MediaWant;
 use super::scoring::MatchedTarget;
 
 /// A target to score search results against.
@@ -18,45 +17,6 @@ pub struct MatchTarget {
     /// Structured identification of what this target represents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_target: Option<MatchedTarget>,
-}
-
-/// Watch pattern upsert request (Kobbler -> Kobload).
-/// Patterns are identified by (source_system, source_id) - Kobload manages internal IDs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct WatchPatternUpsert {
-    pub source_system: String,
-    pub source_id: String,
-    pub callback_url: String,
-    /// Patterns for manual/advanced search. Prefer MediaWant for normal flows.
-    #[serde(default)]
-    pub patterns: Vec<String>,
-    /// Structured media request (preferred for normal flows)
-    #[serde(default)]
-    pub media_want: Option<MediaWant>,
-    /// Match targets for improved scoring
-    #[serde(default)]
-    pub match_targets: Vec<MatchTarget>,
-    #[serde(default = "default_match_mode")]
-    pub match_mode: String,
-    pub min_score: Option<f64>,
-    #[serde(default = "default_auto_download")]
-    pub auto_download: bool,
-    pub metadata: Option<serde_json::Value>,
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-}
-
-fn default_match_mode() -> String {
-    "fuzzy".to_string()
-}
-
-fn default_auto_download() -> bool {
-    true
-}
-
-fn default_enabled() -> bool {
-    true
 }
 
 /// Watch pattern deletion request (Kobbler -> Kobload).

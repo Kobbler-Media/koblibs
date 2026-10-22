@@ -74,8 +74,7 @@ pub use types::{
     StreamSearchRequest, StreamSearchResponse, StreamSourceType, StructuralRejectReason,
     SubtitleMetadata, TvIdentifiers, TvParsed, VideoMetadata, WantRequest, WantResponse,
     WantStatus, WatchMatchResponse, WatchMatchedEvent, WatchPatternDelete,
-    WatchPatternDeletedEvent, WatchPatternDetailResponse, WatchPatternResponse, WatchPatternUpsert,
-    WatchSyncItem, WatchSyncRequest, WatchSyncResponse, XxxParsed,
+    WatchPatternDeletedEvent, WatchPatternDetailResponse, WatchPatternResponse, XxxParsed,
 };
 pub use worker::{
     JobError, JobHandler, JobStatusChange, JobWorker, ProgressReporter, StatusCallback,

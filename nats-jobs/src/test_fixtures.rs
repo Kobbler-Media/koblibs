@@ -9,7 +9,6 @@ use crate::{
     DownloadFileInfo, MatchTarget, MediaWant, ProcessedReleaseDto, SearchAndDownloadRequest,
     SearchAndDownloadResponse, SearchRequest, SearchResponse, SearchResult, WantRequest,
     WantResponse, WantStatus, WatchMatchedEvent, WatchPatternDelete, WatchPatternDeletedEvent,
-    WatchPatternUpsert, WatchSyncItem, WatchSyncRequest, WatchSyncResponse,
 };
 
 /// Fixed UUIDs for deterministic test fixtures.
@@ -212,37 +211,6 @@ pub fn sample_search_response() -> SearchResponse {
     }
 }
 
-/// Sample WatchPatternUpsert (Kobbler -> Kobload via NATS).
-pub fn sample_watch_pattern_upsert() -> WatchPatternUpsert {
-    WatchPatternUpsert {
-        source_system: "kobbler".to_string(),
-        source_id: ids::book_id().to_string(),
-        callback_url: "http://kobbler:6766/api/v1/admin/ingest/kobload/test-token".to_string(),
-        patterns: vec![],
-        media_want: Some(MediaWant::Book {
-            title: "Mistborn: The Final Empire".to_string(),
-            author: Some("Brandon Sanderson".to_string()),
-            isbn: Some("9780765311788".to_string()),
-            format_preferences: vec!["epub".to_string()],
-            identifiers: None,
-            series: None,
-            series_position: None,
-            release_date: None,
-            alternate_titles: None,
-        }),
-        match_targets: vec![],
-        match_mode: "fuzzy".to_string(),
-        min_score: Some(0.75),
-        auto_download: true,
-        metadata: Some(serde_json::json!({
-            "book_id": ids::book_id(),
-            "title": "Mistborn: The Final Empire",
-            "author": "Brandon Sanderson"
-        })),
-        enabled: true,
-    }
-}
-
 /// Sample WatchPatternDeletedEvent (Kobload -> Kobbler via NATS).
 pub fn sample_watch_pattern_deleted_event() -> WatchPatternDeletedEvent {
     WatchPatternDeletedEvent {
@@ -395,36 +363,6 @@ pub fn sample_create_download_response() -> CreateDownloadResponse {
     }
 }
 
-/// Sample WatchSyncRequest.
-pub fn sample_watch_sync_request() -> WatchSyncRequest {
-    WatchSyncRequest {
-        source_system: "kobbler".to_string(),
-        items: vec![WatchSyncItem {
-            source_id: ids::book_id().to_string(),
-            callback_url: "http://kobbler:6766/api/v1/admin/ingest/kobload/test-token".to_string(),
-            patterns: vec!["Brandon Sanderson Mistborn".to_string()],
-            media_want: None,
-            match_targets: vec![],
-            match_mode: Some("fuzzy".to_string()),
-            min_score: Some(0.75),
-            auto_download: true,
-            metadata: None,
-            enabled: true,
-            upgrade_allowed: true,
-            search_not_before: None,
-        }],
-    }
-}
-
-/// Sample WatchSyncResponse.
-pub fn sample_watch_sync_response() -> WatchSyncResponse {
-    WatchSyncResponse {
-        created: 1,
-        updated: 0,
-        deleted: 0,
-    }
-}
-
 /// Sample SearchAndDownloadRequest.
 pub fn sample_search_and_download_request() -> SearchAndDownloadRequest {
     SearchAndDownloadRequest {
@@ -516,15 +454,6 @@ mod tests {
         let deserialized: SearchResponse = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized.results.len(), 1);
         assert_eq!(deserialized.results[0].guid, "abc-123");
-    }
-
-    #[test]
-    fn watch_pattern_upsert_round_trip() {
-        let upsert = sample_watch_pattern_upsert();
-        let json = serde_json::to_value(&upsert).unwrap();
-        let deserialized: WatchPatternUpsert = serde_json::from_value(json).unwrap();
-        assert_eq!(deserialized.source_system, "kobbler");
-        assert!(deserialized.media_want.is_some());
     }
 
     #[test]
@@ -676,19 +605,6 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         let deserialized: CreateDownloadRequest = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized.protocol, "usenet");
-    }
-
-    #[test]
-    fn watch_sync_round_trip() {
-        let req = sample_watch_sync_request();
-        let json = serde_json::to_value(&req).unwrap();
-        let deserialized: WatchSyncRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(deserialized.items.len(), 1);
-
-        let resp = sample_watch_sync_response();
-        let json = serde_json::to_value(&resp).unwrap();
-        let deserialized: WatchSyncResponse = serde_json::from_value(json).unwrap();
-        assert_eq!(deserialized.created, 1);
     }
 
     #[test]
