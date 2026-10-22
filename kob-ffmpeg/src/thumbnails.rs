@@ -71,6 +71,7 @@ fn encode_frame_as_jpeg(frame: &Frame, quality: i32) -> Result<(Vec<u8>, i32, i3
         quality: Some(quality.clamp(1, 31)),
         hw_frames_ctx: None,
         sample_aspect_ratio: None,
+        frame_rate: None,
         color: Default::default(),
         options: Vec::new(),
     })?;

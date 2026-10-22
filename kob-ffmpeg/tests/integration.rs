@@ -414,6 +414,45 @@ fn test_transcode_to_hls() {
     assert!(dir.path().join("init.mp4").exists());
 }
 
+/// MPEG-TS carries a 1/90000 time base. An encoder told nothing else takes that as its
+/// frame rate, and x264's zero-latency rate control then budgets bits as if 90000 frames
+/// shared each second: the live DVR buffer came out a few hundred bytes per frame, grey.
+#[test]
+fn test_transcode_to_hls_from_mpegts_spends_its_bitrate() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("broadcast.ts");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-f", "lavfi", "-i", "testsrc2=duration=3:size=640x360:rate=50",
+            "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "4M", "-f", "mpegts", "-y",
+        ])
+        .arg(&src)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("ffmpeg must be available");
+    assert!(status.success());
+
+    let out = dir.path().join("hls");
+    let config = kob_ffmpeg::transcode::HlsConfig::new(&out)
+        .video_encoder("libx264")
+        .video_bitrate(2_000_000)
+        .preset("veryfast")
+        .tune("zerolatency")
+        .audio_encoder("aac")
+        .segment_duration(1.0);
+    kob_ffmpeg::transcode::transcode_to_hls(&src, &config).unwrap();
+
+    let bytes: u64 = std::fs::read_dir(&out)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".m4s"))
+        .map(|e| e.metadata().unwrap().len())
+        .sum();
+    // 3 s at a 2 Mbit/s target is ~750 KB; the 90000 fps budget left it near 10 KB.
+    assert!(bytes > 200_000, "3 s of video encoded to only {bytes} bytes");
+}
+
 #[test]
 fn test_transcode_to_hls_with_zero_sample_rate_codec_params() {
     // Repro for live-IPTV streams (LATM-encapsulated AAC over MPEG-TS) where
@@ -559,6 +598,7 @@ fn test_mkv_output_basic() {
         quality: None,
         hw_frames_ctx: None,
         sample_aspect_ratio: None,
+        frame_rate: None,
         color: Default::default(),
         options: Vec::new(),
     })

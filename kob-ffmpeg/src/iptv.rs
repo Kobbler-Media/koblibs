@@ -96,6 +96,7 @@ pub fn record_and_encode(
             quality: None,
             hw_frames_ctx: None,
             sample_aspect_ratio: None,
+            frame_rate: crate::codec::encoder::output_frame_rate(stream.r_frame_rate(), false),
             color: unsafe {
                 crate::filter::graph::VideoColorInfo::from_codec_parameters(
                     stream.codec_parameters(),
@@ -706,6 +707,7 @@ pub fn transcode_to_file(
             quality: None,
             hw_frames_ctx: None,
             sample_aspect_ratio: None,
+            frame_rate: crate::codec::encoder::output_frame_rate(stream.r_frame_rate(), false),
             color: unsafe {
                 crate::filter::graph::VideoColorInfo::from_codec_parameters(
                     stream.codec_parameters(),
@@ -1146,6 +1148,7 @@ mod tests {
             quality: None,
             hw_frames_ctx: None,
             sample_aspect_ratio: None,
+            frame_rate: None,
             color: Default::default(),
             options: Vec::new(),
         })

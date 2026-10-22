@@ -112,10 +112,25 @@ pub struct VideoEncoderConfig {
     /// is right for every square-pixel source. DVB SD is 720x576 at 64:45, so
     /// dropping it renders a 16:9 broadcast as 5:4.
     pub sample_aspect_ratio: Option<(i32, i32)>,
+    /// Frames per second, as a rational. Required whenever `time_base` is a
+    /// container's clock rather than a frame rate: MPEG-TS is 1/90000, and an
+    /// encoder left to infer its rate from that budgets bits as if 90000
+    /// frames shared each second, which leaves ~55 bits a frame.
+    pub frame_rate: Option<(i32, i32)>,
     /// Codec-private options (`preset`, `tune`, `crf`, …) applied to the
     /// encoder's `priv_data` at open time. Applied last, so a caller entry
     /// overrides the built-in HW-encoder defaults below.
     pub options: Vec<(String, String)>,
+}
+
+/// The output frame rate for a stream's `r_frame_rate`, doubled when
+/// deinterlacing emits one frame per field. `None` when the stream has none.
+pub fn output_frame_rate(r_frame_rate: ffi::AVRational, frame_per_field: bool) -> Option<(i32, i32)> {
+    if r_frame_rate.num <= 0 || r_frame_rate.den <= 0 {
+        return None;
+    }
+    let num = if frame_per_field { r_frame_rate.num * 2 } else { r_frame_rate.num };
+    Some((num, r_frame_rate.den))
 }
 
 impl Encoder {
@@ -214,6 +229,9 @@ impl Encoder {
             if let Some(q) = config.quality {
                 (*ptr).qmin = q;
                 (*ptr).qmax = q;
+            }
+            if let Some((num, den)) = config.frame_rate {
+                (*ptr).framerate = ffi::AVRational { num, den };
             }
             if let Some((num, den)) = config.sample_aspect_ratio {
                 (*ptr).sample_aspect_ratio = ffi::AVRational { num, den };
