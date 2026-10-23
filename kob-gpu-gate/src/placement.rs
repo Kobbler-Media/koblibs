@@ -16,7 +16,9 @@
 //!   instantaneous usage: `budget_free = total − Σ(peak of resident placements)`.
 //!   Admission additionally respects a **measured** free-VRAM floor when koblem
 //!   has pushed one (`set_measured_free`) so an under-set peak or a non-gate VRAM
-//!   consumer can't be scheduled over: `free = min(budget_free, measured − headroom)`.
+//!   consumer can't be scheduled over: `free = min(budget_free, measured)`. No
+//!   headroom is taken off the measurement: each service's `peak_mb` is already
+//!   padded, so a second margin only refuses work that fits.
 //! - Eviction is **named + relational, not numeric**: each service declares, by
 //!   service name, who may evict it (`evictable_by`).
 //! - Each [`Placement`] carries a [`PlacementSource`] and a `holders` refcount.
@@ -35,11 +37,6 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::ServiceKind;
-
-/// Safety headroom subtracted from a card's *measured* free VRAM before it counts
-/// as admittable, so we never fill a card to the literal byte (allocator slack,
-/// fragmentation, the driver's own working set).
-const MEASURED_HEADROOM_MB: i64 = 512;
 
 /// A physical GPU the scheduler may place work on. Seeded from koblem's `gpu_cards`
 /// table; `enabled=false` removes it from placement and drains it (the operator's
@@ -958,7 +955,7 @@ impl Inner {
     }
 
     /// Effective free VRAM for admission: the pure budget (`total − Σ peaks`)
-    /// clamped by the measured real free (minus headroom) when a measurement
+    /// clamped by the measured real free when a measurement
     /// exists. Disabled / unknown card → 0 free.
     fn free_mb(&self, uuid: &str) -> i64 {
         let budget_free = match self.card(uuid) {
@@ -966,7 +963,7 @@ impl Inner {
             _ => return 0,
         };
         match self.measured_free_mb.get(uuid) {
-            Some(&measured) => budget_free.min(measured as i64 - MEASURED_HEADROOM_MB),
+            Some(&measured) => budget_free.min(measured as i64),
             None => budget_free,
         }
     }
@@ -1471,6 +1468,12 @@ mod tests {
         // Budget says 12000 free, but the card really only has 1000 MiB free.
         p.set_measured_free(A, 1000);
         assert_eq!(p.try_place(ServiceKind::Flux).unwrap().card_uuid, None);
+        // Measured free exactly equal to the peak admits: the peak is the padding.
+        p.set_measured_free(A, 7500);
+        assert_eq!(
+            p.try_place(ServiceKind::Flux).unwrap().card_uuid.as_deref(),
+            Some(A)
+        );
         // Measurement clears → pure budget admits.
         p.set_measured_free(A, 12000);
         assert_eq!(
@@ -1633,7 +1636,7 @@ mod tests {
     #[test]
     fn hold_composes_with_the_measured_clamp() {
         let p = held();
-        p.set_measured_free(A, 3000); // 3000 − 512 = 2488, under the 3300 budget
+        p.set_measured_free(A, 2500); // under the 3300 budget
         assert_eq!(p.try_place(ServiceKind::Tts).unwrap().card_uuid, None);
         assert_eq!(
             p.try_place(ServiceKind::Stt).unwrap().card_uuid.as_deref(),
