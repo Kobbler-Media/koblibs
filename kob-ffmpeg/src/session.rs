@@ -1357,9 +1357,7 @@ fn run_generation(
     })?;
 
     let src_interlaced = video_idx.is_some_and(|v| unsafe {
-        crate::filter::graph::codec_parameters_interlaced(
-            in_ctx.stream(v).unwrap().codec_parameters(),
-        )
+        crate::interlace::codec_parameters_interlaced(in_ctx.stream(v).unwrap().codec_parameters())
     });
     let deint_filter = config.deinterlace.filter_for(src_interlaced);
 

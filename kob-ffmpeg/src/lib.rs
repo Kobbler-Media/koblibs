@@ -47,6 +47,7 @@ pub mod chromaprint;
 pub mod detect;
 #[cfg(feature = "hybrid-io")]
 pub mod hybrid_io;
+pub mod interlace;
 pub mod iptv;
 pub mod probe;
 pub mod remux;

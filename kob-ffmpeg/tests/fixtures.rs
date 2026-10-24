@@ -387,3 +387,26 @@ pub fn ac3_channel_change_mkv() -> PathBuf {
         })
         .clone()
 }
+
+/// One second of 320x240 H.264 at 25 fps, encoded with the given x264 params.
+/// `fake-interlaced=1` gives the "1080i film" case: a field-coded sequence header
+/// over progressive frames, whose container and SEI both say progressive.
+pub fn x264_clip(file_name: &str, x264_params: &str) -> PathBuf {
+    let path = fixture_dir().join(file_name);
+    run_ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=duration=1:size=320x240:rate=25",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-x264-params",
+            x264_params,
+        ],
+        &path,
+    );
+    path
+}

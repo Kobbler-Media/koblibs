@@ -3345,6 +3345,48 @@ fn test_deinterlace_auto_dvr_window() {
 }
 
 #[test]
+fn test_probe_reads_field_coding_from_the_sequence_header() {
+    let cases = [
+        ("fake.mkv", "fake-interlaced=1:pic-struct=1", true),
+        ("fake.ts", "fake-interlaced=1:pic-struct=1", true),
+        ("fake.mp4", "fake-interlaced=1", true),
+        ("poc0.mkv", "fake-interlaced=1:bframes=3", true),
+        ("poc0_progressive.mkv", "bframes=3", false),
+        ("plain.ts", "keyint=25", false),
+    ];
+    for (name, params, interlaced) in cases {
+        let clip = fixtures::x264_clip(name, params);
+        let probed = kob_ffmpeg::probe::probe(&clip).unwrap();
+        assert_eq!(
+            probed.video_streams[0].is_interlaced, interlaced,
+            "{name} ({params})"
+        );
+    }
+    assert!(
+        kob_ffmpeg::probe::probe(&fixtures::interlaced_ts())
+            .unwrap()
+            .video_streams[0]
+            .is_interlaced
+    );
+}
+
+#[test]
+fn test_deinterlace_auto_reencodes_a_field_coded_progressive_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = kob_ffmpeg::transcode::HlsConfig::new(dir.path())
+        .video_encoder("libx264")
+        .segment_duration(1.0)
+        .deinterlace(kob_ffmpeg::filter::graph::Deinterlace::Auto);
+    let clip = fixtures::x264_clip("fake_auto.mkv", "fake-interlaced=1:pic-struct=1");
+    let result = kob_ffmpeg::transcode::transcode_to_hls(&clip, &config).unwrap();
+    let fps = probe_output_fps(&result.playlist_path);
+    assert!(
+        (fps - 50.0).abs() < 0.5,
+        "expected 50 fps output, got {fps}"
+    );
+}
+
+#[test]
 fn test_deinterlace_none_leaves_frame_rate_alone() {
     let input = fixtures::interlaced_ts();
     let dir = tempfile::tempdir().unwrap();

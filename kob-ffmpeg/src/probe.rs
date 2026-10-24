@@ -270,7 +270,6 @@ fn extract_video_stream(stream: &crate::format::input::Stream<'_>) -> Option<Vid
         bits_per_raw,
         color_trc,
         color_pri,
-        field_order,
     ) = unsafe {
         let p = &*params;
         (
@@ -283,7 +282,6 @@ fn extract_video_stream(stream: &crate::format::input::Stream<'_>) -> Option<Vid
             p.bits_per_raw_sample,
             p.color_trc,
             p.color_primaries,
-            p.field_order,
         )
     };
 
@@ -358,7 +356,7 @@ fn extract_video_stream(stream: &crate::format::input::Stream<'_>) -> Option<Vid
         None
     };
 
-    let is_interlaced = field_order_is_interlaced(field_order);
+    let is_interlaced = unsafe { crate::interlace::codec_parameters_interlaced(params) };
 
     Some(VideoStream {
         index: stream.index(),
@@ -377,13 +375,6 @@ fn extract_video_stream(stream: &crate::format::input::Stream<'_>) -> Option<Vid
         hdr_format,
         is_interlaced,
     })
-}
-
-pub fn field_order_is_interlaced(field_order: ffi::AVFieldOrder) -> bool {
-    !matches!(
-        field_order,
-        ffi::AV_FIELD_PROGRESSIVE | ffi::AV_FIELD_UNKNOWN
-    )
 }
 
 fn extract_audio_stream(stream: &crate::format::input::Stream<'_>) -> AudioStream {

@@ -130,15 +130,6 @@ impl Deinterlace {
     }
 }
 
-/// # Safety
-/// `params` must be a valid (or null) `AVCodecParameters` pointer.
-pub unsafe fn codec_parameters_interlaced(params: *const ffi::AVCodecParameters) -> bool {
-    if params.is_null() {
-        return false;
-    }
-    crate::probe::field_order_is_interlaced(unsafe { (*params).field_order })
-}
-
 /// Auto-rotation derived from an `AV_PKT_DATA_DISPLAYMATRIX` side data on a
 /// stream — describes the filter chain that needs to be inserted *before* the
 /// encoder so output pixels are in the intended landscape/portrait orientation.
