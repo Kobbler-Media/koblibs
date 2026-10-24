@@ -125,11 +125,18 @@ pub struct VideoEncoderConfig {
 
 /// The output frame rate for a stream's `r_frame_rate`, doubled when
 /// deinterlacing emits one frame per field. `None` when the stream has none.
-pub fn output_frame_rate(r_frame_rate: ffi::AVRational, frame_per_field: bool) -> Option<(i32, i32)> {
+pub fn output_frame_rate(
+    r_frame_rate: ffi::AVRational,
+    frame_per_field: bool,
+) -> Option<(i32, i32)> {
     if r_frame_rate.num <= 0 || r_frame_rate.den <= 0 {
         return None;
     }
-    let num = if frame_per_field { r_frame_rate.num * 2 } else { r_frame_rate.num };
+    let num = if frame_per_field {
+        r_frame_rate.num * 2
+    } else {
+        r_frame_rate.num
+    };
     Some((num, r_frame_rate.den))
 }
 

@@ -485,7 +485,10 @@ fn transcode_to_hls_inner(
                 quality: None,
                 hw_frames_ctx: enc_hw_frames,
                 sample_aspect_ratio: Some((src_sar.num, src_sar.den)),
-                frame_rate: crate::codec::encoder::output_frame_rate(stream.r_frame_rate(), deint_filter.is_some()),
+                frame_rate: crate::codec::encoder::output_frame_rate(
+                    stream.r_frame_rate(),
+                    deint_filter.is_some(),
+                ),
                 color: unsafe {
                     crate::filter::graph::VideoColorInfo::from_codec_parameters(
                         stream.codec_parameters(),

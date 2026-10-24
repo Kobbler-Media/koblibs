@@ -75,6 +75,21 @@ pub struct SessionConfig {
     pub preset: Option<String>,
     /// Encoder tuning (`zerolatency`, `film`, …).
     pub tune: Option<String>,
+    /// Runs an earlier session left in `output_dir`, from [`TranscodeSession::runs`].
+    /// Their segments are served as they are, and `start_time` moves forward past
+    /// whatever of them is contiguous from it, so only what was never produced is
+    /// transcoded again.
+    pub prior_runs: Vec<PriorRun>,
+}
+
+/// A run of segments one generation produced, as [`TranscodeSession::runs`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PriorRun {
+    pub generation: u32,
+    pub run_start: u32,
+    pub start_secs: f64,
+    /// Set for an overlay run, which owns only `[run_start, end_segment)`.
+    pub end_segment: Option<u32>,
 }
 
 impl SessionConfig {
@@ -101,6 +116,7 @@ impl SessionConfig {
             deinterlace: crate::filter::graph::Deinterlace::None,
             preset: None,
             tune: None,
+            prior_runs: Vec::new(),
         }
     }
 
@@ -153,6 +169,11 @@ impl SessionConfig {
     #[must_use]
     pub fn initial_generation(mut self, generation: u32) -> Self {
         self.initial_generation = generation;
+        self
+    }
+    #[must_use]
+    pub fn prior_runs(mut self, runs: Vec<PriorRun>) -> Self {
+        self.prior_runs = runs;
         self
     }
     #[must_use]
@@ -304,6 +325,7 @@ struct TranscodeRun {
     segment_count: u32,
     estimated_bytes: u64,
     segment_durations: Vec<f64>,
+    end_segment: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -350,7 +372,7 @@ impl TranscodeSession {
         in_ctx: InputContext,
         io: Option<crate::format::io_context::CustomIoContext>,
         input_path: Option<&Path>,
-        config: SessionConfig,
+        mut config: SessionConfig,
     ) -> Result<Self> {
         let segment_duration = config.segment_duration;
         let duration_seconds = config.duration_seconds;
@@ -366,6 +388,29 @@ impl TranscodeSession {
             overlay_generations: std::collections::HashSet::new(),
         }));
 
+        let fully_cached = if config.prior_runs.is_empty() {
+            false
+        } else {
+            let mut s = state.lock().unwrap();
+            let finished = adopt_prior_runs(&mut s, &output_dir, &config.prior_runs);
+            let from = ((config.start_time.unwrap_or(0.0) / segment_duration).floor() as u32)
+                .min(total_segments.saturating_sub(1));
+            let end = contiguous_range_end(&s.segment_index, from);
+            if end > from {
+                config.start_time = Some((f64::from(end) * segment_duration).min(duration_seconds));
+            }
+            let ends_on_eof = end
+                .checked_sub(1)
+                .and_then(|last| s.segment_index.get(last as usize).copied().flatten())
+                .is_some_and(|e| {
+                    finished.contains(&e.generation)
+                        && s.runs
+                            .get(&e.run_start)
+                            .is_some_and(|r| e.run_start + r.segment_count == end)
+                });
+            end >= total_segments || ends_on_eof
+        };
+
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let generation = Arc::new(AtomicU32::new(config.initial_generation));
 
@@ -379,6 +424,9 @@ impl TranscodeSession {
             // Keep the CustomIoContext alive for the duration of the session.
             // It MUST outlive in_ctx which references its AVIOContext via raw pointer.
             let _io_guard = io;
+            if fully_cached {
+                return Ok(());
+            }
             let result =
                 session_loop_from_ctx(in_ctx, path_owned, config, cmd_rx, gen_clone, state_clone);
             if let Err(ref e) = result {
@@ -703,31 +751,10 @@ impl TranscodeSession {
         drop(state);
 
         for (run_start, generation) in runs_snapshot {
-            let gen_dir = self.output_dir.join(format!("gen_{generation}"));
-            let playlist_path = gen_dir.join("stream.m3u8");
-
-            let durations: Vec<f64> = match std::fs::read_to_string(&playlist_path) {
-                Ok(contents) => contents
-                    .lines()
-                    .filter_map(|l| {
-                        l.strip_prefix("#EXTINF:")
-                            .and_then(|rest| rest.trim_end_matches(',').parse::<f64>().ok())
-                    })
-                    .collect(),
-                Err(_) => {
-                    continue;
-                }
+            let Some((durations, bytes)) = read_generation(&self.output_dir, generation) else {
+                continue;
             };
             let count = durations.len() as u32;
-
-            let mut bytes = 0u64;
-            if let Ok(entries) = std::fs::read_dir(&gen_dir) {
-                for entry in entries.flatten() {
-                    if let Ok(meta) = entry.metadata() {
-                        bytes += meta.len();
-                    }
-                }
-            }
 
             let mut state = match self.state.lock() {
                 Ok(s) => s,
@@ -930,6 +957,27 @@ impl TranscodeSession {
         start..contiguous_range_end(&state.segment_index, start)
     }
 
+    /// Every run whose segments are still indexed, oldest generation first — what a
+    /// later session over the same `output_dir` passes back as
+    /// [`SessionConfig::prior_runs`].
+    pub fn runs(&self) -> Vec<PriorRun> {
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let mut runs: Vec<PriorRun> = state
+            .runs
+            .iter()
+            .map(|(&run_start, r)| PriorRun {
+                generation: r.generation,
+                run_start,
+                start_secs: r.start_time_secs,
+                end_segment: r.end_segment,
+            })
+            .collect();
+        runs.sort_by_key(|r| r.generation);
+        runs
+    }
+
     /// Current generation number.
     pub fn current_generation(&self) -> u32 {
         self.generation.load(Ordering::Acquire)
@@ -987,6 +1035,85 @@ impl Drop for TranscodeSession {
             let _ = ov.join.join();
         }
     }
+}
+
+/// Left in a generation's directory once it has written the last segment of the file.
+/// The trailer alone does not say so: a seek or a cancel writes one too.
+const EOF_MARKER: &str = "eof";
+
+/// The EXTINF durations FFmpeg has written for a generation, and its bytes on disk.
+fn read_generation(output_dir: &Path, generation: u32) -> Option<(Vec<f64>, u64)> {
+    let gen_dir = output_dir.join(format!("gen_{generation}"));
+    let contents = std::fs::read_to_string(gen_dir.join("stream.m3u8")).ok()?;
+    let durations = contents
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("#EXTINF:")
+                .and_then(|rest| rest.trim_end_matches(',').parse::<f64>().ok())
+        })
+        .collect();
+    let bytes = std::fs::read_dir(&gen_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0);
+    Some((durations, bytes))
+}
+
+// Replayed oldest first, each run filled to its full count before the next registers:
+// that is the order the original session saw them in, so a later run displaces exactly
+// what it displaced then.
+/// Returns the generations that ran to the end of the file.
+fn adopt_prior_runs(
+    state: &mut SessionState,
+    output_dir: &Path,
+    prior: &[PriorRun],
+) -> std::collections::HashSet<u32> {
+    let mut finished = std::collections::HashSet::new();
+    let mut prior = prior.to_vec();
+    prior.sort_by_key(|r| r.generation);
+    for run in prior {
+        let Some((durations, bytes)) = read_generation(output_dir, run.generation) else {
+            continue;
+        };
+        register_run(
+            state,
+            run.generation,
+            run.run_start,
+            run.end_segment,
+            run.start_secs,
+        );
+        if run.end_segment.is_some() {
+            state.overlay_generations.insert(run.generation);
+        } else if output_dir
+            .join(format!("gen_{}", run.generation))
+            .join(EOF_MARKER)
+            .exists()
+        {
+            finished.insert(run.generation);
+        }
+        let limit = run
+            .end_segment
+            .unwrap_or(u32::MAX)
+            .min(state.segment_index.len() as u32);
+        let count = durations.len() as u32;
+        for abs in run.run_start..(run.run_start + count).min(limit) {
+            state.segment_index[abs as usize] = Some(SegmentEntry {
+                generation: run.generation,
+                run_start: run.run_start,
+            });
+        }
+        if let Some(r) = state.runs.get_mut(&run.run_start) {
+            r.segment_count = count;
+            r.estimated_bytes = bytes;
+            r.segment_durations = durations;
+        }
+    }
+    finished
 }
 
 fn contiguous_range_end(index: &[Option<SegmentEntry>], start: u32) -> u32 {
@@ -1198,6 +1325,7 @@ fn register_run(
             segment_count: 0,
             estimated_bytes: 0,
             segment_durations: Vec::new(),
+            end_segment: end_exclusive,
         },
     );
 }
@@ -1339,7 +1467,10 @@ fn run_generation(
                 quality: None,
                 hw_frames_ctx: enc_hw_frames,
                 sample_aspect_ratio: None,
-                frame_rate: crate::codec::encoder::output_frame_rate(stream.r_frame_rate(), deint_filter.is_some()),
+                frame_rate: crate::codec::encoder::output_frame_rate(
+                    stream.r_frame_rate(),
+                    deint_filter.is_some(),
+                ),
                 color: unsafe {
                     crate::filter::graph::VideoColorInfo::from_codec_parameters(
                         stream.codec_parameters(),
@@ -1491,6 +1622,7 @@ fn run_generation(
     let mut audio_filter_tb = ffi::AVRational { num: 0, den: 1 };
     let mut buffered_audio_frames: std::collections::VecDeque<Frame> =
         std::collections::VecDeque::new();
+    let mut reached_eof = false;
     let mut buffered_packets: std::collections::VecDeque<Packet> =
         std::collections::VecDeque::new();
     if let Some(a_idx) = audio_idx {
@@ -1643,6 +1775,7 @@ fn run_generation(
             in_ctx.read_packet(&mut pkt)?
         };
         if !have_packet {
+            reached_eof = true;
             break;
         }
         let ps = pkt.stream_index();
@@ -1775,6 +1908,11 @@ fn run_generation(
         zero_copy,
         video_out_tb,
     )?;
+    if reached_eof {
+        std::fs::write(gen_dir.join(EOF_MARKER), b"").map_err(|e| {
+            crate::error::FfmpegError::new(ffi::AVERROR_EXTERNAL, format!("eof marker: {e}"))
+        })?;
+    }
     Ok(GenResult::Completed)
 }
 
@@ -1980,6 +2118,7 @@ mod register_run_test {
                 segment_count: count,
                 estimated_bytes: 0,
                 segment_durations: vec![seg_dur; count as usize],
+                end_segment: None,
             },
         );
         for i in 0..count {

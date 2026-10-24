@@ -423,8 +423,19 @@ fn test_transcode_to_hls_from_mpegts_spends_its_bitrate() {
     let src = dir.path().join("broadcast.ts");
     let status = std::process::Command::new("ffmpeg")
         .args([
-            "-f", "lavfi", "-i", "testsrc2=duration=3:size=640x360:rate=50",
-            "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "4M", "-f", "mpegts", "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=duration=3:size=640x360:rate=50",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-b:v",
+            "4M",
+            "-f",
+            "mpegts",
+            "-y",
         ])
         .arg(&src)
         .stdout(std::process::Stdio::null())
@@ -450,7 +461,10 @@ fn test_transcode_to_hls_from_mpegts_spends_its_bitrate() {
         .map(|e| e.metadata().unwrap().len())
         .sum();
     // 3 s at a 2 Mbit/s target is ~750 KB; the 90000 fps budget left it near 10 KB.
-    assert!(bytes > 200_000, "3 s of video encoded to only {bytes} bytes");
+    assert!(
+        bytes > 200_000,
+        "3 s of video encoded to only {bytes} bytes"
+    );
 }
 
 #[test]

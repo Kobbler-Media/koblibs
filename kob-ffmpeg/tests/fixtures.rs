@@ -17,6 +17,7 @@ static CORRUPT_AUDIO_AVI: OnceLock<PathBuf> = OnceLock::new();
 static AC3_CHANNEL_CHANGE: OnceLock<PathBuf> = OnceLock::new();
 static INTERLACED_TS: OnceLock<PathBuf> = OnceLock::new();
 static NEAR_BLACK_VIDEO: OnceLock<PathBuf> = OnceLock::new();
+static MINUTE_VIDEO: OnceLock<PathBuf> = OnceLock::new();
 
 fn fixture_dir() -> &'static Path {
     FIXTURE_DIR
@@ -57,6 +58,42 @@ pub fn basic_video() -> PathBuf {
                     "ultrafast",
                     "-crf",
                     "40",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "32k",
+                    "-shortest",
+                ],
+                &path,
+            );
+            path
+        })
+        .clone()
+}
+
+/// H.264 160x120 @ 10fps with a keyframe every second + AAC audio, 60 seconds.
+pub fn minute_video() -> PathBuf {
+    MINUTE_VIDEO
+        .get_or_init(|| {
+            let path = fixture_dir().join("minute.mkv");
+            run_ffmpeg(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=duration=60:size=160x120:rate=10",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:duration=60",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "45",
+                    "-g",
+                    "10",
                     "-c:a",
                     "aac",
                     "-b:a",
