@@ -53,6 +53,17 @@ pub enum StreamAvailability {
     Uncached,
 }
 
+/// The section of the stream list an option belongs to, in list order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamGroup {
+    Played,
+    Account,
+    Available,
+    Uncached,
+    Failed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamPlayback {
@@ -131,6 +142,8 @@ pub struct StreamOption {
     /// cached. `uncached`: it would have to download first. `cached` is `availability == ready`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub availability: Option<StreamAvailability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<StreamGroup>,
     /// Audio languages the release name lists, in its order, as ISO 639-1 codes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audio_languages: Vec<String>,
@@ -184,6 +197,11 @@ pub struct StreamResolveRequest {
     /// `warm` resolves ahead of a tap and yields to `user` resolves. Absent means `user`.
     #[serde(default)]
     pub priority: Option<StreamPriority>,
+    /// The episode or film being played; a pack's hash only has a title for the whole pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,11 +262,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(option.availability, None);
+        assert_eq!(option.group, None);
         assert!(
             !serde_json::to_string(&option)
                 .unwrap()
                 .contains("availability")
         );
+        for (value, json) in [
+            (StreamGroup::Played, "\"played\""),
+            (StreamGroup::Account, "\"account\""),
+            (StreamGroup::Available, "\"available\""),
+            (StreamGroup::Uncached, "\"uncached\""),
+            (StreamGroup::Failed, "\"failed\""),
+        ] {
+            assert_eq!(serde_json::to_string(&value).unwrap(), json);
+        }
         assert!(option.audio_languages.is_empty());
     }
 

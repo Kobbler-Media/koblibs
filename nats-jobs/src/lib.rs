@@ -69,11 +69,11 @@ pub use types::{
     QualityRejectReason, RejectReason, ReleaseFlags, ReleaseInfo, ScoringDecision,
     SearchAndDownloadRequest, SearchAndDownloadResponse, SearchPatternNow, SearchRequest,
     SearchResponse, SearchResult, SoftwareParsed, SpecialType, SportEventMeta, SportIdentifiers,
-    SportParsed, SportTeam, StreamAvailability, StreamFile, StreamOption, StreamOutcomeReport,
-    StreamPlayback, StreamPreference, StreamPriority, StreamResolveRequest, StreamResolveResponse,
-    StreamSearchRequest, StreamSearchResponse, StreamSourceType, StructuralRejectReason,
-    SubtitleMetadata, TvIdentifiers, TvParsed, VideoMetadata, WantRequest, WantResponse,
-    WantStatus, WatchMatchResponse, WatchMatchedEvent, WatchPatternDelete,
+    SportParsed, SportTeam, StreamAvailability, StreamFile, StreamGroup, StreamOption,
+    StreamOutcomeReport, StreamPlayback, StreamPreference, StreamPriority, StreamResolveRequest,
+    StreamResolveResponse, StreamSearchRequest, StreamSearchResponse, StreamSourceType,
+    StructuralRejectReason, SubtitleMetadata, TvIdentifiers, TvParsed, VideoMetadata, WantRequest,
+    WantResponse, WantStatus, WatchMatchResponse, WatchMatchedEvent, WatchPatternDelete,
     WatchPatternDeletedEvent, WatchPatternDetailResponse, WatchPatternResponse, XxxParsed,
 };
 pub use worker::{
