@@ -18,6 +18,7 @@ static AC3_CHANNEL_CHANGE: OnceLock<PathBuf> = OnceLock::new();
 static INTERLACED_TS: OnceLock<PathBuf> = OnceLock::new();
 static NEAR_BLACK_VIDEO: OnceLock<PathBuf> = OnceLock::new();
 static MINUTE_VIDEO: OnceLock<PathBuf> = OnceLock::new();
+static ASS_MKV: OnceLock<PathBuf> = OnceLock::new();
 
 fn fixture_dir() -> &'static Path {
     FIXTURE_DIR
@@ -409,4 +410,32 @@ pub fn x264_clip(file_name: &str, x264_params: &str) -> PathBuf {
         &path,
     );
     path
+}
+
+/// MKV: 1 video + 1 ASS subtitle whose lines carry override tags and a hard line break.
+pub fn ass_mkv() -> PathBuf {
+    ASS_MKV
+        .get_or_init(|| {
+            let ass = fixture_dir().join("test.ass");
+            std::fs::write(
+                &ass,
+                "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,Arial,20\n\n\
+                 [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+                 Dialogue: 0,0:00:00.20,0:00:00.90,Default,,0,0,0,,{\\i1}Bonjour{\\i0} le monde\\Nligne deux\n\
+                 Dialogue: 0,0:00:01.10,0:00:01.80,Default,,0,0,0,,Au revoir\n",
+            )
+            .unwrap();
+            let path = fixture_dir().join("ass.mkv");
+            run_ffmpeg(
+                &[
+                    "-f", "lavfi", "-i", "testsrc2=duration=2:size=64x64:rate=5",
+                    "-i", ass.to_str().unwrap(),
+                    "-c:v", "libx264", "-preset", "ultrafast", "-c:s", "ass",
+                    "-map", "0:v", "-map", "1:s",
+                ],
+                &path,
+            );
+            path
+        })
+        .clone()
 }

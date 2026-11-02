@@ -150,3 +150,129 @@ pub fn extract_subtitles_batch(
 
     Ok(extractions.len())
 }
+
+/// One subtitle line, its timing in seconds and its text with markup removed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextCue {
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TextTrackCues {
+    pub stream_index: i32,
+    pub codec: String,
+    pub cues: Vec<TextCue>,
+}
+
+pub const TEXT_CODECS: &[&str] = &["subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"];
+
+/// Every text subtitle stream's cues, read in one pass and only as far as [until_secs]:
+/// the opening stretch of a file is enough to tell a track's language and density, and
+/// on a file still downloading it is the only part there is.
+pub fn read_text_cues(input: &Path, until_secs: Option<f64>) -> Result<Vec<TextTrackCues>> {
+    let mut in_ctx = InputContext::open_path(input)?;
+    in_ctx.find_stream_info()?;
+
+    let mut time_bases = Vec::new();
+    let mut tracks: Vec<TextTrackCues> = Vec::new();
+    for stream in in_ctx.streams() {
+        let tb = stream.time_base();
+        time_bases.push(f64::from(tb.num) / f64::from(tb.den.max(1)));
+        if stream.codec_type() != MediaType::Subtitle {
+            continue;
+        }
+        let codec = unsafe {
+            let name = ffi::avcodec_get_name((*stream.codec_parameters()).codec_id);
+            if name.is_null() {
+                continue;
+            }
+            std::ffi::CStr::from_ptr(name)
+                .to_string_lossy()
+                .into_owned()
+        };
+        if TEXT_CODECS.contains(&codec.as_str()) {
+            tracks.push(TextTrackCues {
+                stream_index: stream.index(),
+                codec,
+                cues: Vec::new(),
+            });
+        }
+    }
+    if tracks.is_empty() {
+        return Ok(tracks);
+    }
+
+    let mut packet = Packet::new()?;
+    loop {
+        // A file still downloading ends in bytes not yet written: what was read before
+        // them is still a reading.
+        match in_ctx.read_packet(&mut packet) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(_) if tracks.iter().any(|t| !t.cues.is_empty()) => break,
+            Err(e) => return Err(e),
+        }
+        let idx = packet.stream_index();
+        let tb = time_bases.get(idx as usize).copied().unwrap_or(0.0);
+        let ts = if packet.pts() != ffi::AV_NOPTS_VALUE {
+            packet.pts()
+        } else {
+            packet.dts()
+        };
+        let start = ts as f64 * tb;
+        // Packets are interleaved by time, so the first one past the limit ends the read.
+        if ts != ffi::AV_NOPTS_VALUE && until_secs.is_some_and(|limit| start > limit) {
+            break;
+        }
+        let Some(track) = tracks.iter_mut().find(|t| t.stream_index == idx) else {
+            continue;
+        };
+        let text = cue_text(&track.codec, packet.data());
+        if !text.is_empty() {
+            track.cues.push(TextCue {
+                start_secs: start,
+                end_secs: start + packet.duration() as f64 * tb,
+                text,
+            });
+        }
+    }
+    Ok(tracks)
+}
+
+fn cue_text(codec: &str, data: &[u8]) -> String {
+    let raw = match codec {
+        // A 16-bit length, then the text, then style boxes.
+        "mov_text" if data.len() >= 2 => {
+            let len = usize::from(u16::from_be_bytes([data[0], data[1]]));
+            String::from_utf8_lossy(&data[2..(2 + len).min(data.len())]).into_owned()
+        }
+        // Matroska stores an event's fields up to and including Effect before its text.
+        "ass" | "ssa" => {
+            let line = String::from_utf8_lossy(data);
+            let text = line.splitn(9, ',').nth(8).unwrap_or(&line).to_string();
+            strip_between(&text, '{', '}')
+                .replace("\\N", "\n")
+                .replace("\\n", "\n")
+                .replace("\\h", " ")
+        }
+        _ => String::from_utf8_lossy(data).into_owned(),
+    };
+    strip_between(&raw, '<', '>').trim().to_string()
+}
+
+fn strip_between(text: &str, open: char, close: char) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for c in text.chars() {
+        if c == open {
+            depth += 1;
+        } else if c == close && depth > 0 {
+            depth -= 1;
+        } else if depth == 0 {
+            out.push(c);
+        }
+    }
+    out
+}

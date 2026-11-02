@@ -3617,3 +3617,28 @@ fn test_invalid_preset_is_rejected_by_the_encoder() {
     };
     let _ = err;
 }
+
+#[test]
+fn test_read_text_cues() {
+    let tracks = kob_ffmpeg::subtitles::read_text_cues(&fixtures::rich_mkv(), None).unwrap();
+    assert_eq!(tracks.len(), 1);
+    let cues: Vec<_> = tracks[0]
+        .cues
+        .iter()
+        .map(|c| (c.start_secs, c.text.as_str()))
+        .collect();
+    assert_eq!(cues, vec![(0.0, "Hello World"), (1.0, "Test subtitle")]);
+}
+
+#[test]
+fn test_read_text_cues_strips_ass_markup() {
+    let tracks = kob_ffmpeg::subtitles::read_text_cues(&fixtures::ass_mkv(), None).unwrap();
+    let texts: Vec<_> = tracks[0].cues.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(texts, vec!["Bonjour le monde\nligne deux", "Au revoir"]);
+}
+
+#[test]
+fn test_read_text_cues_stops_at_the_limit() {
+    let tracks = kob_ffmpeg::subtitles::read_text_cues(&fixtures::rich_mkv(), Some(0.5)).unwrap();
+    assert_eq!(tracks[0].cues.len(), 1);
+}
