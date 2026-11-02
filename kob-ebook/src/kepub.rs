@@ -28,6 +28,7 @@ use zip::CompressionMethod;
 use zip::write::{SimpleFileOptions, ZipWriter};
 
 use crate::image_size;
+use crate::simple_css;
 use crate::{EbookError, Result};
 
 const KOBO_STYLE_HACK: &str = "div#book-inner { margin-top: 0; margin-bottom: 0;}";
@@ -98,9 +99,7 @@ pub(crate) fn transform_epub(input: &[u8]) -> Result<Vec<u8>> {
     // Collected up front: the XHTML pass below holds a borrow on the archive
     // for each entry, so it cannot go back for an image's header or a
     // stylesheet mid-stream.
-    let image_dims = read_image_dimensions(&mut archive);
-    let css_rules = read_css_rules(&mut archive);
-    let archive_names = read_entry_names(&mut archive);
+    let ctx = KepubContext::read(&mut archive);
 
     let mut out = ZipWriter::new(Cursor::new(Vec::new()));
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
@@ -136,7 +135,7 @@ pub(crate) fn transform_epub(input: &[u8]) -> Result<Vec<u8>> {
         let bytes = if name == opf_path {
             transform_opf(&buf)?
         } else if xhtml_paths.contains(&name) {
-            transform_xhtml(&buf, &name, &image_dims, &css_rules, &archive_names)?
+            transform_xhtml(&buf, &name, &ctx)?
         } else {
             buf
         };
@@ -148,6 +147,23 @@ pub(crate) fn transform_epub(input: &[u8]) -> Result<Vec<u8>> {
 
     let cursor = out.finish()?;
     Ok(cursor.into_inner())
+}
+
+/// What the XHTML transform needs to know about the rest of the archive.
+pub(crate) struct KepubContext {
+    pub image_dims: HashMap<String, (u32, u32)>,
+    css_rules: HashMap<String, Vec<CssRule>>,
+    archive_names: HashSet<String>,
+}
+
+impl KepubContext {
+    pub(crate) fn read<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Self {
+        Self {
+            image_dims: read_image_dimensions(archive),
+            css_rules: read_css_rules(archive),
+            archive_names: read_entry_names(archive),
+        }
+    }
 }
 
 pub(crate) fn read_opf_path<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<String> {
@@ -502,7 +518,7 @@ fn standalone_image_src(input: &[u8]) -> Result<Option<String>> {
 
 /// Resolve a document-relative href to a zip entry path, undoing XML entity
 /// and percent encoding so it can be matched against the archive's own names.
-fn resolve_relative(doc_path: &str, href: &str) -> Option<String> {
+pub(crate) fn resolve_relative(doc_path: &str, href: &str) -> Option<String> {
     let href = href.split(['#', '?']).next().unwrap_or(href);
     if href.is_empty() || href.starts_with("data:") || href.contains("://") {
         return None;
@@ -526,7 +542,7 @@ fn resolve_relative(doc_path: &str, href: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -675,117 +691,31 @@ fn read_entry_names<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> HashSet
     out
 }
 
-/// Split a stylesheet into the simple rules it holds.
+/// Split a stylesheet into the simple rules it holds. Rules without an id or
+/// a class are dropped: a bare `div { background-image: ... }` would match
+/// every div in the document, and that is not a page marker.
 fn scan_css_rules(css: &str) -> Vec<CssRule> {
-    let cleaned = strip_css_comments(css);
+    let cleaned = simple_css::strip_comments(css);
     let mut rules = Vec::new();
-    let mut i = 0usize;
-    while i < cleaned.len() {
-        let Some(open) = cleaned[i..].find('{') else {
-            break;
-        };
-        let open = i + open;
-        let Some(rel_close) = cleaned[open..].find('}') else {
-            break;
-        };
-        let close = open + rel_close;
-        let selector = cleaned[i..open].trim();
-        let body = &cleaned[open + 1..close];
-        i = close + 1;
+    for (selector, body) in simple_css::rules(&cleaned) {
         for sel in selector.split(',') {
-            if let Some(mut rule) = parse_simple_selector(sel.trim()) {
-                rule = apply_declarations(rule, body);
-                rules.push(rule);
+            if let Some(sel) = simple_css::parse_simple_selector(sel.trim())
+                && (sel.id.is_some() || sel.class.is_some())
+            {
+                let rule = CssRule {
+                    id: sel.id,
+                    class: sel.class,
+                    ..CssRule::default()
+                };
+                rules.push(apply_declarations(rule, body));
             }
         }
     }
     rules
 }
 
-fn strip_css_comments(css: &str) -> String {
-    let mut out = String::with_capacity(css.len());
-    let mut i = 0usize;
-    while i < css.len() {
-        if css[i..].starts_with("/*") {
-            match css[i + 2..].find("*/") {
-                Some(end) => i = i + 2 + end + 2,
-                None => break,
-            }
-        } else {
-            let c = css[i..].chars().next().unwrap();
-            out.push(c);
-            i += c.len_utf8();
-        }
-    }
-    out
-}
-
-/// The bare compound selector at the head of a rule, or `None` for anything
-/// this matcher does not claim. Rules without an id or a class are dropped
-/// too: a bare `div { background-image: ... }` would match every div in the
-/// document, and that is not a page marker.
-fn parse_simple_selector(sel: &str) -> Option<CssRule> {
-    let mut rest = sel;
-    if !rest.is_empty() && !(rest.starts_with('#') || rest.starts_with('.')) {
-        let end = rest.find(['#', '.']).unwrap_or(rest.len());
-        let tag = &rest[..end];
-        if !(tag == "*" || tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')) {
-            return None;
-        }
-        rest = &rest[end..];
-    }
-    let mut id = None;
-    let mut class = None;
-    while !rest.is_empty() {
-        let head = rest.as_bytes()[0];
-        let body = &rest[1..];
-        let ident = body.split(['#', '.']).next().unwrap_or("");
-        let valid = !ident.is_empty()
-            && ident
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-        if !valid {
-            return None;
-        }
-        // The ident is ASCII by construction, so the byte slice is safe.
-        let after = &body[ident.len()..];
-        match head {
-            b'#' => {
-                if id.is_some() {
-                    return None;
-                }
-                id = Some(ident.to_string());
-            }
-            b'.' => {
-                if class.is_some() {
-                    return None;
-                }
-                class = Some(ident.to_string());
-            }
-            _ => return None,
-        }
-        rest = after;
-    }
-    if id.is_none() && class.is_none() {
-        return None;
-    }
-    Some(CssRule {
-        id,
-        class,
-        url: None,
-        width: None,
-        height: None,
-        background_size: None,
-    })
-}
-
 fn apply_declarations(mut rule: CssRule, body: &str) -> CssRule {
-    for decl in body.split(';') {
-        let Some((prop, value)) = decl.split_once(':') else {
-            continue;
-        };
-        let prop = prop.trim().to_ascii_lowercase();
-        let value = value.trim();
+    for (prop, value) in simple_css::declarations(body) {
         match prop.as_str() {
             "background-image" => {
                 if let Some(url) = parse_css_url(value) {
@@ -1381,20 +1311,18 @@ fn emit_full_page_style<W: Write>(writer: &mut Writer<W>) -> Result<()> {
     Ok(())
 }
 
-fn transform_xhtml(
-    input: &[u8],
-    doc_path: &str,
-    image_dims: &HashMap<String, (u32, u32)>,
-    css_rules: &HashMap<String, Vec<CssRule>>,
-    archive_names: &HashSet<String>,
-) -> Result<Vec<u8>> {
+fn transform_xhtml(input: &[u8], doc_path: &str, ctx: &KepubContext) -> Result<Vec<u8>> {
     // A KF8 fixed-layout page: the whole page is a CSS background and the
     // text is an overlay on it. Rewrite it to the scaling-SVG idiom the
     // renderer already understands, keeping the text hidden for search and
     // TTS. See [`full_page_background_plan`].
-    if let Some(plan) =
-        full_page_background_plan(input, doc_path, image_dims, css_rules, archive_names)
-    {
+    if let Some(plan) = full_page_background_plan(
+        input,
+        doc_path,
+        &ctx.image_dims,
+        &ctx.css_rules,
+        &ctx.archive_names,
+    ) {
         let (w, h) = plan.size;
         let neutralized = strip_background_identity(input, &plan)?;
         let kepubified = kepubify_document(&neutralized)?;
@@ -1405,7 +1333,7 @@ fn transform_xhtml(
     // still has postage-stamp plate pages, and this is what fixes them.
     if let Some(src) = standalone_image_src(input)?
         && let Some(entry) = resolve_relative(doc_path, &src)
-        && let Some(&(w, h)) = image_dims.get(&entry)
+        && let Some(&(w, h)) = ctx.image_dims.get(&entry)
     {
         return write_full_page_image(input, &src, w, h);
     }
@@ -1419,9 +1347,86 @@ fn kepubify_document(input: &[u8]) -> Result<Vec<u8>> {
     if detect_kepubified(input) {
         return Ok(input.to_vec());
     }
+    let mut sink = WriterSink(Writer::new(Cursor::new(Vec::new())));
+    walk_kepubify(input, &mut sink)?;
+    Ok(sink.0.into_inner().into_inner())
+}
 
+/// Receives the kepubify pass as it walks a document, so the koboSpan
+/// numbering has exactly one implementation whether the output is a KEPUB
+/// or a map of where each span would start.
+pub(crate) trait KepubSink {
+    /// An event of the source document, passed through unchanged.
+    fn source(&mut self, event: Event<'_>) -> Result<()>;
+    /// Markup the pass adds that the source never had.
+    fn injected(&mut self, event: Event<'_>) -> Result<()>;
+    /// A slice of a source text node, wrapped in `kobo.{para}.{seg}` when
+    /// `span` is set.
+    fn run(&mut self, span: Option<(u32, u32)>, text: &str) -> Result<()>;
+    /// A source `<img/>`, wrapped in its own span.
+    fn image(&mut self, span: (u32, u32), img: BytesStart<'_>) -> Result<()>;
+}
+
+struct WriterSink(Writer<Cursor<Vec<u8>>>);
+
+impl KepubSink for WriterSink {
+    fn source(&mut self, event: Event<'_>) -> Result<()> {
+        Ok(self.0.write_event(event)?)
+    }
+
+    fn injected(&mut self, event: Event<'_>) -> Result<()> {
+        Ok(self.0.write_event(event)?)
+    }
+
+    fn run(&mut self, span: Option<(u32, u32)>, text: &str) -> Result<()> {
+        let text = Event::Text(BytesText::from_escaped(text));
+        match span {
+            Some((para, seg)) => {
+                self.0
+                    .write_event(Event::Start(make_kobo_span(para, seg)))?;
+                self.0.write_event(text)?;
+                self.0.write_event(Event::End(BytesEnd::new("span")))?;
+            }
+            None => self.0.write_event(text)?,
+        }
+        Ok(())
+    }
+
+    fn image(&mut self, (para, seg): (u32, u32), img: BytesStart<'_>) -> Result<()> {
+        self.0
+            .write_event(Event::Start(make_kobo_span(para, seg)))?;
+        self.0.write_event(Event::Empty(img))?;
+        self.0.write_event(Event::End(BytesEnd::new("span")))?;
+        Ok(())
+    }
+}
+
+/// Whether [`transform_xhtml`] numbers this document's text with
+/// [`walk_kepubify`] — false when it is already kepubified or becomes a
+/// plate page, which carries no spans at all.
+pub(crate) fn numbers_spans(input: &[u8], doc_path: &str, ctx: &KepubContext) -> Result<bool> {
+    if detect_kepubified(input) {
+        return Ok(false);
+    }
+    if full_page_background_plan(
+        input,
+        doc_path,
+        &ctx.image_dims,
+        &ctx.css_rules,
+        &ctx.archive_names,
+    )
+    .is_some()
+    {
+        return Ok(true);
+    }
+    let plate = standalone_image_src(input)?
+        .and_then(|src| resolve_relative(doc_path, &src))
+        .is_some_and(|entry| ctx.image_dims.contains_key(&entry));
+    Ok(!plate)
+}
+
+pub(crate) fn walk_kepubify<S: KepubSink>(input: &[u8], sink: &mut S) -> Result<()> {
     let mut reader = Reader::from_reader(input);
-    let mut writer: Writer<Cursor<Vec<u8>>> = Writer::new(Cursor::new(Vec::new()));
     let mut buf = Vec::new();
     let mut state = ContentState::default();
     let mut head_style_emitted = false;
@@ -1431,18 +1436,16 @@ fn kepubify_document(input: &[u8]) -> Result<Vec<u8>> {
         match event {
             Event::Eof => break,
             Event::Start(e) => {
-                let name = e.name().as_ref().to_vec();
-                let lower = name.to_ascii_lowercase();
-                writer.write_event(Event::Start(e))?;
+                let lower = e.name().as_ref().to_ascii_lowercase();
+                sink.source(Event::Start(e))?;
                 if lower == b"body" {
                     state.body_depth += 1;
-                    // Inject the <div#book-columns><div#book-inner> wrapper.
                     let mut book_columns = BytesStart::new("div");
                     book_columns.push_attribute(("id", "book-columns"));
-                    writer.write_event(Event::Start(book_columns))?;
+                    sink.injected(Event::Start(book_columns))?;
                     let mut book_inner = BytesStart::new("div");
                     book_inner.push_attribute(("id", "book-inner"));
-                    writer.write_event(Event::Start(book_inner))?;
+                    sink.injected(Event::Start(book_inner))?;
                 } else if state.body_depth > 0 {
                     if is_skip_tag(&lower) {
                         state.skip_depth += 1;
@@ -1458,56 +1461,41 @@ fn kepubify_document(input: &[u8]) -> Result<Vec<u8>> {
                     let mut style = BytesStart::new("style");
                     style.push_attribute(("type", "text/css"));
                     style.push_attribute(("class", "kobostylehacks"));
-                    writer.write_event(Event::Start(style))?;
-                    writer.write_event(Event::Text(BytesText::new(KOBO_STYLE_HACK)))?;
-                    writer.write_event(Event::End(BytesEnd::new("style")))?;
+                    sink.injected(Event::Start(style))?;
+                    sink.injected(Event::Text(BytesText::new(KOBO_STYLE_HACK)))?;
+                    sink.injected(Event::End(BytesEnd::new("style")))?;
                     head_style_emitted = true;
                 }
                 if lower == b"body" && state.body_depth > 0 {
-                    writer.write_event(Event::End(BytesEnd::new("div")))?;
-                    writer.write_event(Event::End(BytesEnd::new("div")))?;
+                    sink.injected(Event::End(BytesEnd::new("div")))?;
+                    sink.injected(Event::End(BytesEnd::new("div")))?;
                     state.body_depth -= 1;
                 }
                 if state.body_depth > 0 && is_skip_tag(&lower) && state.skip_depth > 0 {
                     state.skip_depth -= 1;
                 }
-                writer.write_event(Event::End(e))?;
+                sink.source(Event::End(e))?;
             }
             Event::Empty(e) => {
                 let lower = e.name().as_ref().to_ascii_lowercase();
-                // <img/> gets a fresh paragraph + a koboSpan wrapper.
                 if state.body_depth > 0 && state.skip_depth == 0 && lower == b"img" {
                     state.para += 1;
-                    state.seg = 0;
+                    state.seg = 1;
                     state.inc_para_next = false;
-                    state.seg += 1;
-                    let span = make_kobo_span(state.para, state.seg);
-                    writer.write_event(Event::Start(span))?;
-                    writer.write_event(Event::Empty(e))?;
-                    writer.write_event(Event::End(BytesEnd::new("span")))?;
+                    sink.image((state.para, state.seg), e)?;
                 } else {
-                    writer.write_event(Event::Empty(e))?;
+                    sink.source(Event::Empty(e))?;
                 }
             }
-            Event::Text(t) => {
-                if state.body_depth == 0 || state.skip_depth > 0 {
-                    writer.write_event(Event::Text(t))?;
-                } else {
-                    let raw = t.decode().map_err(quick_xml::Error::from)?;
-                    emit_text_runs(&mut writer, &mut state, raw.as_ref())?;
-                }
+            Event::Text(t) if state.body_depth > 0 && state.skip_depth == 0 => {
+                let raw = t.decode().map_err(quick_xml::Error::from)?;
+                emit_text_runs(sink, &mut state, raw.as_ref())?;
             }
-            Event::CData(c) => writer.write_event(Event::CData(c))?,
-            Event::Comment(c) => writer.write_event(Event::Comment(c))?,
-            Event::Decl(d) => writer.write_event(Event::Decl(d))?,
-            Event::PI(p) => writer.write_event(Event::PI(p))?,
-            Event::DocType(d) => writer.write_event(Event::DocType(d))?,
-            Event::GeneralRef(r) => writer.write_event(Event::GeneralRef(r))?,
+            other => sink.source(other)?,
         }
         buf.clear();
     }
-
-    Ok(writer.into_inner().into_inner())
+    Ok(())
 }
 
 fn make_kobo_span(para: u32, seg: u32) -> BytesStart<'static> {
@@ -1517,8 +1505,8 @@ fn make_kobo_span(para: u32, seg: u32) -> BytesStart<'static> {
     span
 }
 
-fn emit_text_runs<W: Write>(
-    writer: &mut Writer<W>,
+fn emit_text_runs<S: KepubSink>(
+    sink: &mut S,
     state: &mut ContentState,
     raw_escaped: &str,
 ) -> Result<()> {
@@ -1527,8 +1515,7 @@ fn emit_text_runs<W: Write>(
             continue;
         }
         if run.bytes().all(|b| b.is_ascii_whitespace()) {
-            // Whitespace-only run — emit verbatim, don't wrap.
-            writer.write_event(Event::Text(BytesText::from_escaped(run)))?;
+            sink.run(None, run)?;
         } else {
             if state.inc_para_next {
                 state.para += 1;
@@ -1536,9 +1523,7 @@ fn emit_text_runs<W: Write>(
                 state.inc_para_next = false;
             }
             state.seg += 1;
-            writer.write_event(Event::Start(make_kobo_span(state.para, state.seg)))?;
-            writer.write_event(Event::Text(BytesText::from_escaped(run)))?;
-            writer.write_event(Event::End(BytesEnd::new("span")))?;
+            sink.run(Some((state.para, state.seg)), run)?;
         }
     }
     Ok(())
@@ -1644,9 +1629,7 @@ mod tests {
         let out = transform_xhtml(
             input,
             "OEBPS/t.xhtml",
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
+            &test_ctx(&HashMap::new(), &HashMap::new(), &HashSet::new()),
         )
         .unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -1679,9 +1662,7 @@ mod tests {
         let out = transform_xhtml(
             input,
             "OEBPS/t.xhtml",
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
+            &test_ctx(&HashMap::new(), &HashMap::new(), &HashSet::new()),
         )
         .unwrap();
         // Should be byte-identical when already kepubified.
@@ -1707,9 +1688,11 @@ mod tests {
         let out = transform_xhtml(
             plate_page(),
             "OEBPS/xhtml/ill10.xhtml",
-            &dims("OEBPS/images/Ill10.jpg", 1638, 2441),
-            &HashMap::new(),
-            &HashSet::new(),
+            &test_ctx(
+                &dims("OEBPS/images/Ill10.jpg", 1638, 2441),
+                &HashMap::new(),
+                &HashSet::new(),
+            ),
         )
         .unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -1741,9 +1724,11 @@ mod tests {
         let out = transform_xhtml(
             input,
             "OEBPS/xhtml/ill10.xhtml",
-            &dims("OEBPS/images/Ill10.jpg", 1638, 2441),
-            &HashMap::new(),
-            &HashSet::new(),
+            &test_ctx(
+                &dims("OEBPS/images/Ill10.jpg", 1638, 2441),
+                &HashMap::new(),
+                &HashSet::new(),
+            ),
         )
         .unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -1764,9 +1749,11 @@ mod tests {
         let out = transform_xhtml(
             input,
             "OEBPS/bm02.xhtml",
-            &dims("OEBPS/Images/chart.jpg", 362, 335),
-            &HashMap::new(),
-            &HashSet::new(),
+            &test_ctx(
+                &dims("OEBPS/Images/chart.jpg", 362, 335),
+                &HashMap::new(),
+                &HashSet::new(),
+            ),
         )
         .unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -1782,9 +1769,7 @@ mod tests {
         let out = transform_xhtml(
             input,
             "t.xhtml",
-            &dims("a.jpg", 100, 100),
-            &HashMap::new(),
-            &HashSet::new(),
+            &test_ctx(&dims("a.jpg", 100, 100), &HashMap::new(), &HashSet::new()),
         )
         .unwrap();
         assert!(!String::from_utf8(out).unwrap().contains("<svg"));
@@ -1797,9 +1782,7 @@ mod tests {
         let out = transform_xhtml(
             plate_page(),
             "OEBPS/xhtml/ill10.xhtml",
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
+            &test_ctx(&HashMap::new(), &HashMap::new(), &HashSet::new()),
         )
         .unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -1814,9 +1797,7 @@ mod tests {
         let out = transform_xhtml(
             input,
             "t.xhtml",
-            &dims("a.jpg", 800, 1200),
-            &HashMap::new(),
-            &HashSet::new(),
+            &test_ctx(&dims("a.jpg", 800, 1200), &HashMap::new(), &HashSet::new()),
         )
         .unwrap();
         assert!(String::from_utf8(out).unwrap().contains("<svg"));
@@ -1824,6 +1805,18 @@ mod tests {
 
     /// The smallest zip that `transform_epub` will accept: a container
     /// pointing at an OPF, and one XHTML document in the manifest.
+    fn test_ctx(
+        dims: &HashMap<String, (u32, u32)>,
+        rules: &HashMap<String, Vec<CssRule>>,
+        names: &HashSet<String>,
+    ) -> KepubContext {
+        KepubContext {
+            image_dims: dims.clone(),
+            css_rules: rules.clone(),
+            archive_names: names.clone(),
+        }
+    }
+
     fn minimal_epub(doc: &str) -> Vec<u8> {
         use zip::write::SimpleFileOptions;
         let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
@@ -1924,9 +1917,7 @@ mod tests {
         let out = transform_xhtml(
             input,
             "OEBPS/t.xhtml",
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
+            &test_ctx(&HashMap::new(), &HashMap::new(), &HashSet::new()),
         )
         .unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -1981,9 +1972,7 @@ mod tests {
         let out = transform_xhtml(
             kf8_page_doc(),
             "OEBPS/part0010.html",
-            &HashMap::new(),
-            &kf8_rules(),
-            &kf8_names(),
+            &test_ctx(&HashMap::new(), &kf8_rules(), &kf8_names()),
         )
         .unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -2020,9 +2009,11 @@ mod tests {
         let out = transform_xhtml(
             doc,
             "OEBPS/part0010.html",
-            &dims("OEBPS/images/image_0017.jpg", 600, 914),
-            &kf8_rules(),
-            &kf8_names(),
+            &test_ctx(
+                &dims("OEBPS/images/image_0017.jpg", 600, 914),
+                &kf8_rules(),
+                &kf8_names(),
+            ),
         )
         .unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -2044,9 +2035,7 @@ mod tests {
         let out = transform_xhtml(
             kf8_page_doc(),
             "OEBPS/part0010.html",
-            &HashMap::new(),
-            &rules,
-            &kf8_names(),
+            &test_ctx(&HashMap::new(), &rules, &kf8_names()),
         )
         .unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -2069,9 +2058,7 @@ mod tests {
         let out = transform_xhtml(
             kf8_page_doc(),
             "OEBPS/part0010.html",
-            &HashMap::new(),
-            &rules,
-            &kf8_names(),
+            &test_ctx(&HashMap::new(), &rules, &kf8_names()),
         )
         .unwrap();
         assert!(!String::from_utf8(out).unwrap().contains("<svg"));
@@ -2090,9 +2077,7 @@ mod tests {
         let out = transform_xhtml(
             doc,
             "OEBPS/part0010.html",
-            &HashMap::new(),
-            &kf8_rules(),
-            &kf8_names(),
+            &test_ctx(&HashMap::new(), &kf8_rules(), &kf8_names()),
         )
         .unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -2111,17 +2096,13 @@ mod tests {
         let once = transform_xhtml(
             kf8_page_doc(),
             "OEBPS/part0010.html",
-            &HashMap::new(),
-            &kf8_rules(),
-            &kf8_names(),
+            &test_ctx(&HashMap::new(), &kf8_rules(), &kf8_names()),
         )
         .unwrap();
         let twice = transform_xhtml(
             &once,
             "OEBPS/part0010.html",
-            &HashMap::new(),
-            &kf8_rules(),
-            &kf8_names(),
+            &test_ctx(&HashMap::new(), &kf8_rules(), &kf8_names()),
         )
         .unwrap();
         assert_eq!(once, twice, "second pass rewrote the first pass's output");

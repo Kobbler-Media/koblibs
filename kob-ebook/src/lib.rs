@@ -11,6 +11,8 @@ mod fixed_layout;
 mod image_size;
 mod kepub;
 mod meta;
+pub mod reader_pack;
+mod simple_css;
 
 pub use meta::{Metadata, read_cover_bytes, read_metadata};
 
