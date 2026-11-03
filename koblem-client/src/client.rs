@@ -1,9 +1,10 @@
 //! HTTP client for calling a koblem instance.
 
+use crate::embed::{EmbeddingsRequest, EmbeddingsResponse};
 use crate::types::{
     ChatCompletionRequest, ChatCompletionResponse, HealthResponse, ReviewRequest, ReviewResponse,
-    VisionClassifyFromEmbedRequest, VisionClassifyFromEmbedResponse, VisionTextEmbedRequest,
-    VisionTextEmbedResponse,
+    TextEmbeddingsRequest, TextEmbeddingsResponse, VisionClassifyFromEmbedRequest,
+    VisionClassifyFromEmbedResponse, VisionTextEmbedRequest, VisionTextEmbedResponse,
 };
 use tracing::warn;
 
@@ -107,8 +108,9 @@ impl KoblemClient {
         Ok(resp.json().await?)
     }
 
-    /// Encode a batch of text prompts into the SigLIP shared embedding space.
-    /// Calls koblem's `/v1/text_embeddings` proxy (which holds the GPU vision guard).
+    /// Embed prompts verbatim (the legacy `{prompts}` shape of
+    /// `/v1/text_embeddings`). Prefer [`Self::embed_texts`], which applies the
+    /// task prefix and reports the model.
     pub async fn text_embeddings(
         &self,
         request: &VisionTextEmbedRequest,
@@ -129,10 +131,46 @@ impl KoblemClient {
         Ok(resp.json().await?)
     }
 
-    /// Classify pre-computed image embeddings against text prompts.
-    /// Calls koblem's `/v1/classify_from_embeddings` proxy. Server-side this reproduces
-    /// the full SigLIP `sigmoid(img @ txt.T * scale + bias)` forward, so output matches
-    /// `/v1/classify` for the same images within fp16 noise.
+    /// Embed texts under a task (`/v1/text_embeddings`), served by koblem's
+    /// always-on text instance. A 413 (too long, no `chunk`) arrives as
+    /// `Error::Upstream(413, body)` with a `TextTooLongError` body.
+    pub async fn embed_texts(
+        &self,
+        request: &TextEmbeddingsRequest,
+    ) -> Result<TextEmbeddingsResponse, Error> {
+        self.post_json("/v1/text_embeddings", request).await
+    }
+
+    /// OpenAI-shape `/v1/embeddings`: strings and/or image content parts. Images
+    /// go through koblem's GPU gate; text-only requests do not.
+    pub async fn embeddings(
+        &self,
+        request: &EmbeddingsRequest,
+    ) -> Result<EmbeddingsResponse, Error> {
+        self.post_json("/v1/embeddings", request).await
+    }
+
+    async fn post_json<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        request: &Req,
+    ) -> Result<Resp, Error> {
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.base_url))
+            .json(request)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Upstream(status.as_u16(), body));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Score pre-computed image embeddings against text prompts
+    /// (`/v1/classify_from_embeddings`): cosine similarity, no GPU.
     pub async fn classify_from_embeddings(
         &self,
         request: &VisionClassifyFromEmbedRequest,

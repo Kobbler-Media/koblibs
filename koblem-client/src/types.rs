@@ -1435,24 +1435,22 @@ pub struct SttLibraryTranscribeRequest {
     pub save_sample: bool,
 }
 
+/// Multipart knobs of the image routes (`/api/v1/vision/embed`). The image
+/// budget is fixed server-side (EmbeddingGemma-2 at 70 image tokens), so only
+/// the testbed switch is left.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VisionEmbedRequest {
-    /// "pooler" | "cls" | "mean"
-    #[serde(default)]
-    pub pooling: Option<String>,
-    #[serde(default)]
-    pub max_num_patches: Option<u32>,
-    #[serde(default)]
-    pub return_last_hidden: bool,
     #[serde(default)]
     pub save_sample: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisionEmbedResponse {
+    /// One L2-normalised [`crate::embed::EG2_DIM`]-wide vector per image, in the
+    /// same space as text from `/v1/text_embeddings`.
     pub embeddings: Vec<Vec<f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_hidden_state: Option<Vec<Vec<Vec<f32>>>>,
+    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1465,18 +1463,24 @@ pub struct VisionEmbedResponse {
 pub struct VisionClassifyRequest {
     pub prompts: Vec<String>,
     #[serde(default)]
-    pub max_num_patches: Option<u32>,
-    #[serde(default)]
     pub return_logits: bool,
     #[serde(default)]
     pub save_sample: bool,
 }
 
+/// Image-major: `scores[image][prompt]`. Scores are COSINE similarity of the
+/// image and prompt vectors (no sigmoid, no softmax): typically within a few
+/// hundredths of each other, so rank them or compare to a per-model threshold —
+/// never read one as a probability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisionClassifyResponse {
     pub scores: Vec<Vec<f32>>,
+    /// The same values as `scores`, when asked for. Kept for callers that
+    /// request it; cosine has no separate logit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logits: Option<Vec<Vec<f32>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1485,16 +1489,19 @@ pub struct VisionClassifyResponse {
     pub gpu_log_id: Option<i64>,
 }
 
-/// Request to encode a batch of text prompts into the SigLIP shared embedding space.
-/// Lets callers cache image embeddings and dot-product against text encodings at query time.
+/// The original `/v1/text_embeddings` body: prompts embedded verbatim. The
+/// server still accepts it — it is the `prompts` alias of
+/// [`TextEmbeddingsRequest`] — so older callers keep working.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VisionTextEmbedRequest {
     pub prompts: Vec<String>,
 }
 
+/// Reads a [`TextEmbeddingsResponse`] (which the server now sends) down to the
+/// fields older callers used.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisionTextEmbedResponse {
-    /// One L2-normalised embedding per input prompt, in the same shared space as
+    /// One L2-normalised vector per input prompt, in the same space as
     /// `VisionEmbedResponse::embeddings`.
     pub embeddings: Vec<Vec<f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1505,14 +1512,96 @@ pub struct VisionTextEmbedResponse {
     pub gpu_log_id: Option<i64>,
 }
 
-/// Request to classify a batch of *pre-computed* image embeddings against text prompts.
-/// Reproduces the full SigLIP forward (`sigmoid(img @ txt.T * exp(logit_scale) + logit_bias)`)
-/// server-side so callers can avoid re-encoding the same image bytes on every classification.
+/// `POST /v1/text_embeddings`. koblem applies the EmbeddingGemma-2 task prefix
+/// ([`crate::embed::eg2_text`]), so callers send plain text and never write a
+/// prompt string by hand.
+///
+/// An input longer than the text instance's batch (`TEXT_EMBED_MAX_TOKENS`) is
+/// refused with 413 and a [`TextTooLongError`] unless `chunk` is set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TextEmbeddingsRequest {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input: Vec<String>,
+    /// Legacy alias of `input`, appended after it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompts: Vec<String>,
+    /// `None` = [`crate::embed::EmbedTask::Raw`]: embed the text as given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<crate::embed::EmbedTask>,
+    /// Per-input titles, used by [`crate::embed::EmbedTask::Document`]. Shorter
+    /// than `input` (or empty) leaves the rest untitled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub titles: Vec<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk: Option<ChunkOptions>,
+}
+
+/// Split long inputs on token boundaries instead of refusing them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkOptions {
+    /// Tokens per chunk INCLUDING the task prefix and title. `None` (or above
+    /// the server's limit) = the server's limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Tokens shared between consecutive chunks. Must be below the chunk's text
+    /// budget, or the request is a 400.
+    #[serde(default)]
+    pub overlap_tokens: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TextEmbeddingsResponse {
+    /// One vector per input. With `chunk`, the vector of that input's FIRST chunk.
+    pub embeddings: Vec<Vec<f32>>,
+    /// [`crate::embed::EG2_MODEL`]. Store it next to the vectors.
+    pub model: String,
+    pub dim: usize,
+    /// Present only when the request set `chunk`: every chunk of every input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<Vec<TextEmbeddingChunk>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Only when the GPU fallback served the request (the always-on text
+    /// instance was down): time spent waiting on the gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_log_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TextEmbeddingChunk {
+    pub input_index: usize,
+    pub chunk_index: usize,
+    /// `[char_start, char_end)` in the input text, counted in Unicode scalar
+    /// values (Rust `chars()`, not bytes or UTF-16 units). Consecutive chunks
+    /// overlap by `overlap_tokens`.
+    pub char_start: usize,
+    pub char_end: usize,
+    pub embedding: Vec<f32>,
+}
+
+/// The 413 body of `/v1/text_embeddings` and `/v1/embeddings`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TextTooLongError {
+    pub error: String,
+    /// Tokens in the longest offending input (with its prefix), when counted.
+    pub tokens: usize,
+    pub max_tokens: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_index: Option<usize>,
+}
+
+/// Classify *pre-computed* image embeddings against text prompts: cosine of
+/// each image vector with each prompt's vector, so callers can store image
+/// vectors once and re-score them against any prompt set without the GPU.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VisionClassifyFromEmbedRequest {
-    /// One row per image. Each row must be the 1152-dim L2-normalised embedding
-    /// returned by `/v1/embeddings` for that image.
+    /// One row per image: the [`crate::embed::EG2_DIM`]-wide vector `/v1/embeddings`
+    /// returned for it. A row of any other width (a stored SigLIP2 vector) is a
+    /// 400, not a score.
     pub image_embeddings: Vec<Vec<f32>>,
+    /// Embedded verbatim ([`crate::embed::EmbedTask::Raw`]).
     pub prompts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_logits: Option<bool>,
@@ -1520,10 +1609,14 @@ pub struct VisionClassifyFromEmbedRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisionClassifyFromEmbedResponse {
-    /// One row per input image embedding; one column per prompt. Values are sigmoid scores [0,1].
+    /// One row per input image embedding; one column per prompt. Cosine
+    /// similarity — see [`VisionClassifyResponse`] for how to read it.
     pub scores: Vec<Vec<f32>>,
+    /// The same values as `scores`, when asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logits: Option<Vec<Vec<f32>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7665,6 +7758,55 @@ mod tests {
         assert_eq!(resp.gpu_log_id, back.gpu_log_id);
     }
 
+    /// The legacy `{prompts}` body is a valid `TextEmbeddingsRequest`, and the new
+    /// response still reads as the old one, so callers can move at their own pace.
+    #[test]
+    fn text_embeddings_accepts_the_legacy_shape_both_ways() {
+        let legacy = serde_json::to_value(VisionTextEmbedRequest {
+            prompts: vec!["credits roll".into()],
+        })
+        .unwrap();
+        let req: TextEmbeddingsRequest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(req.prompts, vec!["credits roll".to_string()]);
+        assert!(req.input.is_empty() && req.task.is_none() && req.chunk.is_none());
+
+        let req: TextEmbeddingsRequest = serde_json::from_value(json!({
+            "input": ["Alien"],
+            "task": "document",
+            "titles": [null],
+            "chunk": {"max_tokens": 512, "overlap_tokens": 32}
+        }))
+        .unwrap();
+        assert_eq!(req.task, Some(crate::embed::EmbedTask::Document));
+        assert_eq!(req.titles, vec![None]);
+        assert_eq!(
+            req.chunk,
+            Some(ChunkOptions {
+                max_tokens: Some(512),
+                overlap_tokens: 32
+            })
+        );
+
+        let resp = TextEmbeddingsResponse {
+            embeddings: vec![vec![0.6, 0.8]],
+            model: crate::embed::EG2_MODEL.into(),
+            dim: 2,
+            chunks: Some(vec![TextEmbeddingChunk {
+                input_index: 0,
+                chunk_index: 0,
+                char_start: 0,
+                char_end: 5,
+                embedding: vec![0.6, 0.8],
+            }]),
+            duration_ms: Some(3),
+            ..Default::default()
+        };
+        let old: VisionTextEmbedResponse =
+            serde_json::from_value(serde_json::to_value(&resp).unwrap()).unwrap();
+        assert_eq!(old.embeddings, resp.embeddings);
+        assert_eq!(old.duration_ms, Some(3));
+    }
+
     #[test]
     fn vision_classify_from_embed_roundtrip() {
         let req = VisionClassifyFromEmbedRequest {
@@ -7693,6 +7835,7 @@ mod tests {
         let resp = VisionClassifyFromEmbedResponse {
             scores: vec![vec![0.1, 0.9, 0.5]],
             logits: Some(vec![vec![-2.0, 2.0, 0.0]]),
+            model: Some(crate::embed::EG2_MODEL.into()),
             duration_ms: Some(13),
             gate_wait_ms: Some(0),
             gpu_log_id: None,
