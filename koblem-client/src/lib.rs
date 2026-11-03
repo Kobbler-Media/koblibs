@@ -4,6 +4,7 @@
 //! Both koblem (the server) and kobbler/kobload (the clients) depend on this crate
 //! to keep request/response types in sync.
 
+pub mod embed;
 pub mod types;
 
 mod client;
