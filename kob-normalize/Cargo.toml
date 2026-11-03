@@ -2,9 +2,9 @@
 name = "kob-normalize"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.99"
 description = "Canonical title/release normalization for scene-style release matching"
 license = "AGPL-3.0-only"
 
 [dependencies]
-unicode-normalization = "0.1.25"
+unicode-normalization = "0.1.26"

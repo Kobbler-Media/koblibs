@@ -2,6 +2,7 @@
 
 use crate::cancel::CancelRegistry;
 use crate::client::{NatsClient, NatsError};
+use crate::consumer::ensure_consumer;
 use crate::db::JobStatusDb;
 use crate::types::{Job, JobStatus};
 use async_nats::jetstream::consumer::AckPolicy;
@@ -380,21 +381,7 @@ async fn consumer_task(
             }
         };
 
-        // Check for stale consumer (sequence ahead of stream or mismatched config) and recreate if needed
-        if let Err(e) =
-            check_and_cleanup_stale_consumer(&mut stream, &consumer_name, &consumer_config).await
-        {
-            warn!(
-                "Error checking stale consumer '{}': {}, continuing anyway",
-                consumer_name, e
-            );
-        }
-
-        // Create or get the consumer
-        let consumer = match stream
-            .get_or_create_consumer(&consumer_name, consumer_config.clone())
-            .await
-        {
+        let consumer = match ensure_consumer(&mut stream, &consumer_name, &consumer_config).await {
             Ok(c) => c,
             Err(e) => {
                 warn!(
@@ -523,75 +510,6 @@ async fn consumer_task(
             }
         }
     }
-}
-
-/// Check for stale consumers and delete if found.
-async fn check_and_cleanup_stale_consumer(
-    stream: &mut async_nats::jetstream::stream::Stream,
-    consumer_name: &str,
-    expected_config: &ConsumerConfig,
-) -> Result<(), NatsError> {
-    // Get stream info to check for stale consumers
-    let stream_info = stream
-        .info()
-        .await
-        .map_err(|e| NatsError::JetStream(e.to_string()))?;
-    let stream_last_seq = stream_info.state.last_sequence;
-
-    // Try to get existing consumer to check if it's stale
-    if let Ok(mut existing) = stream.get_consumer::<ConsumerConfig>(consumer_name).await
-        && let Ok(info) = existing.info().await
-    {
-        let consumer_seq = info.delivered.stream_sequence;
-        // If consumer is ahead of stream, it's stale and needs recreation
-        if consumer_seq > stream_last_seq && stream_last_seq > 0 {
-            warn!(
-                "Consumer '{}' is stale (at seq {} but stream ends at {}), recreating",
-                consumer_name, consumer_seq, stream_last_seq
-            );
-            if let Err(e) = stream.delete_consumer(consumer_name).await {
-                warn!("Failed to delete stale consumer '{}': {}", consumer_name, e);
-            }
-        } else if info.config.backoff != expected_config.backoff {
-            warn!(
-                "Consumer '{}' has stale backoff ({:?} vs expected {:?}), recreating",
-                consumer_name, info.config.backoff, expected_config.backoff
-            );
-            if let Err(e) = stream.delete_consumer(consumer_name).await {
-                warn!("Failed to delete stale consumer '{}': {}", consumer_name, e);
-            }
-        } else if info.config.max_deliver != expected_config.max_deliver {
-            warn!(
-                "Consumer '{}' has stale max_deliver ({} vs expected {}), recreating",
-                consumer_name, info.config.max_deliver, expected_config.max_deliver
-            );
-            if let Err(e) = stream.delete_consumer(consumer_name).await {
-                warn!("Failed to delete stale consumer '{}': {}", consumer_name, e);
-            }
-        } else if info.config.max_ack_pending != expected_config.max_ack_pending {
-            warn!(
-                "Consumer '{}' has stale max_ack_pending ({} vs expected {}), recreating",
-                consumer_name, info.config.max_ack_pending, expected_config.max_ack_pending
-            );
-            if let Err(e) = stream.delete_consumer(consumer_name).await {
-                warn!("Failed to delete stale consumer '{}': {}", consumer_name, e);
-            }
-        } else if info.config.ack_wait != expected_config.ack_wait
-            && expected_config.backoff.is_empty()
-        {
-            // Only check ack_wait when backoff is not set, because the NATS server
-            // overrides ack_wait with backoff[0] when a backoff array is configured.
-            warn!(
-                "Consumer '{}' has stale ack_wait ({:?} vs expected {:?}), recreating",
-                consumer_name, info.config.ack_wait, expected_config.ack_wait
-            );
-            if let Err(e) = stream.delete_consumer(consumer_name).await {
-                warn!("Failed to delete stale consumer '{}': {}", consumer_name, e);
-            }
-        }
-    }
-
-    Ok(())
 }
 
 /// Advisory payload from NATS when a message exceeds max_deliver.

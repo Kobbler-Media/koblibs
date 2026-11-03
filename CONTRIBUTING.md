@@ -8,7 +8,7 @@ assumptions about how they are deployed.
 
 ## Getting set up
 
-You need **Rust 1.96 or newer** (edition 2024). Most crates need nothing else. `kob-ffmpeg`
+You need **Rust 1.99 or newer** (edition 2024). Most crates need nothing else. `kob-ffmpeg`
 and `kob-ffmpeg-sys` additionally need FFmpeg development headers, `pkg-config` and libclang
 — see [README.md](README.md#system-prerequisites).
 

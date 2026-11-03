@@ -7,7 +7,7 @@ networks:
 
 services:
   nats:
-    image: nats:2.14.2-alpine
+    image: nats:2.15.2-alpine
     container_name: nats
     restart: unless-stopped
     command: ["--jetstream", "--store_dir=/data", "-m", "8222", "--auth", "${NATS_TOKEN:-devtoken}"]

@@ -164,7 +164,7 @@ pub(crate) fn apply(epub: &[u8], layout: &FixedLayout) -> Result<Vec<u8>> {
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let name = file.name().to_string();
+        let name = file.name()?.into_owned();
         if name == "mimetype" || file.is_dir() {
             continue;
         }
@@ -222,13 +222,13 @@ fn declare_in_opf(input: &[u8], layout: &FixedLayout) -> Result<Vec<u8>> {
         match &event {
             // The rendition vocabulary has to be in scope for `rendition:layout`
             // to mean anything to a strict reader.
-            Event::Start(e) if e.name().as_ref() == b"package" => {
+            Event::Start(e) if e.name().as_ref() == "package" => {
                 let mut declared = false;
                 let mut rebuilt = BytesStart::new("package");
                 for attr in e.attributes().flatten() {
-                    if attr.key.as_ref() == b"prefix" {
+                    if attr.key.as_ref() == "prefix" {
                         declared = true;
-                        let existing = String::from_utf8_lossy(&attr.value).into_owned();
+                        let existing = attr.value.into_owned();
                         let merged = if existing.contains("rendition:") {
                             existing
                         } else {
@@ -249,12 +249,12 @@ fn declare_in_opf(input: &[u8], layout: &FixedLayout) -> Result<Vec<u8>> {
             // Appended at the end of the metadata block, so it cannot land
             // before `dcterms:modified` or any other element whose position
             // the spec constrains.
-            Event::End(e) if e.name().as_ref() == b"metadata" => {
+            Event::End(e) if e.name().as_ref() == "metadata" => {
                 write_rendition_metas(&mut writer, layout)?;
             }
             // A self-closing `<metadata/>` has no end tag to append to, so it
             // has to be opened up to hold the declaration.
-            Event::Empty(e) if e.name().as_ref() == b"metadata" => {
+            Event::Empty(e) if e.name().as_ref() == "metadata" => {
                 let mut opened = BytesStart::new("metadata");
                 for attr in e.attributes().flatten() {
                     opened.push_attribute(attr);
@@ -316,7 +316,7 @@ fn declare_viewport(input: &[u8], layout: &FixedLayout) -> Result<Vec<u8>> {
     loop {
         let event = reader.read_event_into(&mut buf)?;
         match &event {
-            Event::End(e) if !injected && e.name().as_ref() == b"head" => {
+            Event::End(e) if !injected && e.name().as_ref() == "head" => {
                 let mut meta = BytesStart::new("meta");
                 meta.push_attribute(("name", "viewport"));
                 meta.push_attribute(("content", content.as_str()));

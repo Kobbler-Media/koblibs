@@ -241,12 +241,12 @@ fn parse_tree(input: &[u8]) -> Option<(El, String, Vec<String>)> {
                 let steps = tracker.start().to_vec();
                 let el = element(e, steps);
                 if el.tag == "link"
-                    && attr(e, b"rel").is_some_and(|r| {
+                    && attr(e, "rel").is_some_and(|r| {
                         r.to_ascii_lowercase()
                             .split_whitespace()
                             .any(|t| t == "stylesheet")
                     })
-                    && let Some(href) = attr(e, b"href")
+                    && let Some(href) = attr(e, "href")
                 {
                     links.push(href);
                 }
@@ -268,16 +268,16 @@ fn parse_tree(input: &[u8]) -> Option<(El, String, Vec<String>)> {
             other => {
                 tracker.character_data(other);
                 let text = match other {
-                    Event::Text(t) => t.decode().ok().map(|s| s.into_owned()),
-                    Event::CData(c) => Some(String::from_utf8_lossy(c).into_owned()),
+                    Event::Text(t) => Some(t.to_string()),
+                    Event::CData(c) => Some(c.to_string()),
                     Event::GeneralRef(r) => Some(match r.resolve_char_ref() {
                         Ok(Some(c)) => c.to_string(),
                         _ => match &**r {
-                            b"amp" => "&".into(),
-                            b"lt" => "<".into(),
-                            b"gt" => ">".into(),
-                            b"quot" => "\"".into(),
-                            b"apos" => "'".into(),
+                            "amp" => "&".into(),
+                            "lt" => "<".into(),
+                            "gt" => ">".into(),
+                            "quot" => "\"".into(),
+                            "apos" => "'".into(),
                             _ => "\u{a0}".into(),
                         },
                     }),
@@ -298,18 +298,18 @@ fn parse_tree(input: &[u8]) -> Option<(El, String, Vec<String>)> {
 }
 
 fn element(e: &BytesStart, steps: Vec<u32>) -> El {
-    let num = |name: &[u8]| attr(e, name).and_then(|v| v.trim().parse::<u32>().ok());
+    let num = |name: &str| attr(e, name).and_then(|v| v.trim().parse::<u32>().ok());
     El {
-        tag: String::from_utf8_lossy(e.local_name().as_ref()).to_ascii_lowercase(),
-        id: attr(e, b"id"),
-        class: attr(e, b"class").unwrap_or_default(),
-        style: attr(e, b"style").unwrap_or_default(),
-        src: attr(e, b"src")
-            .or_else(|| attr(e, b"href"))
+        tag: e.local_name().as_ref().to_ascii_lowercase(),
+        id: attr(e, "id"),
+        class: attr(e, "class").unwrap_or_default(),
+        style: attr(e, "style").unwrap_or_default(),
+        src: attr(e, "src")
+            .or_else(|| attr(e, "href"))
             .filter(|s| !s.trim().is_empty()),
-        alt: attr(e, b"alt").filter(|s| !s.trim().is_empty()),
-        width: num(b"width"),
-        height: num(b"height"),
+        alt: attr(e, "alt").filter(|s| !s.trim().is_empty()),
+        width: num("width"),
+        height: num("height"),
         steps,
         children: Vec::new(),
     }

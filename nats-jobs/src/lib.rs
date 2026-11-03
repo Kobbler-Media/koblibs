@@ -44,6 +44,7 @@
 
 pub mod cancel;
 pub mod client;
+mod consumer;
 pub mod db;
 pub mod publisher;
 pub mod scheduler;

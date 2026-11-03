@@ -2,7 +2,7 @@
 name = "kob-ebook"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.99"
 description = "Native ebook conversion: source formats -> EPUB via boko, EPUB -> KEPUB via in-process koboSpan injection"
 license = "AGPL-3.0-only"
 
@@ -23,11 +23,11 @@ license = "AGPL-3.0-only"
 #
 # Drop the fork once upstream ships all of it.
 boko = { git = "https://github.com/tinyfiddler/boko", rev = "a5f0ce3e0664dbe9aefec7a32ec8910353ab5708", default-features = false }
-quick-xml = "0.41"
+quick-xml = "0.42.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
-thiserror = "2.0.20"
+zip = { version = "9.3.0", default-features = false, features = ["deflate-flate2"] }
+thiserror = "2.0.21"
 tracing = "0.1.44"
 
 [dev-dependencies]

@@ -192,7 +192,7 @@ mod smoke {
         let mut saw_kobo_span = false;
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i).expect("zip entry");
-            let name = entry.name().to_string();
+            let name = entry.name().expect("utf-8 name").into_owned();
             if !name.ends_with(".html") && !name.ends_with(".xhtml") {
                 continue;
             }
@@ -313,7 +313,7 @@ mod smoke {
         let mut text_page: Option<String> = None;
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i).expect("zip entry");
-            let name = entry.name().to_string();
+            let name = entry.name().expect("utf-8 name").into_owned();
             if !name.ends_with(".html") && !name.ends_with(".xhtml") {
                 continue;
             }

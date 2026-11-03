@@ -102,10 +102,11 @@ fn main() {
         .blocklist_item("FP_ZERO")
         .blocklist_item("FP_SUBNORMAL")
         .blocklist_item("FP_NORMAL")
-        // string.h comes in behind the FFmpeg headers and brings the runtime's own
-        // mem* with it. They are not FFmpeg API, and redeclaring them puts a second
-        // signature on symbols the compiler emits calls to itself — bindgen types the
-        // length as c_ulong where the runtime uses usize, which rustc reports as
+        // string.h and stdlib.h come in behind the FFmpeg headers and bring the
+        // runtime's own mem* and allocator with them. They are not FFmpeg API, and
+        // redeclaring them puts a second signature on symbols the compiler emits calls
+        // to itself — bindgen types the length as c_ulong (or an opaque size_t) where
+        // the runtime uses usize, which rustc reports as
         // `suspicious_runtime_symbol_definitions` and `-D warnings` then makes fatal.
         .blocklist_function("memcpy")
         .blocklist_function("memmove")
@@ -113,6 +114,10 @@ fn main() {
         .blocklist_function("memcmp")
         .blocklist_function("bcmp")
         .blocklist_function("strlen")
+        .blocklist_function("malloc")
+        .blocklist_function("calloc")
+        .blocklist_function("realloc")
+        .blocklist_function("free")
         .header("wrapper.h");
 
     for path in &include_paths {

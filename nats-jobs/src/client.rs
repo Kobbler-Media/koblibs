@@ -145,6 +145,8 @@ impl NatsClient {
             connect_options = connect_options.token(token.clone());
         } else if let (Some(user), Some(pass)) = (&config.username, &config.password) {
             connect_options = connect_options.user_and_password(user.clone(), pass.clone());
+        } else if let Some(seed) = &config.nkey_seed {
+            connect_options = connect_options.nkey(seed.clone());
         }
 
         info!("Connecting to NATS at {}", config.url);

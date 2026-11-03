@@ -58,36 +58,36 @@ pub(crate) fn parse(opf: &[u8]) -> Result<Package> {
             let local = e.local_name().as_ref().to_ascii_lowercase();
             if depth == 1 {
                 package_children += 1;
-                if local == b"spine" && spine_step.is_none() {
+                if local == "spine" && spine_step.is_none() {
                     let mut step = String::new();
-                    push_step(&mut step, package_children * 2, attr(&e, b"id").as_deref());
+                    push_step(&mut step, package_children * 2, attr(&e, "id").as_deref());
                     spine_step = Some(step);
                     in_spine = !empty;
-                    pkg.rtl = attr(&e, b"page-progression-direction").as_deref() == Some("rtl");
+                    pkg.rtl = attr(&e, "page-progression-direction").as_deref() == Some("rtl");
                 }
-                in_metadata = local == b"metadata" && !empty;
+                in_metadata = local == "metadata" && !empty;
             } else if depth == 2 && in_spine {
                 spine_children += 1;
-                if local == b"itemref" {
+                if local == "itemref" {
                     let mut cfi = spine_step.clone().unwrap_or_default();
-                    push_step(&mut cfi, spine_children * 2, attr(&e, b"id").as_deref());
+                    push_step(&mut cfi, spine_children * 2, attr(&e, "id").as_deref());
                     pkg.itemrefs.push(Itemref {
-                        idref: attr(&e, b"idref").unwrap_or_default(),
-                        properties: attr(&e, b"properties").unwrap_or_default(),
+                        idref: attr(&e, "idref").unwrap_or_default(),
+                        properties: attr(&e, "properties").unwrap_or_default(),
                         cfi,
                     });
                 }
             }
-            if local == b"item"
-                && let (Some(id), Some(href)) = (attr(&e, b"id"), attr(&e, b"href"))
+            if local == "item"
+                && let (Some(id), Some(href)) = (attr(&e, "id"), attr(&e, "href"))
                 && !id.trim().is_empty()
                 && !href.trim().is_empty()
             {
                 pkg.manifest.insert(id, href);
             }
             if in_metadata && !empty {
-                text_target = if local == b"meta" {
-                    match attr(&e, b"property").as_deref() {
+                text_target = if local == "meta" {
+                    match attr(&e, "property").as_deref() {
                         Some("rendition:layout") => Some(TextTarget::Layout),
                         Some("rendition:spread") => Some(TextTarget::Spread),
                         _ => None,
@@ -105,10 +105,10 @@ pub(crate) fn parse(opf: &[u8]) -> Result<Package> {
         }
         match event {
             Event::Text(t) if text_target.is_some() => {
-                text.push_str(&t.decode().map_err(quick_xml::Error::from)?);
+                text.push_str(t.as_ref());
             }
             Event::CData(c) if text_target.is_some() => {
-                text.push_str(&String::from_utf8_lossy(&c));
+                text.push_str(c.as_ref());
             }
             Event::End(_) => {
                 depth = depth.saturating_sub(1);

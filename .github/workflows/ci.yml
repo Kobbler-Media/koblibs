@@ -28,7 +28,7 @@ jobs:
       run:
         working-directory: ${{ matrix.crate }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: System build deps (ffmpeg headers + libclang for bindgen)
         run: |
           sudo apt-get update
@@ -38,7 +38,7 @@ jobs:
             clang libclang-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.96"
+          toolchain: "1.99"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:

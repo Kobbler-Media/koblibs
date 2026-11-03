@@ -85,7 +85,7 @@ for c in kob-*/ koblem-client/ nats-jobs/; do (cd "$c" && cargo check) || exit 1
 
 ### System prerequisites
 
-- **Rust 1.96 or newer** (every crate sets `rust-version = "1.96"`, edition 2024).
+- **Rust 1.99 or newer** (every crate sets `rust-version = "1.99"`, edition 2024).
 - **FFmpeg development headers** and `pkg-config`, plus libclang for bindgen, to build
   `kob-ffmpeg-sys` / `kob-ffmpeg`. Arch: `sudo pacman -S ffmpeg clang pkgconf`.
   Debian/Ubuntu: `sudo apt install libavformat-dev libavcodec-dev libavutil-dev

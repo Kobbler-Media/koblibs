@@ -18,6 +18,7 @@
 //! background image — the Kindle fixed-layout shape, where the text is an
 //! overlay on the page, not content beside it. See [`full_page_background_plan`].
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Seek, Write};
 
@@ -121,7 +122,7 @@ pub(crate) fn transform_epub(input: &[u8]) -> Result<Vec<u8>> {
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let name = file.name().to_string();
+        let name = file.name()?.into_owned();
         if written.contains(&name) {
             continue;
         }
@@ -177,11 +178,11 @@ pub(crate) fn read_opf_path<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) ->
     let mut reader_buf = Vec::new();
     loop {
         match reader.read_event_into(&mut reader_buf)? {
-            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"rootfile" => {
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == "rootfile" => {
                 for attr in e.attributes() {
                     let attr = attr?;
-                    if attr.key.as_ref() == b"full-path" {
-                        return Ok(String::from_utf8_lossy(attr.value.as_ref()).into_owned());
+                    if attr.key.as_ref() == "full-path" {
+                        return Ok(attr.value.into_owned());
                     }
                 }
             }
@@ -216,23 +217,21 @@ pub(crate) fn read_xhtml_manifest<R: Read + Seek>(
     let mut reader_buf = Vec::new();
     loop {
         match reader.read_event_into(&mut reader_buf)? {
-            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"item" => {
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == "item" => {
                 let mut href = None;
                 let mut media_type = None;
                 for attr in e.attributes() {
                     let attr = attr?;
                     match attr.key.as_ref() {
-                        b"href" => href = Some(attr.value.into_owned()),
-                        b"media-type" => media_type = Some(attr.value.into_owned()),
+                        "href" => href = Some(attr.value.into_owned()),
+                        "media-type" => media_type = Some(attr.value.into_owned()),
                         _ => {}
                     }
                 }
-                if let (Some(h), Some(mt)) = (href, media_type) {
-                    let mt = String::from_utf8_lossy(&mt);
-                    if mt == "application/xhtml+xml" || mt == "text/html" {
-                        let h = String::from_utf8_lossy(&h);
-                        paths.insert(format!("{opf_dir}{h}"));
-                    }
+                if let (Some(h), Some(mt)) = (href, media_type)
+                    && (mt == "application/xhtml+xml" || mt == "text/html")
+                {
+                    paths.insert(format!("{opf_dir}{h}"));
                 }
             }
             Event::Eof => break,
@@ -253,19 +252,19 @@ fn transform_opf(input: &[u8]) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf)? {
-            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"meta" => {
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == "meta" => {
                 let mut is_cover_meta = false;
                 let mut content = None;
                 for attr in e.attributes() {
                     let attr = attr?;
                     match attr.key.as_ref() {
-                        b"name" if attr.value.as_ref() == b"cover" => is_cover_meta = true,
-                        b"content" => content = Some(attr.value.into_owned()),
+                        "name" if attr.value == "cover" => is_cover_meta = true,
+                        "content" => content = Some(attr.value.into_owned()),
                         _ => {}
                     }
                 }
                 if is_cover_meta && let Some(c) = content {
-                    cover_id = Some(String::from_utf8_lossy(&c).into_owned());
+                    cover_id = Some(c);
                 }
             }
             Event::Eof => break,
@@ -283,39 +282,30 @@ fn transform_opf(input: &[u8]) -> Result<Vec<u8>> {
     loop {
         let event = reader.read_event_into(&mut buf)?;
         match &event {
-            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"item" => {
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == "item" => {
                 let mut id_match = false;
                 let mut has_cover_property = false;
                 for attr in e.attributes().flatten() {
-                    if attr.key.as_ref() == b"id" && attr.value.as_ref() == cover_id.as_bytes() {
+                    if attr.key.as_ref() == "id" && attr.value == cover_id {
                         id_match = true;
                     }
-                    if attr.key.as_ref() == b"properties"
-                        && attr.value.as_ref().windows(11).any(|w| w == b"cover-image")
-                    {
+                    if attr.key.as_ref() == "properties" && attr.value.contains("cover-image") {
                         has_cover_property = true;
                     }
                 }
 
                 if id_match && !has_cover_property {
-                    let mut new_e = BytesStart::new(
-                        std::str::from_utf8(e.name().as_ref())
-                            .unwrap_or("item")
-                            .to_string(),
-                    );
-                    let mut existing_props: Option<Vec<u8>> = None;
+                    let mut new_e = BytesStart::new(e.name().as_ref().to_string());
+                    let mut existing_props: Option<String> = None;
                     for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"properties" {
+                        if attr.key.as_ref() == "properties" {
                             existing_props = Some(attr.value.into_owned());
                         } else {
                             new_e.push_attribute(attr);
                         }
                     }
                     let merged: String = match existing_props {
-                        Some(v) if !v.is_empty() => {
-                            let s = String::from_utf8_lossy(&v).into_owned();
-                            format!("{s} cover-image")
-                        }
+                        Some(v) if !v.is_empty() => format!("{v} cover-image"),
                         _ => "cover-image".to_string(),
                     };
                     new_e.push_attribute(("properties", merged.as_str()));
@@ -328,18 +318,18 @@ fn transform_opf(input: &[u8]) -> Result<Vec<u8>> {
                     continue;
                 }
             }
-            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"meta" => {
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == "meta" => {
                 let drop_me = e
                     .attributes()
                     .flatten()
-                    .any(|a| a.key.as_ref() == b"name" && a.value.as_ref() == b"calibre:timestamp");
+                    .any(|a| a.key.as_ref() == "name" && a.value.as_ref() == "calibre:timestamp");
                 if drop_me {
                     if matches!(event, Event::Start(_)) {
                         // Skip until the matching End — calibre:timestamp metas are usually
                         // self-closing, but be defensive.
                         loop {
                             let inner = reader.read_event_into(&mut buf)?;
-                            if matches!(&inner, Event::End(end) if end.name().as_ref() == b"meta") {
+                            if matches!(&inner, Event::End(end) if end.name().as_ref() == "meta") {
                                 break;
                             }
                             if matches!(inner, Event::Eof) {
@@ -373,17 +363,17 @@ struct ContentState {
     inc_para_next: bool,
 }
 
-fn is_skip_tag(name: &[u8]) -> bool {
+fn is_skip_tag(name: &str) -> bool {
     matches!(
         name,
-        b"script" | b"style" | b"pre" | b"audio" | b"video" | b"svg" | b"math"
+        "script" | "style" | "pre" | "audio" | "video" | "svg" | "math"
     )
 }
 
-fn is_para_trigger(name: &[u8]) -> bool {
+fn is_para_trigger(name: &str) -> bool {
     matches!(
         name,
-        b"p" | b"ol" | b"ul" | b"table" | b"h1" | b"h2" | b"h3" | b"h4" | b"h5" | b"h6"
+        "p" | "ol" | "ul" | "table" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
     )
 }
 
@@ -409,7 +399,9 @@ fn read_image_dimensions<R: Read + Seek>(
         let Ok(mut entry) = archive.by_index(i) else {
             continue;
         };
-        let name = entry.name().to_string();
+        let Ok(name) = entry.name().map(Cow::into_owned) else {
+            continue;
+        };
         let is_raster = name.rsplit('.').next().is_some_and(|ext| {
             ["jpg", "jpeg", "png", "gif"]
                 .iter()
@@ -465,25 +457,24 @@ fn standalone_image_src(input: &[u8]) -> Result<Option<String>> {
             Event::Eof => break,
             Event::Start(e) | Event::Empty(e) => {
                 let lower = e.name().as_ref().to_ascii_lowercase();
-                if lower == b"body" {
+                if lower == "body" {
                     body_depth += 1;
                 } else if body_depth > 0 {
-                    if lower == b"svg" || lower == b"image" || lower == b"iframe" {
+                    if lower == "svg" || lower == "image" || lower == "iframe" {
                         return Ok(None);
                     }
-                    if lower == b"img" {
+                    if lower == "img" {
                         image_count += 1;
                         if image_count > 1 {
                             return Ok(None);
                         }
                         for attr in e.attributes() {
                             let attr = attr?;
-                            if attr.key.as_ref().eq_ignore_ascii_case(b"src") {
+                            if attr.key.as_ref().eq_ignore_ascii_case("src") {
                                 // Kept in its escaped form: it goes back out as
                                 // an attribute value unchanged, and only the
                                 // zip lookup needs it decoded.
-                                src =
-                                    Some(String::from_utf8_lossy(attr.value.as_ref()).into_owned());
+                                src = Some(attr.value.into_owned());
                             }
                         }
                     }
@@ -494,14 +485,14 @@ fn standalone_image_src(input: &[u8]) -> Result<Option<String>> {
             }
             Event::End(e) => {
                 let lower = e.name().as_ref().to_ascii_lowercase();
-                if lower == b"body" && body_depth > 0 {
+                if lower == "body" && body_depth > 0 {
                     body_depth -= 1;
                 } else if body_depth > 0 && is_skip_tag(&lower) && skip_depth > 0 {
                     skip_depth -= 1;
                 }
             }
             Event::Text(t) if body_depth > 0 && skip_depth == 0 => {
-                let raw = t.decode().map_err(quick_xml::Error::from)?;
+                let raw: &str = t.as_ref();
                 let visible = raw.chars().filter(|c| !c.is_whitespace()).count();
                 text_budget = match text_budget.checked_sub(visible) {
                     Some(left) => left,
@@ -601,19 +592,19 @@ fn write_full_page_image(input: &[u8], src_attr: &str, width: u32, height: u32) 
         let event = reader.read_event_into(&mut buf)?;
         match event {
             Event::Eof => break,
-            Event::Start(e) if e.name().as_ref().eq_ignore_ascii_case(b"body") => {
+            Event::Start(e) if e.name().as_ref().eq_ignore_ascii_case("body") => {
                 writer.write_event(Event::Start(e))?;
                 writer.write_event(Event::Text(BytesText::from_escaped(body.as_str())))?;
                 body_depth += 1;
             }
-            Event::End(e) if e.name().as_ref().eq_ignore_ascii_case(b"body") => {
+            Event::End(e) if e.name().as_ref().eq_ignore_ascii_case("body") => {
                 body_depth = body_depth.saturating_sub(1);
                 writer.write_event(Event::End(e))?;
             }
             // Everything the original body held is replaced by the SVG.
             _ if body_depth > 0 => {}
             Event::End(e) => {
-                if e.name().as_ref().eq_ignore_ascii_case(b"head") && !head_style_emitted {
+                if e.name().as_ref().eq_ignore_ascii_case("head") && !head_style_emitted {
                     let mut style = BytesStart::new("style");
                     style.push_attribute(("type", "text/css"));
                     style.push_attribute(("class", "kobostylehacks"));
@@ -662,7 +653,9 @@ fn read_css_rules<R: Read + Seek>(
         let Ok(mut entry) = archive.by_index(i) else {
             continue;
         };
-        let name = entry.name().to_string();
+        let Ok(name) = entry.name().map(Cow::into_owned) else {
+            continue;
+        };
         let is_css = name
             .rsplit('.')
             .next()
@@ -682,13 +675,10 @@ fn read_css_rules<R: Read + Seek>(
 /// The zip entry names in the archive, for resolving a background `url()`
 /// against what is actually in the file.
 fn read_entry_names<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for i in 0..archive.len() {
-        if let Ok(entry) = archive.by_index(i) {
-            out.insert(entry.name().to_string());
-        }
-    }
-    out
+    archive
+        .file_names()
+        .filter_map(|name| name.ok().map(Cow::into_owned))
+        .collect()
 }
 
 /// Split a stylesheet into the simple rules it holds. Rules without an id or
@@ -807,7 +797,7 @@ fn find_full_page_background(input: &[u8], rules: &[CssRule]) -> Option<FullPage
             Event::Eof => break,
             Event::Start(e) | Event::Empty(e) => {
                 let lower = e.name().as_ref().to_ascii_lowercase();
-                if lower == b"body" {
+                if lower == "body" {
                     body_depth += 1;
                 } else if body_depth > 0
                     && let Some(found) = match_background_element(e, rules)
@@ -822,7 +812,7 @@ fn find_full_page_background(input: &[u8], rules: &[CssRule]) -> Option<FullPage
             }
             Event::End(e) => {
                 let lower = e.name().as_ref().to_ascii_lowercase();
-                if lower == b"body" && body_depth > 0 {
+                if lower == "body" && body_depth > 0 {
                     body_depth -= 1;
                 }
             }
@@ -843,9 +833,9 @@ fn match_background_element(e: &BytesStart, rules: &[CssRule]) -> Option<FullPag
     let mut classes: Vec<String> = Vec::new();
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
-            b"id" => id = Some(String::from_utf8_lossy(&attr.value).into_owned()),
-            b"class" => {
-                for c in String::from_utf8_lossy(&attr.value).split_whitespace() {
+            "id" => id = Some(attr.value.into_owned()),
+            "class" => {
+                for c in attr.value.split_whitespace() {
                     classes.push(c.to_string());
                 }
             }
@@ -913,14 +903,14 @@ fn viewport_size(input: &[u8]) -> Option<(u32, u32)> {
     loop {
         let event = reader.read_event_into(&mut buf).ok()?;
         match &event {
-            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"meta" => {
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == "meta" => {
                 let mut name = None;
                 let mut content = None;
                 for attr in e.attributes().flatten() {
                     match attr.key.as_ref() {
-                        b"name" => name = Some(String::from_utf8_lossy(&attr.value).into_owned()),
-                        b"content" => {
-                            content = Some(String::from_utf8_lossy(&attr.value).into_owned());
+                        "name" => name = Some(attr.value.into_owned()),
+                        "content" => {
+                            content = Some(attr.value.into_owned());
                         }
                         _ => {}
                     }
@@ -1020,13 +1010,13 @@ fn linked_stylesheet_rules(
     let mut buf = Vec::new();
     while let Ok(event) = reader.read_event_into(&mut buf) {
         match &event {
-            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"link" => {
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == "link" => {
                 let mut rel = None;
                 let mut href = None;
                 for attr in e.attributes().flatten() {
                     match attr.key.as_ref() {
-                        b"rel" => rel = Some(String::from_utf8_lossy(&attr.value).into_owned()),
-                        b"href" => href = Some(String::from_utf8_lossy(&attr.value).into_owned()),
+                        "rel" => rel = Some(attr.value.into_owned()),
+                        "href" => href = Some(attr.value.into_owned()),
                         _ => {}
                     }
                 }
@@ -1105,24 +1095,20 @@ fn strip_background_identity(input: &[u8], plan: &FullPagePlan) -> Result<Vec<u8
             Event::Eof => break,
             Event::Start(e) | Event::Empty(e) if !rewritten => {
                 let lower = e.name().as_ref().to_ascii_lowercase();
-                if lower == b"body" {
+                if lower == "body" {
                     body_depth += 1;
                 } else if body_depth > 0 && is_page_element(e, plan) {
                     rewritten = true;
-                    let mut rebuilt = BytesStart::new(
-                        std::str::from_utf8(e.name().as_ref())
-                            .unwrap_or("div")
-                            .to_string(),
-                    );
+                    let mut rebuilt = BytesStart::new(e.name().as_ref().to_string());
                     for attr in e.attributes().flatten() {
                         let key = attr.key.as_ref();
-                        let value: &str = &String::from_utf8_lossy(&attr.value);
-                        if key == b"id" {
+                        let value: &str = &attr.value;
+                        if key == "id" {
                             if plan.matched_id.as_deref() == Some(value) {
                                 continue;
                             }
                             rebuilt.push_attribute(attr);
-                        } else if key == b"class" {
+                        } else if key == "class" {
                             let tokens: Vec<&str> = value.split_whitespace().collect();
                             let kept: Vec<&str> = tokens
                                 .iter()
@@ -1148,7 +1134,7 @@ fn strip_background_identity(input: &[u8], plan: &FullPagePlan) -> Result<Vec<u8
             }
             Event::End(e) => {
                 let lower = e.name().as_ref().to_ascii_lowercase();
-                if lower == b"body" && body_depth > 0 {
+                if lower == "body" && body_depth > 0 {
                     body_depth -= 1;
                 }
             }
@@ -1169,14 +1155,13 @@ fn strip_background_identity(input: &[u8], plan: &FullPagePlan) -> Result<Vec<u8
 fn is_page_element(e: &BytesStart, plan: &FullPagePlan) -> bool {
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
-            b"id" => {
-                if plan.matched_id.as_deref() == Some(String::from_utf8_lossy(&attr.value).as_ref())
-                {
+            "id" => {
+                if plan.matched_id.as_deref() == Some(attr.value.as_ref()) {
                     return true;
                 }
             }
-            b"class" => {
-                let value = String::from_utf8_lossy(&attr.value);
+            "class" => {
+                let value = attr.value;
                 if value
                     .split_whitespace()
                     .any(|t| plan.matched_classes.iter().any(|c| c == t))
@@ -1209,7 +1194,7 @@ fn add_full_page_svg(
     let mut body_depth = 0u32;
     // Elements open inside the body; the wrapper pair sits at the bottom of
     // the stack, so the close that leaves one element open is `#book-inner`'s.
-    let mut open: Vec<Vec<u8>> = Vec::new();
+    let mut open: Vec<String> = Vec::new();
     let mut hidden_opened = false;
 
     let body = format!(
@@ -1234,8 +1219,8 @@ fn add_full_page_svg(
                 let in_body = body_depth > 0;
                 if in_body
                     && !hidden_opened
-                    && lower == b"div"
-                    && attr_value(&e, b"id").as_deref() == Some("book-inner")
+                    && lower == "div"
+                    && attr_value(&e, "id").as_deref() == Some("book-inner")
                 {
                     writer.write_event(Event::Start(e))?;
                     writer.write_event(Event::Text(BytesText::from_escaped(body.as_str())))?;
@@ -1243,7 +1228,7 @@ fn add_full_page_svg(
                     open.push(lower);
                 } else {
                     writer.write_event(Event::Start(e))?;
-                    if lower == b"body" {
+                    if lower == "body" {
                         body_depth += 1;
                     }
                     if in_body {
@@ -1253,17 +1238,17 @@ fn add_full_page_svg(
             }
             Event::End(e) => {
                 let lower = e.name().as_ref().to_ascii_lowercase();
-                if body_depth > 0 && lower == b"body" {
+                if body_depth > 0 && lower == "body" {
                     body_depth -= 1;
                     writer.write_event(Event::End(e))?;
                 } else if body_depth > 0 {
-                    let closing_inner = open.len() == 2 && open.get(1) == Some(&b"div".to_vec());
+                    let closing_inner = open.len() == 2 && open.get(1).is_some_and(|n| n == "div");
                     if closing_inner {
                         writer.write_event(Event::Text(BytesText::from_escaped("</div>")))?;
                     }
                     pop_resync(&mut open, &lower);
                     writer.write_event(Event::End(e))?;
-                } else if lower == b"head" && !head_style_emitted {
+                } else if lower == "head" && !head_style_emitted {
                     emit_full_page_style(&mut writer)?;
                     head_style_emitted = true;
                     writer.write_event(Event::End(e))?;
@@ -1282,7 +1267,7 @@ fn add_full_page_svg(
 /// Pop the element a close ends, resyncing by name when a malformed document
 /// ends something else: a wrapper the stack lost track of must not swallow
 /// the hidden div's close.
-fn pop_resync(open: &mut Vec<Vec<u8>>, name: &[u8]) {
+fn pop_resync(open: &mut Vec<String>, name: &str) {
     match open.pop() {
         Some(top) if top == name => {}
         Some(_) => {
@@ -1294,11 +1279,11 @@ fn pop_resync(open: &mut Vec<Vec<u8>>, name: &[u8]) {
     }
 }
 
-fn attr_value(e: &BytesStart, key: &[u8]) -> Option<String> {
+fn attr_value(e: &BytesStart, key: &str) -> Option<String> {
     e.attributes()
         .flatten()
         .find(|a| a.key.as_ref() == key)
-        .map(|a| String::from_utf8_lossy(&a.value).into_owned())
+        .map(|a| a.value.into_owned())
 }
 
 fn emit_full_page_style<W: Write>(writer: &mut Writer<W>) -> Result<()> {
@@ -1438,7 +1423,7 @@ pub(crate) fn walk_kepubify<S: KepubSink>(input: &[u8], sink: &mut S) -> Result<
             Event::Start(e) => {
                 let lower = e.name().as_ref().to_ascii_lowercase();
                 sink.source(Event::Start(e))?;
-                if lower == b"body" {
+                if lower == "body" {
                     state.body_depth += 1;
                     let mut book_columns = BytesStart::new("div");
                     book_columns.push_attribute(("id", "book-columns"));
@@ -1456,7 +1441,7 @@ pub(crate) fn walk_kepubify<S: KepubSink>(input: &[u8], sink: &mut S) -> Result<
             }
             Event::End(e) => {
                 let lower = e.name().as_ref().to_ascii_lowercase();
-                if lower == b"head" && !head_style_emitted {
+                if lower == "head" && !head_style_emitted {
                     // Match pgaskin/kepubify: <style type="text/css" class="kobostylehacks">.
                     let mut style = BytesStart::new("style");
                     style.push_attribute(("type", "text/css"));
@@ -1466,7 +1451,7 @@ pub(crate) fn walk_kepubify<S: KepubSink>(input: &[u8], sink: &mut S) -> Result<
                     sink.injected(Event::End(BytesEnd::new("style")))?;
                     head_style_emitted = true;
                 }
-                if lower == b"body" && state.body_depth > 0 {
+                if lower == "body" && state.body_depth > 0 {
                     sink.injected(Event::End(BytesEnd::new("div")))?;
                     sink.injected(Event::End(BytesEnd::new("div")))?;
                     state.body_depth -= 1;
@@ -1478,7 +1463,7 @@ pub(crate) fn walk_kepubify<S: KepubSink>(input: &[u8], sink: &mut S) -> Result<
             }
             Event::Empty(e) => {
                 let lower = e.name().as_ref().to_ascii_lowercase();
-                if state.body_depth > 0 && state.skip_depth == 0 && lower == b"img" {
+                if state.body_depth > 0 && state.skip_depth == 0 && lower == "img" {
                     state.para += 1;
                     state.seg = 1;
                     state.inc_para_next = false;
@@ -1488,8 +1473,7 @@ pub(crate) fn walk_kepubify<S: KepubSink>(input: &[u8], sink: &mut S) -> Result<
                 }
             }
             Event::Text(t) if state.body_depth > 0 && state.skip_depth == 0 => {
-                let raw = t.decode().map_err(quick_xml::Error::from)?;
-                emit_text_runs(sink, &mut state, raw.as_ref())?;
+                emit_text_runs(sink, &mut state, t.as_ref())?;
             }
             other => sink.source(other)?,
         }
@@ -1864,7 +1848,7 @@ mod tests {
         // and a second copy would make the read order decide the answer.
         let mut archive = zip::ZipArchive::new(Cursor::new(&twice)).unwrap();
         let stamps = (0..archive.len())
-            .filter(|i| archive.by_index(*i).unwrap().name() == GENERATION_STAMP_PATH)
+            .filter(|i| archive.by_index(*i).unwrap().name().unwrap() == GENERATION_STAMP_PATH)
             .count();
         assert_eq!(stamps, 1, "expected exactly one stamp entry");
     }

@@ -63,8 +63,8 @@ impl PathTracker {
     /// caller: character data advances the chunk, everything else is ignored.
     pub fn character_data(&mut self, event: &Event<'_>) {
         let len = match event {
-            Event::Text(t) => t.decode().map(|s| dom_len(&s)).unwrap_or(0),
-            Event::CData(c) => dom_len(&String::from_utf8_lossy(c)),
+            Event::Text(t) => dom_len(t.as_ref()),
+            Event::CData(c) => dom_len(c.as_ref()),
             Event::GeneralRef(r) => ref_len(r),
             _ => return,
         };
@@ -136,18 +136,18 @@ pub(crate) struct KoboSpan {
 
 pub(crate) const SPAN_TEXT_PREFIX: usize = 128;
 
-pub(crate) fn attr(e: &BytesStart, name: &[u8]) -> Option<String> {
+pub(crate) fn attr(e: &BytesStart, name: &str) -> Option<String> {
     e.attributes()
         .flatten()
         .find(|a| a.key.local_name().as_ref() == name)
         .map(|a| {
             a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map(|v| v.into_owned())
-                .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned())
+                .unwrap_or_else(|_| a.value.into_owned())
         })
 }
 
-fn has_attr(e: &BytesStart, name: &[u8]) -> bool {
+fn has_attr(e: &BytesStart, name: &str) -> bool {
     e.attributes()
         .flatten()
         .any(|a| a.key.local_name().as_ref() == name)
@@ -185,7 +185,7 @@ pub(crate) fn scan(input: &[u8]) -> SourceDoc {
                 if !empty {
                     depth += 1;
                 }
-                if !empty && local == b"title" && doc.title.is_none() && title.is_none() {
+                if !empty && local == "title" && doc.title.is_none() && title.is_none() {
                     in_title = true;
                     title = Some(String::new());
                 }
@@ -206,17 +206,13 @@ pub(crate) fn scan(input: &[u8]) -> SourceDoc {
             }
             Event::Eof => break,
             other => {
-                if in_title
-                    && let (Event::Text(t), Some(title)) = (other, title.as_mut())
-                    && let Ok(s) = t.decode()
-                {
-                    title.push_str(&s);
+                if in_title && let (Event::Text(t), Some(title)) = (other, title.as_mut()) {
+                    title.push_str(t.as_ref());
                 }
                 if let (Some((i, _)), Event::Text(t)) = (span_text, other)
-                    && let Ok(s) = t.decode()
                     && doc.kobo_spans[i].text.len() < SPAN_TEXT_PREFIX
                 {
-                    doc.kobo_spans[i].text.push_str(&s);
+                    doc.kobo_spans[i].text.push_str(t.as_ref());
                 }
                 tracker.character_data(other);
             }
@@ -230,18 +226,18 @@ pub(crate) fn scan(input: &[u8]) -> SourceDoc {
     doc
 }
 
-fn observe_element(doc: &mut SourceDoc, e: &BytesStart, local: &[u8], path: Vec<u32>) {
-    let hidden = has_attr(e, b"hidden");
-    let image = matches!(local, b"img" | b"image");
-    let listed = if matches!(local, b"ol" | b"ul" | b"li") {
-        attr(e, b"type").and_then(|t| list_type(&t))
+fn observe_element(doc: &mut SourceDoc, e: &BytesStart, local: &str, path: Vec<u32>) {
+    let hidden = has_attr(e, "hidden");
+    let image = matches!(local, "img" | "image");
+    let listed = if matches!(local, "ol" | "ul" | "li") {
+        attr(e, "type").and_then(|t| list_type(&t))
     } else {
         None
     };
-    if local == b"span"
-        && let Some(id) = attr(e, b"id")
+    if local == "span"
+        && let Some(id) = attr(e, "id")
         && id.starts_with("kobo.")
-        && attr(e, b"class").is_some_and(|c| c.split_whitespace().any(|c| c == "koboSpan"))
+        && attr(e, "class").is_some_and(|c| c.split_whitespace().any(|c| c == "koboSpan"))
     {
         doc.kobo_spans.push(KoboSpan {
             id,
@@ -253,15 +249,15 @@ fn observe_element(doc: &mut SourceDoc, e: &BytesStart, local: &[u8], path: Vec<
         return;
     }
     let info = ElementInfo {
-        tag: String::from_utf8_lossy(local).into_owned(),
+        tag: local.to_string(),
         hidden,
         href: if image {
-            attr(e, b"src").or_else(|| attr(e, b"href"))
+            attr(e, "src").or_else(|| attr(e, "href"))
         } else {
             None
         },
-        width: if image { px(attr(e, b"width")) } else { None },
-        height: if image { px(attr(e, b"height")) } else { None },
+        width: if image { px(attr(e, "width")) } else { None },
+        height: if image { px(attr(e, "height")) } else { None },
         list_type: listed,
     };
     doc.elements.insert(path, info);

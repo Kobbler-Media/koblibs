@@ -285,7 +285,7 @@ fn rewrite_entry(zip: &[u8], name: &str, bytes: &[u8]) -> Vec<u8> {
     let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).unwrap();
-        let entry_name = entry.name().to_string();
+        let entry_name = entry.name().unwrap().into_owned();
         let mut data = Vec::new();
         entry.read_to_end(&mut data).unwrap();
         out.start_file(&entry_name, zip::write::SimpleFileOptions::default())
@@ -457,21 +457,21 @@ fn kobo_span_texts(doc: &[u8]) -> Vec<(String, String)> {
     let mut open = false;
     loop {
         match reader.read_event_into(&mut buf).unwrap() {
-            Event::Start(e) if e.name().as_ref() == b"span" => {
+            Event::Start(e) if e.name().as_ref() == "span" => {
                 let id = e
                     .attributes()
                     .flatten()
-                    .find(|a| a.key.as_ref() == b"id")
-                    .map(|a| String::from_utf8_lossy(&a.value).into_owned())
+                    .find(|a| a.key.as_ref() == "id")
+                    .map(|a| a.value.into_owned())
                     .unwrap_or_default();
                 if id.starts_with("kobo.") {
                     out.push((id, String::new()));
                     open = true;
                 }
             }
-            Event::End(e) if e.name().as_ref() == b"span" => open = false,
-            Event::Text(t) if open => out.last_mut().unwrap().1.push_str(&t.decode().unwrap()),
-            Event::Empty(e) if open && e.name().as_ref() == b"img" => {}
+            Event::End(e) if e.name().as_ref() == "span" => open = false,
+            Event::Text(t) if open => out.last_mut().unwrap().1.push_str(t.as_ref()),
+            Event::Empty(e) if open && e.name().as_ref() == "img" => {}
             Event::Eof => break,
             _ => {}
         }

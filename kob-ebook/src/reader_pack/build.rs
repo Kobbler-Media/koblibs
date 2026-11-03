@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read};
@@ -41,7 +42,10 @@ fn read_entry<R: Read + std::io::Seek>(zip: &mut ZipArchive<R>, name: &str) -> O
 
 pub(crate) fn build(epub: &[u8]) -> Result<ReaderPack> {
     let mut zip = ZipArchive::new(Cursor::new(epub))?;
-    let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+    let names = zip
+        .file_names()
+        .map(|name| name.map(Cow::into_owned))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let name_set: HashSet<&str> = names.iter().map(String::as_str).collect();
     let opf_path = kepub::read_opf_path(&mut zip)?;
     let opf_bytes = read_entry(&mut zip, &opf_path).ok_or_else(|| {
