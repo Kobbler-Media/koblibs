@@ -1614,7 +1614,8 @@ impl GpuLock {
         }
         let pending = self.pending_demand.lock().unwrap().clone();
         for kind in ServiceKind::ALL.into_iter().filter(|k| k.is_standing()) {
-            if !self.is_service_enabled(kind) {
+            // Beefy evicted it and does not admit it: it stays off until exit.
+            if !self.is_service_enabled(kind) || self.box_locked_against(kind).is_some() {
                 continue;
             }
             // Don't re-home into the gap between two queued jobs. Re-seeding here
