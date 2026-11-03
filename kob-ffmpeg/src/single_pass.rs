@@ -19,9 +19,10 @@
 //!
 //! `vhash` and `embed_src` both support optional `windows` on their params —
 //! a list of `[start_secs, end_secs)` ranges the sink will emit frames for.
-//! Empty windows = whole file. The decoder still runs over the whole file
-//! (other branches need it) but out-of-window frames skip the per-frame
-//! scale + JPEG/descriptor work.
+//! Empty windows = whole file. Out-of-window frames skip the per-frame
+//! scale + JPEG/descriptor work. When every requested branch is windowed the
+//! run seeks to just ahead of the earliest window; otherwise the decoder runs
+//! over the whole file because the other branches need it.
 //!
 //! CPU decode only — concurrent CUDA contexts race in the upstream sites.
 //! Each branch keeps its own resampler / scaler / filter graph, so a corrupt
@@ -343,6 +344,42 @@ pub struct SinglePassResult {
     pub corruption: Option<Vec<CorruptRange>>,
     pub per_branch_errors: Vec<(BranchId, FfmpegError)>,
     pub branch_durations: HashMap<BranchId, Duration>,
+    /// Where decoding started when every requested branch was windowed, so the run
+    /// skipped the file ahead of the earliest window. `None` = decoded from the start.
+    pub seeked_to_secs: Option<f64>,
+}
+
+/// Seek this far ahead of the earliest window: some demuxers (mpegts) land after the
+/// target even with `AVSEEK_FLAG_BACKWARD`.
+const WINDOW_SEEK_LEAD_SECS: f64 = 5.0;
+
+/// The earliest window start when every requested branch is a windowed video branch
+/// (vhash / embed_src with non-empty windows). `None` when any branch needs the whole
+/// file, which is every audio branch plus trickplay, black frames and corruption.
+fn windowed_only_start(req: &SinglePassRequest) -> Option<f64> {
+    let whole_file = req.trickplay.is_some()
+        || req.black_frames.is_some()
+        || req.corruption.is_some()
+        || req.chromaprint.is_some()
+        || req.silence.is_some()
+        || req.loudness
+        || req.audio_peaks.is_some();
+    if whole_file {
+        return None;
+    }
+    let windows: Vec<&[(f64, f64)]> = req
+        .vhash
+        .iter()
+        .map(|p| p.windows.as_slice())
+        .chain(req.embed_src.iter().map(|p| p.windows.as_slice()))
+        .collect();
+    if windows.is_empty() || windows.iter().any(|w| w.is_empty()) {
+        return None;
+    }
+    windows
+        .iter()
+        .flat_map(|w| w.iter().map(|(start, _)| *start))
+        .reduce(f64::min)
 }
 
 // ── Internal sink state ──────────────────────────────────────────────────────
@@ -1253,6 +1290,29 @@ pub fn run_single_pass_from_ctx_with_sinks(
         }
     }
 
+    // Only windowed branches: start at the earliest window rather than decoding (and
+    // reading off the NAS) everything before it. The sinks' fps grids stay anchored at
+    // 0 and advance past the pre-window frames, so they capture the same frames a
+    // from-the-start decode would. A failed seek leaves the position at the start.
+    let mut seeked_to_secs = None;
+    if let Some(start) = windowed_only_start(&req) {
+        let target = (start - WINDOW_SEEK_LEAD_SECS).max(0.0);
+        if target > 0.0 {
+            let ts = (target * ffi::AV_TIME_BASE as f64) as i64;
+            match ctx.seek(-1, ts, ffi::AVSEEK_FLAG_BACKWARD as i32) {
+                Ok(()) => {
+                    if let Some(dec) = video_decoder.as_mut() {
+                        dec.flush();
+                    }
+                    seeked_to_secs = Some(target);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, seek_secs = target, "window seek failed; decoding from the start");
+                }
+            }
+        }
+    }
+
     // ── Decode loop ─────────────────────────────────────────────────────────
     // Per-branch wall-clock accumulator, threaded through every feed/finalize
     // so callers can see where a long single_pass run actually spent its time.
@@ -1395,6 +1455,7 @@ pub fn run_single_pass_from_ctx_with_sinks(
     let mut result = SinglePassResult {
         input_duration_secs,
         branch_durations,
+        seeked_to_secs,
         ..Default::default()
     };
 

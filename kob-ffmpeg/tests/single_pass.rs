@@ -724,3 +724,72 @@ fn corruption_clean_on_clean_fixture() {
         ranges.len()
     );
 }
+
+fn tail_embed_request(path: std::path::PathBuf) -> SinglePassRequest {
+    let mut req = SinglePassRequest::new(path);
+    req.embed_src = Some(EmbedSrcParams {
+        width: 160,
+        fps: 1.0,
+        jpeg_quality: 3,
+        windows: vec![(40.0, 60.0)],
+    });
+    req.vhash = Some(VhashParams {
+        intermediate_width: 64,
+        fps: 3.0,
+        windows: vec![(45.0, 60.0)],
+    });
+    req
+}
+
+#[test]
+fn single_pass_windowed_only_seeks_and_matches_full_decode() {
+    // Only windowed branches → the run seeks ahead of the earliest window. Adding a
+    // whole-file branch (black frames) forces a from-the-start decode; the windowed
+    // branches must come out identical either way.
+    let path = fixtures::minute_video();
+    let seeked = run_single_pass(tail_embed_request(path.clone()), None).expect("seeked run");
+    let mut full_req = tail_embed_request(path);
+    full_req.black_frames = Some(BlackFramesParams::default());
+    let full = run_single_pass(full_req, None).expect("full run");
+
+    assert_eq!(seeked.seeked_to_secs, Some(35.0));
+    assert_eq!(full.seeked_to_secs, None);
+
+    let a = seeked.embed_src.expect("seeked embed_src");
+    let b = full.embed_src.expect("full embed_src");
+    assert_eq!(a.len(), 20, "1 fps over [40, 60)");
+    assert_eq!(
+        a.iter().map(|f| f.timestamp_secs).collect::<Vec<_>>(),
+        b.iter().map(|f| f.timestamp_secs).collect::<Vec<_>>()
+    );
+    for (x, y) in a.iter().zip(&b) {
+        assert_eq!(
+            x.jpeg_data, y.jpeg_data,
+            "frame at {}s differs",
+            x.timestamp_secs
+        );
+    }
+
+    let va = seeked.vhash.expect("seeked vhash");
+    let vb = full.vhash.expect("full vhash");
+    assert_eq!(
+        va.iter()
+            .map(|d| (d.timestamp_secs, d.data.clone()))
+            .collect::<Vec<_>>(),
+        vb.iter()
+            .map(|d| (d.timestamp_secs, d.data.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        (seeked.input_duration_secs - full.input_duration_secs).abs() < 0.2,
+        "duration still reaches the end of the file"
+    );
+}
+
+#[test]
+fn single_pass_unwindowed_branch_disables_seek() {
+    let mut req = tail_embed_request(fixtures::minute_video());
+    req.vhash.as_mut().unwrap().windows.clear();
+    let result = run_single_pass(req, None).expect("run");
+    assert_eq!(result.seeked_to_secs, None);
+}
