@@ -139,11 +139,12 @@ impl Placement {
     }
 }
 
-/// The LLM is the one always-resident service: however its placement is created
-/// (seed, fresh admit, relocation, or observe) it is `Standing` so no guard drop
-/// ever frees its budget out from under the warm llama-server.
+/// The always-resident services ([`ServiceKind::is_standing`]: the LLM and the
+/// text embedder): however their placement is created (seed, fresh admit,
+/// relocation, or observe) it is `Standing` so no guard drop ever frees its
+/// budget out from under the warm worker.
 fn source_for(kind: ServiceKind, requested: PlacementSource) -> PlacementSource {
-    if matches!(kind, ServiceKind::Llm) {
+    if kind.is_standing() {
         PlacementSource::Standing
     } else {
         requested
@@ -857,12 +858,16 @@ impl Inner {
                 })
                 .cloned()
                 .collect();
-            // Relocatable first (cheapest to evict — move not kill), then largest
-            // peak first so the greedy loop frees the deficit by evicting the
-            // FEWEST residents.
+            // A standing service that cannot move (the always-on text embedder)
+            // goes LAST: every other caller on the box depends on it, so it is the
+            // victim of last resort. Then relocatable first (cheapest to evict —
+            // move not kill), then largest peak first so the greedy loop frees the
+            // deficit by evicting the FEWEST residents.
+            let last_resort = |p: &Placement| p.kind.is_standing() && !p.relocatable;
             victims.sort_by(|a, b| {
-                b.relocatable
-                    .cmp(&a.relocatable)
+                last_resort(a)
+                    .cmp(&last_resort(b))
+                    .then(b.relocatable.cmp(&a.relocatable))
                     .then(b.peak_mb.cmp(&a.peak_mb))
             });
 
@@ -1546,6 +1551,55 @@ mod tests {
             10000,
             "LLM budget survives guard drop"
         );
+    }
+
+    /// The text embedder is the other standing service: an observe (its worker
+    /// announcing itself) records it Standing, so a later `loaded:false` announce
+    /// does not drop the reservation the always-on service depends on.
+    #[test]
+    fn text_embed_placement_is_standing() {
+        let p = Placer::new();
+        p.set_cards(cards());
+        p.set_engine(ServiceKind::TextEmbed, desc(1600, B, &[B], &[], false));
+        p.observe(ServiceKind::TextEmbed, B);
+        assert!(!p.unobserve_observed(ServiceKind::TextEmbed));
+        assert_eq!(
+            p.occupancy()[1].residents,
+            vec![(ServiceKind::TextEmbed, 1600)]
+        );
+    }
+
+    /// Evicted last: when evicting the other qualifying residents covers the
+    /// deficit, the always-on text embedder stays, even though peak-first order
+    /// alone would have picked it.
+    #[test]
+    fn text_embed_is_the_victim_of_last_resort() {
+        let p = Placer::new();
+        p.set_cards(cards());
+        p.set_engine(
+            ServiceKind::TextEmbed,
+            desc(3000, B, &[B], &[ServiceKind::Flux], false),
+        );
+        p.set_engine(
+            ServiceKind::Stt,
+            desc(1500, B, &[B], &[ServiceKind::Flux], false),
+        );
+        p.set_engine(ServiceKind::Flux, desc(13000, B, &[B], &[], false));
+        p.seed_resident(ServiceKind::TextEmbed);
+        let _ = p.try_place(ServiceKind::Stt).unwrap();
+        p.release(ServiceKind::Stt);
+        p.observe(ServiceKind::Stt, B);
+        // 16000 − 3000 − 1500 = 11500 free; flux needs 13000. Evicting stt alone
+        // frees enough.
+        let d = p.try_place(ServiceKind::Flux).unwrap();
+        assert_eq!(d.card_uuid.as_deref(), Some(B));
+        assert_eq!(d.evict, vec![ServiceKind::Stt]);
+
+        // With no other victim left, it does go.
+        p.release(ServiceKind::Flux);
+        p.set_engine(ServiceKind::Flux, desc(15000, B, &[B], &[], false));
+        let d = p.try_place(ServiceKind::Flux).unwrap();
+        assert_eq!(d.evict, vec![ServiceKind::TextEmbed]);
     }
 
     // ── exclusive-mode hold ──────────────────────────────────────────────────

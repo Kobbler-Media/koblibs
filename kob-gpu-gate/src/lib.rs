@@ -181,10 +181,15 @@ pub enum ServiceKind {
     /// reservation would let the scheduler admit a co-tenant onto a 12 GB card
     /// that has no room for one. It is also 3060-pinned by UUID in compose.
     Pixal3d,
+    /// The always-on EmbeddingGemma-2 text embedder (`embed-text`). Its requests
+    /// never acquire: like the LLM it holds a STANDING reservation on its home
+    /// card, and it is evicted only as a last resort (see the victim ordering in
+    /// `placement.rs`).
+    TextEmbed,
 }
 
 impl ServiceKind {
-    pub const ALL: [ServiceKind; 17] = [
+    pub const ALL: [ServiceKind; 18] = [
         ServiceKind::Llm,
         ServiceKind::Tts,
         ServiceKind::Avatar,
@@ -202,6 +207,7 @@ impl ServiceKind {
         ServiceKind::MinimaxH3,
         ServiceKind::Spar3d,
         ServiceKind::Pixal3d,
+        ServiceKind::TextEmbed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -223,6 +229,7 @@ impl ServiceKind {
             ServiceKind::MinimaxH3 => "minimax_h3",
             ServiceKind::Spar3d => "spar3d",
             ServiceKind::Pixal3d => "pixal3d",
+            ServiceKind::TextEmbed => "text_embed",
         }
     }
 
@@ -247,8 +254,16 @@ impl ServiceKind {
             "minimax_h3" => Some(ServiceKind::MinimaxH3),
             "spar3d" => Some(ServiceKind::Spar3d),
             "pixal3d" => Some(ServiceKind::Pixal3d),
+            "text_embed" => Some(ServiceKind::TextEmbed),
             _ => None,
         }
+    }
+
+    /// Services that keep a standing reservation with no guard held: seeded at
+    /// boot, re-seeded on their home card once an eviction's contention clears,
+    /// and never reclaimed as idle by the queue planner.
+    pub fn is_standing(self) -> bool {
+        matches!(self, ServiceKind::Llm | ServiceKind::TextEmbed)
     }
 
     /// For a light TTS/music engine, the `ServiceUrls` registry tag(s) whose
@@ -295,6 +310,7 @@ struct ServiceUrls {
     stt: Option<String>,
     tts: Vec<TtsService>,
     vision: Option<String>,
+    text_embed: Option<String>,
     matting: Option<String>,
     music: Vec<MusicService>,
     /// Drain/unload registry for the LLM + the former heavies.
@@ -304,7 +320,7 @@ struct ServiceUrls {
 /// Length of the per-service `service_enabled` array. Kept in lockstep with the
 /// `ServiceKind` enum + `ServiceKind::ALL` by the const assert below, so adding a
 /// variant without extending both fails to compile instead of panicking at runtime.
-const SERVICE_COUNT: usize = 17;
+const SERVICE_COUNT: usize = 18;
 const _: () = assert!(
     ServiceKind::ALL.len() == SERVICE_COUNT,
     "ServiceKind::ALL and the service_enabled array must stay in lockstep"
@@ -573,6 +589,7 @@ impl GpuLock {
                 AtomicBool::new(true), // MinimaxH3
                 AtomicBool::new(true), // Spar3d
                 AtomicBool::new(true), // Pixal3d
+                AtomicBool::new(true), // TextEmbed
             ]),
             placer: Placer::new(),
             decision_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -617,6 +634,13 @@ impl GpuLock {
     /// Register the TTS engines the gate should unload during eviction.
     pub fn set_tts_services(&self, services: Vec<TtsService>) {
         self.service_urls.lock().unwrap().tts = services;
+    }
+
+    /// Register the always-on text embedder so the gate can unload it
+    /// (`POST {url}/unload`) when a heavy job has nowhere else to go, and so the
+    /// reconcile loop polls its `/v1/gpu/status`.
+    pub fn set_text_embed_url(&self, url: Option<String>) {
+        self.service_urls.lock().unwrap().text_embed = url.filter(|u| !u.is_empty());
     }
 
     /// Register the matting service URL so the gate can SIGKILL its worker when it
@@ -713,6 +737,7 @@ impl GpuLock {
             };
             add(ServiceKind::Stt, urls.stt.as_deref());
             add(ServiceKind::Vision, urls.vision.as_deref());
+            add(ServiceKind::TextEmbed, urls.text_embed.as_deref());
             add(ServiceKind::Matting, urls.matting.as_deref());
             // Music keeps one shared URL Vec across two budget lines: resolve
             // each kind's own worker URL by its registry tag.
@@ -1128,10 +1153,33 @@ impl GpuLock {
     /// dropped. Note it deliberately does not touch `keep`, so a caller that also
     /// needs the keeper's own worker unloaded must do that itself.
     pub async fn evict_all_except(&self, keep: ServiceKind) -> Vec<ServiceKind> {
+        self.evict_all_except_sparing(keep, &[]).await
+    }
+
+    /// [`Self::evict_all_except`], leaving each kind in `spare` resident when its
+    /// card's budget still balances under the current hold (`used ≤ total`).
+    ///
+    /// For a standing co-tenant (the text embedder) that the keeper's reservation
+    /// was sized to leave room for: unloading it only to have it reload beside the
+    /// keeper moments later buys nothing, and reloading it AFTER the keeper has
+    /// claimed its memory is the order that can OOM. A spared kind whose card is
+    /// over budget is evicted like everything else — call [`Self::set_exclusive_with`]
+    /// first, or there is no hold to measure against.
+    pub async fn evict_all_except_sparing(
+        &self,
+        keep: ServiceKind,
+        spare: &[ServiceKind],
+    ) -> Vec<ServiceKind> {
         let resident: Vec<ServiceKind> = self
             .occupancy()
             .into_iter()
-            .flat_map(|c| c.residents.into_iter().map(|(k, _peak)| k))
+            .flat_map(|c| {
+                let fits = c.used_mb <= c.total_mb;
+                c.residents
+                    .into_iter()
+                    .map(|(k, _peak)| k)
+                    .filter(move |k| !(fits && spare.contains(k)))
+            })
             .filter(|k| *k != keep)
             .collect();
         if resident.is_empty() {
@@ -1367,7 +1415,7 @@ impl GpuLock {
             // Re-establish the always-resident LLM's standing reservation — a
             // disable dropped it, and re-enable must put its peak back on the
             // budget or a spilling heavy would admit on top of the warm worker.
-            if matches!(kind, ServiceKind::Llm) {
+            if kind.is_standing() {
                 self.placer.seed_resident(kind);
             }
             // Re-enabling can unblock acquirers waiting on this service.
@@ -1392,13 +1440,17 @@ impl GpuLock {
     /// SIGKILL a light service's worker via its unload URL.
     async fn unload_service(&self, kind: ServiceKind) -> bool {
         match kind {
-            ServiceKind::Stt | ServiceKind::Vision | ServiceKind::Matting => {
+            ServiceKind::Stt
+            | ServiceKind::Vision
+            | ServiceKind::Matting
+            | ServiceKind::TextEmbed => {
                 let url = {
                     let urls = self.service_urls.lock().unwrap();
                     match kind {
                         ServiceKind::Stt => urls.stt.clone(),
                         ServiceKind::Vision => urls.vision.clone(),
                         ServiceKind::Matting => urls.matting.clone(),
+                        ServiceKind::TextEmbed => urls.text_embed.clone(),
                         _ => unreachable!(),
                     }
                 };
@@ -1548,30 +1600,35 @@ impl GpuLock {
         self.placer.seed_resident(kind)
     }
 
-    /// Reclaim the always-resident LLM's **home** card once the contention that
-    /// evicted it clears. Called every reconcile tick: if the LLM was dropped and
-    /// its home card is free again, re-seed its standing reservation on home so it's
-    /// ready without waiting for the next request. Skipped when the gate is globally
-    /// disabled or the LLM is administratively disabled. Home-only by design (the
-    /// "drop the LLM until home is clean, then bring it back" behaviour) — it never
-    /// roams the LLM to a spill card on its own.
+    /// Reclaim each standing service's **home** card ([`ServiceKind::is_standing`]:
+    /// the LLM and the text embedder) once the contention that evicted it clears.
+    /// Called every reconcile tick: if one was dropped and its home card is free
+    /// again, re-seed its standing reservation on home so it's ready without
+    /// waiting for the next request. Skipped when the gate is globally disabled or
+    /// the service is administratively disabled. Home-only by design (the "drop it
+    /// until home is clean, then bring it back" behaviour) — it never roams to a
+    /// spill card on its own.
     pub fn rehome_standing(&self) {
-        let kind = ServiceKind::Llm;
-        if !self.enabled.load(Ordering::Relaxed) || !self.is_service_enabled(kind) {
+        if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
-        // Don't re-home into the gap between two queued jobs. Re-seeding here puts
-        // the LLM back on the home card that the *next* queued job is about to
-        // evict it from, so that job pays a drain (900 s budget) the job before it
-        // had already paid — every time, all night. Only pending work that would
-        // actually evict it suppresses this; anything else re-homes as before.
         let pending = self.pending_demand.lock().unwrap().clone();
-        if !pending.is_empty() && self.placer.evictable_by_any(kind, &pending) {
-            return;
-        }
-        if let Some(card) = self.placer.rehome_standing(kind) {
-            info!(service = ?kind, card = %card, "GPU: reclaimed home for standing service");
-            self.vacancy.notify_waiters();
+        for kind in ServiceKind::ALL.into_iter().filter(|k| k.is_standing()) {
+            if !self.is_service_enabled(kind) {
+                continue;
+            }
+            // Don't re-home into the gap between two queued jobs. Re-seeding here
+            // puts the service back on the home card that the *next* queued job is
+            // about to evict it from, so that job pays a drain (900 s budget for
+            // the LLM) the job before it had already paid — every time, all night.
+            // Only pending work that would actually evict it suppresses this.
+            if !pending.is_empty() && self.placer.evictable_by_any(kind, &pending) {
+                continue;
+            }
+            if let Some(card) = self.placer.rehome_standing(kind) {
+                info!(service = ?kind, card = %card, "GPU: reclaimed home for standing service");
+                self.vacancy.notify_waiters();
+            }
         }
     }
 
@@ -2718,6 +2775,62 @@ mod tests {
             residents.contains(&ServiceKind::Flux),
             "an unconfirmed victim must KEEP its reservation"
         );
+    }
+
+    fn resident(g: &GpuLock, kind: ServiceKind) -> bool {
+        g.occupancy()
+            .iter()
+            .any(|c| c.residents.iter().any(|(k, _)| *k == kind))
+    }
+
+    /// The text embedder rides out Beefy when the reservation leaves it room, and
+    /// is unloaded like any peer when it does not.
+    #[tokio::test]
+    async fn exclusive_sweep_spares_a_standing_co_tenant_only_when_it_fits() {
+        for (reserve_b, spared) in [(14000, true), (15000, false)] {
+            let g = GpuLock::new();
+            g.set_cards(cards());
+            g.set_text_embed_url(Some(stub_unload_endpoint().await));
+            g.set_engine_config(
+                ServiceKind::TextEmbed,
+                desc(1600, B, &[B], &[ServiceKind::Flux], false),
+            );
+            g.seed_resident(ServiceKind::TextEmbed);
+            g.set_exclusive_with(
+                ServiceKind::Llm,
+                &[ServiceKind::TextEmbed],
+                HashMap::from([(A.to_string(), 12000), (B.to_string(), reserve_b)]),
+            );
+            let failed = g
+                .evict_all_except_sparing(ServiceKind::Llm, &[ServiceKind::TextEmbed])
+                .await;
+            assert!(failed.is_empty());
+            assert_eq!(
+                resident(&g, ServiceKind::TextEmbed),
+                spared,
+                "reserve {reserve_b} on a 16000 card with a 1600 embedder"
+            );
+        }
+    }
+
+    /// A standing kind is re-seeded on its home card once room comes back, the
+    /// same way the LLM is.
+    #[tokio::test]
+    async fn rehome_reseeds_the_text_embedder() {
+        let g = GpuLock::new();
+        g.set_cards(cards());
+        g.set_engine_config(
+            ServiceKind::TextEmbed,
+            desc(1600, B, &[B], &[ServiceKind::Flux], false),
+        );
+        assert!(!resident(&g, ServiceKind::TextEmbed));
+        g.rehome_standing();
+        assert!(resident(&g, ServiceKind::TextEmbed));
+        assert_eq!(
+            ServiceKind::parse("text_embed"),
+            Some(ServiceKind::TextEmbed)
+        );
+        assert_eq!(ServiceKind::TextEmbed.as_str(), "text_embed");
     }
 
     // ── exclusive allow-list ─────────────────────────────────────────────────
