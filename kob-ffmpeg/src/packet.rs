@@ -87,6 +87,27 @@ impl Packet {
         unsafe { (*self.ptr).duration }
     }
 
+    /// Byte offset of the packet in its input, or -1 when the demuxer does not know it.
+    #[inline]
+    pub fn pos(&self) -> i64 {
+        unsafe { (*self.ptr).pos }
+    }
+
+    /// `(skip_samples, discard_padding)` from the packet's `AV_PKT_DATA_SKIP_SAMPLES`
+    /// side data, the encoder delay and end padding a gapless decode trims.
+    pub fn skip_samples(&self) -> Option<(u32, u32)> {
+        let mut size = 0usize;
+        let data = unsafe {
+            ffi::av_packet_get_side_data(self.ptr, ffi::AV_PKT_DATA_SKIP_SAMPLES, &mut size)
+        };
+        if data.is_null() || size < 8 {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(data, 8) };
+        let le = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        Some((le(0), le(4)))
+    }
+
     /// Raw packet data as a byte slice. Returns empty slice if no data.
     pub fn data(&self) -> &[u8] {
         unsafe {

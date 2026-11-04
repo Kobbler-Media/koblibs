@@ -49,6 +49,7 @@ pub mod detect;
 pub mod hybrid_io;
 pub mod interlace;
 pub mod iptv;
+pub mod pcm_stream;
 pub mod probe;
 pub mod remux;
 pub mod session;

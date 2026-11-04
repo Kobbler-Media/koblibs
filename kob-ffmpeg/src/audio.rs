@@ -196,7 +196,24 @@ pub fn extract_pcm_range(
     run: Option<&crate::progress::RunContext>,
     on_data: &mut dyn FnMut(&[u8]) -> bool,
 ) -> Result<()> {
-    let mut ctx = InputContext::open_path(path)?;
+    extract_pcm_from(
+        InputContext::open_path(path)?,
+        sample_rate,
+        offset_secs,
+        duration_secs,
+        run,
+        on_data,
+    )
+}
+
+pub(crate) fn extract_pcm_from(
+    mut ctx: InputContext,
+    sample_rate: i32,
+    offset_secs: f64,
+    duration_secs: f64,
+    run: Option<&crate::progress::RunContext>,
+    on_data: &mut dyn FnMut(&[u8]) -> bool,
+) -> Result<()> {
     ctx.find_stream_info()?;
 
     let audio_idx = ctx.find_best_stream(MediaType::Audio).ok_or_else(|| {

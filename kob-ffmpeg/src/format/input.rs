@@ -602,6 +602,10 @@ impl Stream<'_> {
         crate::types::SampleFormat::from_raw(unsafe { (*self.codec_parameters()).format })
     }
 
+    pub fn sample_rate(&self) -> i32 {
+        unsafe { (*self.codec_parameters()).sample_rate }
+    }
+
     /// Channel layout (audio streams).
     pub fn channel_layout(&self) -> crate::types::ChannelLayout {
         crate::types::ChannelLayout::from_raw(unsafe { (*self.codec_parameters()).ch_layout })
