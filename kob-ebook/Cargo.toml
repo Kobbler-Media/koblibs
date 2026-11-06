@@ -7,9 +7,12 @@ description = "Native ebook conversion: source formats -> EPUB via boko, EPUB ->
 license = "AGPL-3.0-only"
 
 [dependencies]
-# Fork of zacharydenton/boko, pinned to upstream master plus PR #25 and the
+# Fork of zacharydenton/boko, pinned to upstream master plus PR #25, the
 # CFI source map reader packs locate text with (Chapter::text_cfi /
-# resolve_cfi), which upstream does not have.
+# resolve_cfi), and the cascade reader packs need for book styling
+# (::first-letter dropcaps, vertical-align lengths, the browser's hr border,
+# background images),
+# none of which upstream has.
 #
 # 0.5.0 (the crates.io release) drops every KF8 stylesheet flow on AZW3/MOBI
 # import: it rewrites `kindle:flow:NNNN` refs into `styles/styleNNNN.css` but
@@ -22,7 +25,7 @@ license = "AGPL-3.0-only"
 # this), which PR #25 resolves.
 #
 # Drop the fork once upstream ships all of it.
-boko = { git = "https://github.com/tinyfiddler/boko", rev = "a5f0ce3e0664dbe9aefec7a32ec8910353ab5708", default-features = false }
+boko = { git = "https://github.com/tinyfiddler/boko", rev = "f20d150ca5441aab7e1afe1642eb5ee25fcf662c", default-features = false }
 quick-xml = "0.42.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

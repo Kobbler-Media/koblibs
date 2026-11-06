@@ -9,7 +9,9 @@
 
 mod blocks;
 mod build;
+mod decor;
 mod fixed_page;
+mod floats;
 mod kobo;
 mod leaf;
 mod model;
@@ -25,8 +27,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 pub use model::{
-    Align, Baseline, Block, BlockKind, BlockPos, Cell, Chapter, ChapterEntry, Dropcap, FixedLayout,
-    FixedPage, FontFace, Fragment, Frame, Hyphens, Image, Link, Manifest, Position, Row, Span,
+    Align, Baseline, Block, BlockKind, BlockPos, Borders, Cell, Chapter, ChapterEntry, Clear,
+    Container, Dropcap, FixedLayout, FixedPage, Float, FontFace, Fragment, Frame, Hyphens, Image,
+    Line, LineStyle, Link, Manifest, Measure, Position, Row, RuleImage, RuleStyle, Side, Span,
     SpreadSide, Table, TextStyle, TocEntry, Transform,
 };
 pub use sidecar::{ChapterSidecar, KoboEntry, Segment, resolve_cfi};
@@ -35,7 +38,7 @@ use crate::Result;
 
 /// Revision of the pack format and of the builder's output. Bump it whenever
 /// a rebuilt pack would differ, so stored packs can be found and rebuilt.
-pub const READER_PACK_GENERATION: u32 = 1;
+pub const READER_PACK_GENERATION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReaderPack {

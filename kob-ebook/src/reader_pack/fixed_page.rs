@@ -361,6 +361,7 @@ pub(crate) fn extract(
                 alt: img.alt.clone(),
                 width: Some(w),
                 height: Some(h),
+                column_width: None,
             },
             page_width: w,
             page_height: h,

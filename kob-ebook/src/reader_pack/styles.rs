@@ -2,14 +2,17 @@ use std::collections::HashMap;
 
 use boko::ComputedStyle;
 use boko::style::{
-    BreakValue, FontStyle, FontVariant, Hyphens as BokoHyphens, Length, TextAlign, TextTransform,
-    VerticalAlign,
+    BreakValue, Color, Display, FontStyle, FontVariant, Hyphens as BokoHyphens, Length, TextAlign,
+    TextTransform, VerticalAlign,
 };
 
+use super::decor;
 use super::model::{Align, Baseline, Dropcap, Hyphens, TextStyle, Transform};
 
 /// The CSS default font size, which `px` lengths are measured against.
 pub(crate) const BASE_PX: f32 = 16.0;
+
+const NORMAL_LINE_HEIGHT: f32 = 1.2;
 
 /// What a percentage of the containing block's width comes to, in em: a
 /// reader column is around thirty em wide, and the client has no box to
@@ -76,6 +79,24 @@ impl StyleTable {
         i
     }
 
+    /// A one-letter dropcap widened to the whole CSS first letter: the
+    /// punctuation before and after it goes large with it.
+    pub fn with_first_letter(&mut self, id: u32, text: &str) -> u32 {
+        let Some(dropcap) = self.styles[id as usize].dropcap.filter(|d| d.chars == 1) else {
+            return id;
+        };
+        let chars = first_letter_len(text);
+        if chars <= 1 {
+            return id;
+        }
+        let mut style = self.styles[id as usize].clone();
+        style.dropcap = Some(Dropcap {
+            chars: chars.min(u8::MAX as usize) as u8,
+            ..dropcap
+        });
+        self.intern(style)
+    }
+
     pub fn into_styles(self) -> Vec<TextStyle> {
         self.styles
     }
@@ -92,10 +113,7 @@ impl StyleTable {
             family: s.font_family.as_deref().and_then(|f| self.family(f)),
             letter_spacing: em(s.letter_spacing, size).filter(|v| *v != 0.0),
             word_spacing: em(s.word_spacing, size).filter(|v| *v != 0.0),
-            color: s
-                .color
-                .filter(|c| c.a != 0)
-                .map(|c| format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)),
+            color: s.color.filter(|c| c.a != 0).map(hex),
             transform: match s.text_transform {
                 TextTransform::Uppercase => Some(Transform::Uppercase),
                 TextTransform::Lowercase => Some(Transform::Lowercase),
@@ -104,13 +122,14 @@ impl StyleTable {
             },
             underline: s.text_decoration_underline,
             strike: s.text_decoration_line_through,
-            baseline: match s.vertical_align {
-                VerticalAlign::Super => Some(Baseline::Super),
-                VerticalAlign::Sub => Some(Baseline::Sub),
-                _ => None,
-            },
+            baseline: baseline(s),
             ..TextStyle::default()
         };
+        if s.display == Display::Inline {
+            out.shift = shift(s);
+            out.background = decor::background(s);
+            out.borders = decor::borders(s);
+        }
         if role == StyleRole::Block {
             out.align = match s.text_align {
                 TextAlign::Start => None,
@@ -165,7 +184,123 @@ impl StyleTable {
     }
 }
 
-fn round(v: f32) -> f32 {
+/// The length in UTF-16 units, the client's string offsets, of the CSS first
+/// letter: leading punctuation, one letter or digit, and the punctuation after it.
+fn first_letter_len(text: &str) -> usize {
+    let mut chars = text.chars().peekable();
+    let mut len = 0;
+    while let Some(&c) = chars.peek()
+        && is_first_letter_punctuation(c)
+    {
+        len += c.len_utf16();
+        chars.next();
+    }
+    match chars.next() {
+        Some(c) if c.is_alphanumeric() => len += c.len_utf16(),
+        _ => return len.max(1),
+    }
+    while let Some(&c) = chars.peek()
+        && is_first_letter_punctuation(c)
+    {
+        len += c.len_utf16();
+        chars.next();
+    }
+    len
+}
+
+/// Open, close, initial, final and other punctuation, which CSS counts into a
+/// first letter; dashes and connectors it leaves out.
+fn is_first_letter_punctuation(c: char) -> bool {
+    matches!(
+        c,
+        '!' | '"'
+            | '#'
+            | '%'
+            | '&'
+            | '\''
+            | '('
+            | ')'
+            | '*'
+            | ','
+            | '.'
+            | '/'
+            | ':'
+            | ';'
+            | '?'
+            | '@'
+            | '['
+            | '\\'
+            | ']'
+            | '{'
+            | '}'
+            | '¡'
+            | '§'
+            | '«'
+            | '¶'
+            | '·'
+            | '»'
+            | '¿'
+            | '‘'
+            | '’'
+            | '‚'
+            | '‛'
+            | '“'
+            | '”'
+            | '„'
+            | '‟'
+            | '‹'
+            | '›'
+            | '…'
+            | '‰'
+            | '′'
+            | '″'
+            | '〈'
+            | '〉'
+            | '「'
+            | '」'
+            | '『'
+            | '』'
+    )
+}
+
+/// `top` and `bottom` on an inline lift or drop it the way `super` and
+/// `sub` do; on a table cell they place its content instead.
+fn baseline(s: &ComputedStyle) -> Option<Baseline> {
+    let inline = s.display == Display::Inline;
+    match s.vertical_align {
+        VerticalAlign::Super => Some(Baseline::Super),
+        VerticalAlign::Sub => Some(Baseline::Sub),
+        VerticalAlign::Top | VerticalAlign::TextTop if inline => Some(Baseline::Super),
+        VerticalAlign::Bottom | VerticalAlign::TextBottom if inline => Some(Baseline::Sub),
+        _ => None,
+    }
+}
+
+/// A `vertical-align` length, in the span's own em; a percentage is of its line height.
+fn shift(s: &ComputedStyle) -> Option<f32> {
+    let size = s.font_size_abs.0;
+    let line_height = match s.line_height {
+        Length::Em(v) => v,
+        Length::Px(v) => v / (BASE_PX * size),
+        Length::Rem(v) => v / size,
+        Length::Percent(v) => v / 100.0,
+        Length::Auto => NORMAL_LINE_HEIGHT,
+    };
+    let em = match s.vertical_align_length {
+        Length::Auto => return None,
+        Length::Em(v) => v,
+        Length::Px(v) => v / (BASE_PX * size),
+        Length::Rem(v) => v / size,
+        Length::Percent(v) => v / 100.0 * line_height,
+    };
+    Some(round(em)).filter(|v| *v != 0.0)
+}
+
+pub(crate) fn hex(c: Color) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)
+}
+
+pub(crate) fn round(v: f32) -> f32 {
     (v * 1000.0).round() / 1000.0
 }
 

@@ -211,6 +211,7 @@ fn images() {
         alt: alt.map(String::from),
         width: Some(w),
         height: Some(h),
+        column_width: None,
     };
     assert_eq!(
         ch.blocks[0].image,
@@ -331,4 +332,18 @@ fn footnotes_and_links() {
 fn inline_anchors_carry_offsets() {
     let ch = chapter(r#"<p>  Lead <span id="mid">middle</span> end</p>"#);
     assert_eq!(ch.anchors["mid"].offset, 5);
+}
+
+#[test]
+fn a_container_that_avoids_breaks_keeps_its_blocks_together() {
+    let epub = Epub::new()
+        .asset("big.png", "image/png", PNG_1200X800)
+        .css(".keep { page-break-inside: avoid; }")
+        .doc(
+            "c1.xhtml",
+            r#"<div class="keep"><div><img src="big.png" alt=""/></div><p>Caption.</p></div><p>Next.</p><div><p>Loose.</p><p>Ends.</p></div>"#,
+        );
+    let ch = one(epub);
+    let keeps: Vec<_> = ch.blocks.iter().map(|b| b.keep_with_next).collect();
+    assert_eq!(keeps, [true, false, false, false, false]);
 }

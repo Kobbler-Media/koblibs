@@ -120,6 +120,13 @@ pub struct TextStyle {
     pub strike: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<Baseline>,
+    /// A baseline raised (positive) or lowered by this many of the span's own em.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shift: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub borders: Option<Borders>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyphens: Option<Hyphens>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -217,6 +224,12 @@ pub struct Block {
     pub inset_end: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<Frame>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub frame_plain: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub containers: Vec<Container>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub centred: Option<Measure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marker: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -228,9 +241,140 @@ pub struct Block {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<Image>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<RuleStyle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table: Option<Table>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed: Option<FixedPage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub float: Option<Float>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear: Option<Clear>,
+}
+
+/// An image set against one edge of the column, the blocks after it flowing
+/// beside it; `gap` is the room in em its margin and padding keep on the
+/// side the text runs along.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Float {
+    pub side: Side,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub gap: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Clear {
+    Left,
+    Right,
+    Both,
+}
+
+/// A decorated element around one or more blocks, repeated on each of them.
+/// `id` is unique within the block list, so two adjacent boxes alike in every
+/// other field stay two. Lengths are in em; the insets place its border edge,
+/// the spaces sit between that edge and its first and last blocks.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Container {
+    pub id: u32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub inset_start: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub inset_end: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub space_top: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub space_bottom: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<Line>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right: Option<Line>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<Line>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<Line>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    /// Corner radii in em: top-left, top-right, bottom-right, bottom-left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<[f32; 4]>,
+    /// The content width of a box centred by `margin: auto`; `inner` is the
+    /// border and padding it adds across both sides, in em.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub centred: Option<Measure>,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub inner: f32,
+}
+
+/// A CSS width: in em, or as a fraction of the column it sits in.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Measure {
+    Em(f32),
+    Fraction(f32),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Borders {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<Line>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right: Option<Line>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<Line>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<Line>,
+}
+
+/// `color` is unset when the line takes the text colour.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Line {
+    pub width: f32,
+    pub style: LineStyle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineStyle {
+    Solid,
+    Dashed,
+    Dotted,
+    Double,
+}
+
+/// A rule the book draws itself, as a line or as a picture; `length` is a
+/// fraction of the column, `height` the rule's own in em.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleStyle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<Line>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<RuleImage>,
+}
+
+/// An ornament drawn as the rule, once and centred or tiled across it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleImage {
+    pub src: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub repeat: bool,
 }
 
 impl Block {
@@ -277,11 +421,15 @@ pub struct Image {
     pub width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_width: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Table {
     pub rows: Vec<Row>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub collapse: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -296,6 +444,8 @@ pub struct Cell {
     pub blocks: Vec<Block>,
     pub colspan: u32,
     pub rowspan: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub borders: Option<Borders>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

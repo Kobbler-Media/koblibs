@@ -5,15 +5,20 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use boko::model::{AnchorTarget, ResolvedLinks};
-use boko::style::{BreakValue, Length, ListStyleType};
+use boko::style::{BorderCollapse, BreakValue, Length, ListStyleType};
 use boko::{Chapter, ComputedStyle, NodeId, Role, SourceSegment};
 
+use super::decor;
+use super::floats;
 use super::leaf::{LeafText, PathCache, SpanAttrs};
-use super::model::{Block, BlockKind, BlockPos, Cell, Frame, Image, Link, LinkTarget, Row, Table};
+use super::model::{
+    Block, BlockKind, BlockPos, Borders, Cell, Clear, Container, Float, Frame, Image, Link,
+    LinkTarget, Measure, Row, Table,
+};
 use super::notes::{NoteIndex, global, is_inline_role};
 use super::sidecar::Segment;
 use super::source::SourceDoc;
-use super::styles::{StyleRole, StyleTable, em_or_zero, forced_break};
+use super::styles::{StyleRole, StyleTable, em_or_zero, forced_break, round};
 
 pub(crate) struct BookCx<'a> {
     pub chapters: &'a [Arc<Chapter>],
@@ -55,6 +60,23 @@ enum Mode {
 struct LeafMode {
     dropcap: bool,
     verbatim: bool,
+    floated: Option<Float>,
+}
+
+struct LeafImage {
+    id: NodeId,
+    tiny: bool,
+    float: Option<Float>,
+    leading: bool,
+}
+
+/// A floated element, which floats only if all it holds is one image.
+struct OpenFloat {
+    float: Float,
+    fraction: Option<f32>,
+    first_block: usize,
+    gap: f32,
+    floor: f32,
 }
 
 struct ListState {
@@ -66,6 +88,16 @@ struct Saved {
     insets: (f32, f32),
     frames: usize,
     lists: usize,
+    boxes: usize,
+    measures: usize,
+    floats: usize,
+    first_block: usize,
+}
+
+struct OpenBox {
+    container: Container,
+    edge: f32,
+    first: Option<usize>,
 }
 
 const IMAGE_TINY_EM: f32 = 2.0;
@@ -73,6 +105,7 @@ const IMAGE_TINY_EM: f32 = 2.0;
 /// agent sheet leaves out because its own exporters draw none.
 const LIST_INSET_EM: f32 = 2.5;
 const BLOCK_BREAK_EM: f32 = 1.0;
+const KEEP_TOGETHER_MAX: usize = 6;
 
 pub(crate) struct Flattener<'a> {
     book: &'a BookCx<'a>,
@@ -87,11 +120,19 @@ pub(crate) struct Flattener<'a> {
     paths: PathCache,
     out: Flat,
     gap: f32,
+    /// The part of `gap` a border holds apart: margins collapse only above it.
+    floor: f32,
     pending_break: bool,
+    pending_clear: Option<Clear>,
     marker: Option<String>,
     insets: (f32, f32),
-    frames: Vec<Frame>,
+    frames: Vec<(Frame, bool)>,
     lists: Vec<ListState>,
+    boxes: Vec<OpenBox>,
+    next_box: u32,
+    measures: Vec<Measure>,
+    floats: Vec<OpenFloat>,
+    collapsing: bool,
 }
 
 pub(crate) fn flatten_chapter(
@@ -132,11 +173,18 @@ impl<'a> Flattener<'a> {
             paths: PathCache::default(),
             out: Flat::default(),
             gap: 0.0,
+            floor: 0.0,
             pending_break: false,
+            pending_clear: None,
             marker: None,
             insets: (0.0, 0.0),
             frames: Vec::new(),
             lists: Vec::new(),
+            boxes: Vec::new(),
+            next_box: 0,
+            measures: Vec::new(),
+            floats: Vec::new(),
+            collapsing: false,
         }
     }
 
@@ -218,8 +266,20 @@ impl<'a> Flattener<'a> {
             _ if self.is_inline(id) => self.leaf(id, &[id]),
             Role::Rule => {
                 let saved = self.enter(id);
-                let block = self.block(BlockKind::Rule, id);
-                self.push(block, Some(id), None);
+                let look = self.style(id).map_or(decor::RuleLook::Default, decor::rule);
+                if let decor::RuleLook::Default | decor::RuleLook::Drawn(_) = look {
+                    let mut block = self.block(BlockKind::Rule, id);
+                    if let decor::RuleLook::Drawn(mut rule) = look {
+                        if let Some(image) = &mut rule.image
+                            && let Some(&(w, h)) = self.book.image_dims.get(&image.src)
+                        {
+                            image.width = Some(w);
+                            image.height = Some(h);
+                        }
+                        block.rule = Some(rule);
+                    }
+                    self.push(block, Some(id), None);
+                }
                 self.exit(id, saved);
             }
             Role::Table if self.mode == Mode::Flow => self.table(id),
@@ -261,6 +321,10 @@ impl<'a> Flattener<'a> {
             insets: self.insets,
             frames: self.frames.len(),
             lists: self.lists.len(),
+            boxes: self.boxes.len(),
+            measures: self.measures.len(),
+            floats: self.floats.len(),
+            first_block: self.out.blocks.len(),
         };
         let Some(s) = self.style(id) else {
             return saved;
@@ -268,24 +332,78 @@ impl<'a> Flattener<'a> {
         let size = s.font_size_abs.0;
         let role = self.ch.node(id).map(|n| n.role);
         let list = matches!(role, Some(Role::OrderedList | Role::UnorderedList));
-        if !(list && !self.lists.is_empty()) {
-            self.gap = self.gap.max(em_or_zero(s.margin_top, size));
+        let rule = role == Some(Role::Rule);
+        self.pending_clear = floats::merge(self.pending_clear, floats::clear(s));
+        if let Some(float) = floats::float(s) {
+            self.floats.push(OpenFloat {
+                float,
+                fraction: decor::column_width(s),
+                first_block: self.out.blocks.len(),
+                gap: self.gap,
+                floor: self.floor,
+            });
         }
-        self.gap += em_or_zero(s.padding_top, size);
-        let start = em_or_zero(s.margin_left, size) + em_or_zero(s.padding_left, size);
-        self.insets.0 += if list && start == 0.0 {
-            LIST_INSET_EM
-        } else {
-            start
+        if !(list && !self.lists.is_empty()) {
+            self.collapse(em_or_zero(s.margin_top, size));
+        }
+        let margin = |len| {
+            if rule && decor::percent_margin(len) {
+                0.0
+            } else {
+                em_or_zero(len, size)
+            }
         };
-        self.insets.1 += em_or_zero(s.margin_right, size) + em_or_zero(s.padding_right, size);
+        let (margin_start, margin_end) = (margin(s.margin_left), margin(s.margin_right));
+        let decorated = (!rule && self.mode != Mode::Cell)
+            .then(|| decor::container(s))
+            .flatten();
+        let (border_start, border_end) = decorated.as_ref().map_or((0.0, 0.0), |c| {
+            (decor::width(&c.left), decor::width(&c.right))
+        });
+        let centred = (!rule).then(|| decor::centred(s)).flatten();
+        if let Some(measure) = centred {
+            self.measures.push(measure);
+        }
+        if let Some(mut container) = decorated {
+            container.id = self.next_box;
+            if centred.is_some() {
+                container.centred = centred;
+                container.inner = round(
+                    border_start
+                        + border_end
+                        + em_or_zero(s.padding_left, size)
+                        + em_or_zero(s.padding_right, size),
+                );
+            }
+            container.inset_start = self.insets.0 + margin_start;
+            container.inset_end = self.insets.1 + margin_end;
+            self.next_box += 1;
+            let edge = self.gap;
+            self.gap += decor::width(&container.top) + em_or_zero(s.padding_top, size);
+            self.floor = self.gap;
+            self.boxes.push(OpenBox {
+                container,
+                edge,
+                first: None,
+            });
+        } else {
+            self.gap += em_or_zero(s.padding_top, size);
+        }
+        let start = margin_start + em_or_zero(s.padding_left, size);
+        self.insets.0 += border_start
+            + if list && start == 0.0 {
+                LIST_INSET_EM
+            } else {
+                start
+            };
+        self.insets.1 += border_end + margin_end + em_or_zero(s.padding_right, size);
         if forced_break(s.break_before) {
             self.pending_break = true;
         }
         match role {
-            Some(Role::BlockQuote) => self.frames.push(Frame::Quote),
-            Some(Role::Sidebar) => self.frames.push(Frame::Aside),
-            Some(Role::Figure) => self.frames.push(Frame::Figure),
+            Some(Role::BlockQuote) => self.frames.push((Frame::Quote, decor::plain_quote(s))),
+            Some(Role::Sidebar) => self.frames.push((Frame::Aside, false)),
+            Some(Role::Figure) => self.frames.push((Frame::Figure, false)),
             Some(Role::OrderedList | Role::UnorderedList) => self.lists.push(ListState {
                 counter: self.ch.semantics.list_start(id).unwrap_or(1),
                 kind: self.list_type(id),
@@ -300,6 +418,10 @@ impl<'a> Flattener<'a> {
         saved
     }
 
+    fn collapse(&mut self, margin: f32) {
+        self.gap = self.floor + (self.gap - self.floor).max(margin);
+    }
+
     fn exit(&mut self, id: NodeId, saved: Saved) {
         if let Some(s) = self.style(id) {
             let size = s.font_size_abs.0;
@@ -307,13 +429,32 @@ impl<'a> Flattener<'a> {
                 .ch
                 .node(id)
                 .is_some_and(|n| matches!(n.role, Role::OrderedList | Role::UnorderedList));
-            if !(list && saved.lists > 0) {
-                self.gap = self.gap.max(em_or_zero(s.margin_bottom, size));
+            let margin = em_or_zero(s.margin_bottom, size);
+            let padding = em_or_zero(s.padding_bottom, size);
+            if self.boxes.len() > saved.boxes
+                && let Some(open) = self.boxes.pop()
+            {
+                self.gap += padding + decor::width(&open.container.bottom);
+                self.close_box(&open);
+                self.floor = self.gap;
+                self.collapse(margin);
+            } else {
+                if !(list && saved.lists > 0) {
+                    self.collapse(margin);
+                }
+                self.gap += padding;
             }
-            self.gap += em_or_zero(s.padding_bottom, size);
             if forced_break(s.break_after) {
                 self.pending_break = true;
             }
+            if s.break_inside == BreakValue::Avoid {
+                self.keep_together(saved.first_block);
+            }
+        }
+        if self.floats.len() > saved.floats
+            && let Some(open) = self.floats.pop()
+        {
+            self.close_float(open);
         }
         if self.ch.node(id).is_some_and(|n| n.role == Role::ListItem) {
             self.marker = None;
@@ -321,6 +462,53 @@ impl<'a> Flattener<'a> {
         self.insets = saved.insets;
         self.frames.truncate(saved.frames);
         self.lists.truncate(saved.lists);
+        self.boxes.truncate(saved.boxes);
+        self.measures.truncate(saved.measures);
+    }
+
+    /// Holding a figure to its caption is worth a page break; holding a whole
+    /// section together is not, and would only push it a page further on.
+    fn keep_together(&mut self, first: usize) {
+        let blocks = &mut self.out.blocks[first..];
+        if (2..=KEEP_TOGETHER_MAX).contains(&blocks.len()) {
+            let last = blocks.len() - 1;
+            for block in &mut blocks[..last] {
+                block.keep_with_next = true;
+            }
+        }
+    }
+
+    /// A float leaves the flow where it found it: what follows collapses its
+    /// margin with what came before.
+    fn close_float(&mut self, open: OpenFloat) {
+        let [block] = &mut self.out.blocks[open.first_block..] else {
+            return;
+        };
+        let Some(image) = block
+            .image
+            .as_mut()
+            .filter(|_| block.kind == BlockKind::Image)
+        else {
+            return;
+        };
+        if let Some(fraction) = open.fraction {
+            image.column_width = Some(round(fraction * image.column_width.unwrap_or(1.0)));
+        }
+        block.float = Some(open.float);
+        self.gap = open.gap;
+        self.floor = open.floor;
+    }
+
+    fn close_box(&mut self, open: &OpenBox) {
+        let Some(first) = open.first else { return };
+        let space = round(self.gap);
+        for block in &mut self.out.blocks[first..] {
+            for c in &mut block.containers {
+                if c.id == open.container.id {
+                    c.space_bottom = space;
+                }
+            }
+        }
     }
 
     fn next_marker(&mut self, kind: ListStyleType) -> Option<String> {
@@ -344,22 +532,33 @@ impl<'a> Flattener<'a> {
 
     fn block(&mut self, kind: BlockKind, owner: NodeId) -> Block {
         let s = self.style(owner);
+        self.floor = 0.0;
         Block {
             kind,
             space_before: std::mem::take(&mut self.gap),
             inset_start: self.insets.0,
             inset_end: self.insets.1,
-            frame: self.frames.last().copied(),
+            frame: self.frames.last().map(|f| f.0),
+            frame_plain: self.frames.last().is_some_and(|f| f.1),
+            centred: self.measures.last().copied(),
             marker: self.marker.take(),
             break_before: std::mem::take(&mut self.pending_break),
+            clear: self.pending_clear.take(),
             avoid_break_inside: s.is_some_and(|s| s.break_inside == BreakValue::Avoid),
             keep_with_next: s.is_some_and(|s| s.break_after == BreakValue::Avoid),
             ..Block::default()
         }
     }
 
-    fn push(&mut self, block: Block, element: Option<NodeId>, segments: Option<Vec<Segment>>) {
+    fn push(&mut self, mut block: Block, element: Option<NodeId>, segments: Option<Vec<Segment>>) {
         let index = self.out.blocks.len() as u32;
+        for open in &mut self.boxes {
+            if open.first.is_none() {
+                open.container.space_top = round(block.space_before - open.edge);
+                open.first = Some(index as usize);
+            }
+        }
+        block.containers = self.boxes.iter().map(|b| b.container.clone()).collect();
         if self.mode == Mode::Flow {
             if let Some(path) = element.and_then(|e| self.ch.source.element_path(e)) {
                 self.out.elements.insert(index, path);
@@ -381,6 +580,7 @@ impl<'a> Flattener<'a> {
         let mode = LeafMode {
             dropcap: self.style(owner).is_some_and(|s| s.dropcap_lines > 0),
             verbatim,
+            floated: None,
         };
         let attrs = SpanAttrs::default();
         for &id in run {
@@ -388,7 +588,7 @@ impl<'a> Flattener<'a> {
         }
         if text.is_blank() {
             if text.spans.iter().any(|s| s.text.contains('\n')) {
-                self.gap = self.gap.max(BLOCK_BREAK_EM);
+                self.collapse(BLOCK_BREAK_EM);
             }
             let block = self.out.blocks.len() as u32;
             for (anchor, _) in text.anchors {
@@ -396,12 +596,18 @@ impl<'a> Flattener<'a> {
                     .anchors
                     .push((anchor, BlockPos { block, offset: 0 }));
             }
-            for &(image, _) in &images {
-                self.image_block(owner, image);
+            for image in &images {
+                self.image_block(owner, image.id, image.float);
             }
             return;
         }
         text.trim(verbatim);
+        for image in images
+            .iter()
+            .filter(|i| i.leading && i.float.is_some() && !i.tiny)
+        {
+            self.image_block(owner, image.id, image.float);
+        }
         let (kind, level) = match owner_role {
             Some(Role::Heading(l)) => (BlockKind::Heading, Some(l.clamp(1, 6))),
             Some(Role::CodeBlock) => (BlockKind::Code, None),
@@ -413,6 +619,8 @@ impl<'a> Flattener<'a> {
         block.style = self
             .styles
             .of(self.chapter, self.ch, owner_style, StyleRole::Block);
+        let first: String = text.spans.iter().take(4).map(|s| s.text.as_str()).collect();
+        block.style = self.styles.with_first_letter(block.style, &first);
         let segments = (self.mode == Mode::Flow).then(|| {
             let source = &self.ch.source;
             let paths = &mut self.paths;
@@ -432,9 +640,9 @@ impl<'a> Flattener<'a> {
         }
         block.spans = text.spans;
         self.push(block, None, segments);
-        for &(image, tiny) in &images {
-            if !tiny {
-                self.image_block(owner, image);
+        for image in &images {
+            if !image.tiny && !(image.leading && image.float.is_some()) {
+                self.image_block(owner, image.id, image.float);
             }
         }
     }
@@ -446,7 +654,7 @@ impl<'a> Flattener<'a> {
         attrs: &SpanAttrs,
         leaf: LeafMode,
         text: &mut LeafText,
-        images: &mut Vec<(NodeId, bool)>,
+        images: &mut Vec<LeafImage>,
     ) {
         if self.skipped(id) {
             return;
@@ -456,7 +664,12 @@ impl<'a> Flattener<'a> {
             text.anchor(anchor);
         }
         if self.is_image(id) {
-            images.push((id, self.is_tiny(id)));
+            images.push(LeafImage {
+                id,
+                tiny: self.is_tiny(id),
+                float: self.style(id).and_then(floats::float).or(leaf.floated),
+                leading: text.is_blank(),
+            });
             return;
         }
         match node.role {
@@ -503,6 +716,12 @@ impl<'a> Flattener<'a> {
                     self.link_attrs(id, attrs)
                 } else {
                     attrs.clone()
+                };
+                let leaf = LeafMode {
+                    floated: leaf
+                        .floated
+                        .or_else(|| self.style(id).and_then(floats::float)),
+                    ..leaf
                 };
                 for child in self.ch.children(id) {
                     self.inline(child, node.style, &attrs, leaf, text, images);
@@ -603,22 +822,33 @@ impl<'a> Flattener<'a> {
                 .map(str::to_string),
             width: size.map(|s| s.0),
             height: size.map(|s| s.1),
+            column_width: self.style(id).and_then(decor::column_width),
             src,
         })
     }
 
-    fn image_block(&mut self, owner: NodeId, id: NodeId) {
+    fn image_block(&mut self, owner: NodeId, id: NodeId, float: Option<Float>) {
         let Some(image) = self.image(id) else { return };
+        let flow = float.map(|_| (self.gap, self.floor, self.marker.take()));
         let mut block = self.block(BlockKind::Image, owner);
         block.image = Some(image);
+        block.float = float;
         self.push(block, Some(id), None);
+        if let Some(flow) = flow {
+            (self.gap, self.floor, self.marker) = flow;
+        }
     }
 
     fn table(&mut self, id: NodeId) {
         let saved = self.enter(id);
         let mut rows = Vec::new();
         let mut anchors = Vec::new();
+        let collapse = self
+            .style(id)
+            .is_some_and(|s| s.border_collapse == BorderCollapse::Collapse);
+        let outer = std::mem::replace(&mut self.collapsing, collapse);
         self.rows(id, false, &mut rows, &mut anchors);
+        self.collapsing = outer;
         if !rows.is_empty() {
             let index = self.out.blocks.len() as u32;
             for anchor in anchors {
@@ -631,7 +861,7 @@ impl<'a> Flattener<'a> {
                 ));
             }
             let mut block = self.block(BlockKind::Table, id);
-            block.table = Some(Table { rows });
+            block.table = Some(Table { rows, collapse });
             self.push(block, Some(id), None);
         }
         self.exit(id, saved);
@@ -659,10 +889,29 @@ impl<'a> Flattener<'a> {
         }
     }
 
+    /// A collapsed row's own top and bottom borders are drawn by its cells.
+    fn cell_borders(&self, cell: NodeId, row: &Borders) -> Option<Borders> {
+        let own = self
+            .style(cell)
+            .and_then(decor::borders)
+            .unwrap_or_default();
+        let merged = Borders {
+            top: own.top.or_else(|| row.top.clone()),
+            bottom: own.bottom.or_else(|| row.bottom.clone()),
+            ..own
+        };
+        (merged != Borders::default()).then_some(merged)
+    }
+
     fn row(&mut self, id: NodeId, header: bool, anchors: &mut Vec<String>) -> Row {
         let mut cells = Vec::new();
         let mut all_header = true;
         let ch = self.ch;
+        let row_lines = self
+            .style(id)
+            .filter(|_| self.collapsing)
+            .and_then(decor::borders)
+            .unwrap_or_default();
         for cell in ch.children(id) {
             if self.skipped(cell) {
                 continue;
@@ -675,6 +924,7 @@ impl<'a> Flattener<'a> {
                 blocks: f.out.blocks,
                 colspan: ch.semantics.col_span(cell).unwrap_or(1).max(1),
                 rowspan: ch.semantics.row_span(cell).unwrap_or(1).max(1),
+                borders: self.cell_borders(cell, &row_lines),
             });
         }
         Row {
