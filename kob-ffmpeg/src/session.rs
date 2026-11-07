@@ -62,12 +62,10 @@ pub struct SessionConfig {
     /// (corruption transcode windows) to encode only `[start_time, end_secs]`
     /// of the source rather than all the way to EOF.
     pub end_secs: Option<f64>,
-    /// When set, the auto-registered run owns only segments
-    /// `[abs_start, overlay_end_segment)` instead of all segments from
-    /// `abs_start` to end-of-file. Used together with `end_secs` for bounded
-    /// overlay generations so a copy-mode primary run's post-overlay segments
-    /// aren't displaced.
-    pub overlay_end_segment: Option<u32>,
+    /// When set, the auto-registered run owns only these timeline slots instead of
+    /// every slot from its start to end-of-file. Used together with `end_secs` for
+    /// bounded overlay generations so the primary run's segments outside them stay.
+    pub overlay_segments: Option<Range<u32>>,
     /// Field-order removal. `Auto` applies `bwdif` only to interlaced sources.
     pub deinterlace: crate::filter::graph::Deinterlace,
     /// Encoder speed preset (`veryfast`, `medium`, …). `None` leaves the
@@ -112,7 +110,7 @@ impl SessionConfig {
             initial_generation: 0,
             hw_device: None,
             end_secs: None,
-            overlay_end_segment: None,
+            overlay_segments: None,
             deinterlace: crate::filter::graph::Deinterlace::None,
             preset: None,
             tune: None,
@@ -301,7 +299,7 @@ enum SessionCommand {
 
 /// Shared state between the transcode thread and the caller.
 struct SessionState {
-    /// Transcode runs keyed by first absolute segment index.
+    /// Transcode runs keyed by generation.
     runs: BTreeMap<u32, TranscodeRun>,
     /// Flat segment index: abs_segment → generation + run_start. O(1) lookup.
     segment_index: Vec<Option<SegmentEntry>>,
@@ -320,12 +318,32 @@ struct SessionState {
 #[derive(Debug, Clone)]
 struct TranscodeRun {
     generation: u32,
-    #[allow(dead_code)] // stored for debugging/future use
+    run_start: u32,
     start_time_secs: f64,
     segment_count: u32,
     estimated_bytes: u64,
     segment_durations: Vec<f64>,
     end_segment: Option<u32>,
+    /// A bounded run that has written its whole range. Its claimed slots past the
+    /// segments it wrote are then filler: an overlay cut longer than the copy
+    /// segments it replaces covers their time in fewer segments.
+    complete: bool,
+}
+
+impl TranscodeRun {
+    fn claims(&self, abs: u32) -> bool {
+        self.end_segment
+            .is_some_and(|end| abs >= self.run_start && abs < end)
+    }
+}
+
+impl SessionState {
+    fn is_filler(&self, abs: u32) -> bool {
+        self.segment_index
+            .get(abs as usize)
+            .is_some_and(Option::is_none)
+            && self.runs.values().any(|r| r.complete && r.claims(abs))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -395,7 +413,7 @@ impl TranscodeSession {
             let finished = adopt_prior_runs(&mut s, &output_dir, &config.prior_runs);
             let from = ((config.start_time.unwrap_or(0.0) / segment_duration).floor() as u32)
                 .min(total_segments.saturating_sub(1));
-            let end = contiguous_range_end(&s.segment_index, from);
+            let end = contiguous_range_end(&s, from);
             if end > from {
                 config.start_time = Some((f64::from(end) * segment_duration).min(duration_seconds));
             }
@@ -405,7 +423,7 @@ impl TranscodeSession {
                 .is_some_and(|e| {
                     finished.contains(&e.generation)
                         && s.runs
-                            .get(&e.run_start)
+                            .get(&e.generation)
                             .is_some_and(|r| e.run_start + r.segment_count == end)
                 });
             end >= total_segments || ends_on_eof
@@ -467,10 +485,11 @@ impl TranscodeSession {
         // to the wrong slot in the segment index, falsely triggering a
         // non-cached seek that creates a new generation and fragments the index.
         if let Ok(state) = self.state.lock() {
-            for (&run_start, run) in &state.runs {
+            for run in state.runs.values() {
                 if run.segment_durations.is_empty() {
                     continue;
                 }
+                let run_start = run.run_start;
                 let run_end_time: f64 =
                     run.start_time_secs + run.segment_durations.iter().sum::<f64>();
                 if position_secs >= run.start_time_secs && position_secs < run_end_time {
@@ -479,8 +498,7 @@ impl TranscodeSession {
                     for (i, &dur) in run.segment_durations.iter().enumerate() {
                         if t + dur > position_secs {
                             let abs_seg = run_start + i as u32;
-                            let contiguous_end =
-                                contiguous_range_end(&state.segment_index, abs_seg);
+                            let contiguous_end = contiguous_range_end(&state, abs_seg);
                             let restart_secs = (contiguous_end as f64 * self.segment_duration)
                                 .min(self.duration_seconds);
                             return Some(SeekResult::Cached {
@@ -530,12 +548,11 @@ impl TranscodeSession {
     /// time_range.end)` with a different encoder, leaving copy-mode segments
     /// outside that range intact.
     ///
-    /// The window is snapped outward to source-keyframe boundaries (using the
-    /// stored keyframe list set via [`Self::set_keyframes`]) so the overlay
-    /// starts on an IDR. Returns the new generation number on success — the
-    /// caller can use it for logging / playlist invalidation. The encode runs
-    /// on a background thread; segments appear on disk progressively and are
-    /// picked up by `update_segments` via the existing playlist contract.
+    /// The window is widened to the boundaries of the primary segments it touches,
+    /// found by time from what the primary has written, so the overlay replaces whole
+    /// segments: a stream copy cuts them on source keyframes, not on the fixed grid.
+    /// Returns the new generation number. The encode runs on a background thread;
+    /// segments appear on disk progressively and are picked up by `update_segments`.
     ///
     /// Fails when the session was started from a custom I/O source (e.g.
     /// debrid live) — those don't have a reopenable input path. Caller should
@@ -552,40 +569,31 @@ impl TranscodeSession {
             )
         })?;
 
-        let have_keyframes = self
-            .keyframes
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|kfs| !kfs.is_empty()))
-            .unwrap_or(false);
-        if !have_keyframes {
-            tracing::warn!(
-                requested_start = time_range.start,
-                requested_end = time_range.end,
-                "start_overlay called without keyframes loaded — boundary snap is a no-op, \
-                 overlay segments may not align with source GOP boundaries. \
-                 Caller should `set_keyframes(...)` after probe completes."
-            );
+        self.update_segments();
+        let abs_start = self.time_to_segment_accurate(time_range.start);
+        let last = self.time_to_segment_accurate(time_range.end);
+        let abs_end_excl = if self.segment_to_time_accurate(last) >= time_range.end {
+            last
+        } else {
+            last + 1
         }
-
-        let snapped_start = self.snap_keyframe_floor(time_range.start);
-        let snapped_end = self.snap_keyframe_ceil(time_range.end);
-        if snapped_end <= snapped_start {
+        .max(abs_start + 1);
+        let window_start = self.segment_to_time_accurate(abs_start);
+        let window_end = self
+            .segment_to_time_accurate(abs_end_excl)
+            .min(self.duration_seconds);
+        if window_end <= window_start {
             return Err(crate::error::FfmpegError::new(
                 ffi::AVERROR_EXTERNAL,
-                "start_overlay: empty time range after keyframe snap",
+                "start_overlay: empty time range",
             ));
         }
-
-        let abs_start = ((snapped_start / self.segment_duration).floor() as u32)
-            .min(self.total_segments.saturating_sub(1));
-        let abs_end_excl = ((snapped_end / self.segment_duration).ceil() as u32)
-            .max(abs_start + 1)
-            .min(self.total_segments);
+        let overlay_segment_duration = (abs_start..abs_end_excl)
+            .map(|abs| self.segment_to_time_accurate(abs + 1) - self.segment_to_time_accurate(abs))
+            .fold(0.0_f64, f64::max);
 
         let new_gen = self.generation.fetch_add(1, Ordering::Release) + 1;
         let output_dir = self.output_dir.clone();
-        let segment_duration = self.segment_duration;
         let duration_seconds = self.duration_seconds;
         let state = self.state.clone();
 
@@ -606,7 +614,7 @@ impl TranscodeSession {
             in_ctx.find_stream_info()?;
 
             let mut config = SessionConfig::new(output_dir, duration_seconds)
-                .segment_duration(segment_duration)
+                .segment_duration(overlay_segment_duration)
                 .video_encoder(&overlay.video_encoder)
                 .initial_generation(new_gen);
             if let Some(br) = overlay.video_bitrate {
@@ -621,9 +629,9 @@ impl TranscodeSession {
             if let Some(hw) = overlay.hw_device {
                 config = config.hw_device(hw);
             }
-            config.start_time = Some(snapped_start);
-            config.end_secs = Some(snapped_end);
-            config.overlay_end_segment = Some(abs_end_excl);
+            config.start_time = Some(window_start);
+            config.end_secs = Some(window_end);
+            config.overlay_segments = Some(abs_start..abs_end_excl);
 
             let local_gen = Arc::new(AtomicU32::new(new_gen));
 
@@ -647,42 +655,11 @@ impl TranscodeSession {
         Ok(new_gen)
     }
 
-    /// Snap a timestamp down to the keyframe at-or-before it. Falls back to
-    /// the input timestamp if no keyframe list is loaded or none precedes it.
-    fn snap_keyframe_floor(&self, secs: f64) -> f64 {
-        if let Ok(guard) = self.keyframes.lock()
-            && let Some(kfs) = guard.as_ref()
-        {
-            return kfs
-                .iter()
-                .rev()
-                .find(|&&t| t <= secs)
-                .copied()
-                .unwrap_or(secs);
-        }
-        secs
-    }
-
-    /// Snap a timestamp up to the keyframe at-or-after it. Falls back to
-    /// the input timestamp if no keyframe list is loaded or none follows it.
-    fn snap_keyframe_ceil(&self, secs: f64) -> f64 {
-        if let Ok(guard) = self.keyframes.lock()
-            && let Some(kfs) = guard.as_ref()
-        {
-            return kfs.iter().find(|&&t| t >= secs).copied().unwrap_or(secs);
-        }
-        secs
-    }
-
     /// Resolve an absolute segment index to its file path.
     pub fn resolve_segment(&self, abs_index: u32) -> Option<ResolvedSegment> {
         let state = self.state.lock().ok()?;
         let entry = (*state.segment_index.get(abs_index as usize)?)?;
-        let run = state
-            .runs
-            .iter()
-            .find(|(_, r)| r.generation == entry.generation)?
-            .1;
+        let run = state.runs.get(&entry.generation)?;
         let local_index = abs_index - entry.run_start;
         let gen_dir = state.base_dir.join(format!("gen_{}", entry.generation));
         let duration = run
@@ -709,16 +686,18 @@ impl TranscodeSession {
         let mut segments = Vec::new();
         let mut last_gen: Option<u32> = None;
 
-        for abs in start_segment..self.total_segments {
+        for abs in start_segment..state.segment_index.len() as u32 {
             let Some(entry) = state.segment_index.get(abs as usize).and_then(|e| *e) else {
-                break; // Gap — stop
+                if state.is_filler(abs) {
+                    continue;
+                }
+                break;
             };
             let local_index = abs - entry.run_start;
             let duration = state
                 .runs
-                .iter()
-                .find(|(_, r)| r.generation == entry.generation)
-                .and_then(|(_, r)| r.segment_durations.get(local_index as usize).copied())
+                .get(&entry.generation)
+                .and_then(|r| r.segment_durations.get(local_index as usize).copied())
                 .unwrap_or(self.segment_duration);
             let is_boundary = last_gen != Some(entry.generation);
             last_gen = Some(entry.generation);
@@ -737,47 +716,24 @@ impl TranscodeSession {
     /// Call this periodically (e.g., on each playlist request) to pick up
     /// newly written segments.
     pub fn update_segments(&self) {
-        let state = match self.state.lock() {
-            Ok(s) => s,
+        let generations: Vec<u32> = match self.state.lock() {
+            Ok(s) => s.runs.keys().copied().collect(),
             Err(_) => return,
         };
 
-        // Collect run info to iterate without holding the lock during I/O
-        let runs_snapshot: Vec<(u32, u32)> = state
-            .runs
-            .iter()
-            .map(|(&run_start, r)| (run_start, r.generation))
-            .collect();
-        drop(state);
-
-        for (run_start, generation) in runs_snapshot {
+        for generation in generations {
             let Some((durations, bytes)) = read_generation(&self.output_dir, generation) else {
                 continue;
             };
-            let count = durations.len() as u32;
-
-            let mut state = match self.state.lock() {
-                Ok(s) => s,
-                Err(_) => return,
+            let wrote_range = self
+                .output_dir
+                .join(format!("gen_{generation}"))
+                .join(EOF_MARKER)
+                .exists();
+            let Ok(mut state) = self.state.lock() else {
+                return;
             };
-
-            let Some(run) = state.runs.get_mut(&run_start) else {
-                continue;
-            };
-            let old_count = run.segment_count;
-            run.segment_count = count;
-            run.estimated_bytes = bytes;
-            run.segment_durations = durations;
-
-            for i in old_count..count {
-                let abs = run_start + i;
-                if let Some(slot) = state.segment_index.get_mut(abs as usize) {
-                    *slot = Some(SegmentEntry {
-                        generation,
-                        run_start,
-                    });
-                }
-            }
+            fill_run(&mut state, generation, durations, bytes, wrote_range);
         }
     }
 
@@ -804,15 +760,15 @@ impl TranscodeSession {
                 .iter()
                 .filter(|(_, r)| r.generation != active_gen)
                 .filter(|(_, r)| !state.overlay_generations.contains(&r.generation))
-                .filter(|&(&start, r)| {
-                    let end = start + r.segment_count;
-                    !(start <= playback_segment && end > playback_segment)
+                .filter(|(_, r)| {
+                    let end = r.run_start + r.segment_count;
+                    !(r.run_start <= playback_segment && end > playback_segment)
                 })
-                .max_by_key(|&(&start, r)| {
-                    let mid = start + r.segment_count / 2;
+                .max_by_key(|(_, r)| {
+                    let mid = r.run_start + r.segment_count / 2;
                     mid.abs_diff(playback_segment)
                 })
-                .map(|(&start, r)| (start, r.generation, r.segment_count));
+                .map(|(_, r)| (r.run_start, r.generation, r.segment_count));
 
             let Some((run_start, evict_gen, seg_count)) = to_evict else {
                 break;
@@ -828,7 +784,7 @@ impl TranscodeSession {
                 }
             }
 
-            state.runs.remove(&run_start);
+            state.runs.remove(&evict_gen);
 
             // Delete files (non-blocking — best effort)
             let dir = state.base_dir.join(format!("gen_{evict_gen}"));
@@ -862,19 +818,16 @@ impl TranscodeSession {
             Ok(s) => s,
             Err(_) => return self.time_to_segment(secs),
         };
-        for (&run_start, run) in &state.runs {
-            if run.segment_durations.is_empty() {
+        for run in state.runs.values().filter(|r| r.end_segment.is_none()) {
+            let mut t = run.start_time_secs;
+            if secs < t {
                 continue;
             }
-            let run_end_time: f64 = run.start_time_secs + run.segment_durations.iter().sum::<f64>();
-            if secs >= run.start_time_secs && secs < run_end_time {
-                let mut t = run.start_time_secs;
-                for (i, &dur) in run.segment_durations.iter().enumerate() {
-                    if t + dur > secs {
-                        return run_start + i as u32;
-                    }
-                    t += dur;
+            for (i, &dur) in run.segment_durations.iter().enumerate() {
+                if t + dur > secs {
+                    return run.run_start + i as u32;
                 }
+                t += dur;
             }
         }
         self.time_to_segment(secs)
@@ -887,13 +840,20 @@ impl TranscodeSession {
             Ok(s) => s,
             Err(_) => return self.segment_to_time(target),
         };
-        for (&run_start, run) in &state.runs {
-            let run_end = run_start + run.segment_count;
-            if target >= run_start && target < run_end {
-                let local = (target - run_start) as usize;
-                let offset: f64 = run.segment_durations.iter().take(local).sum();
-                return run.start_time_secs + offset;
-            }
+        let primaries = || state.runs.values().filter(|r| r.end_segment.is_none());
+        let start_of = |r: &TranscodeRun| {
+            let local = (target - r.run_start) as usize;
+            r.start_time_secs + r.segment_durations.iter().take(local).sum::<f64>()
+        };
+        if let Some(run) =
+            primaries().find(|r| target >= r.run_start && target < r.run_start + r.segment_count)
+        {
+            return start_of(run);
+        }
+        if let Some(run) =
+            primaries().find(|r| r.segment_count > 0 && target == r.run_start + r.segment_count)
+        {
+            return start_of(run);
         }
         self.segment_to_time(target)
     }
@@ -954,7 +914,7 @@ impl TranscodeSession {
             Ok(s) => s,
             Err(_) => return start..start,
         };
-        start..contiguous_range_end(&state.segment_index, start)
+        start..contiguous_range_end(&state, start)
     }
 
     /// Every run whose segments are still indexed, oldest generation first — what a
@@ -966,10 +926,10 @@ impl TranscodeSession {
         };
         let mut runs: Vec<PriorRun> = state
             .runs
-            .iter()
-            .map(|(&run_start, r)| PriorRun {
+            .values()
+            .map(|r| PriorRun {
                 generation: r.generation,
-                run_start,
+                run_start: r.run_start,
                 start_secs: r.start_time_secs,
                 end_segment: r.end_segment,
             })
@@ -1037,8 +997,9 @@ impl Drop for TranscodeSession {
     }
 }
 
-/// Left in a generation's directory once it has written the last segment of the file.
-/// The trailer alone does not say so: a seek or a cancel writes one too.
+/// Left in a generation's directory once it has written the last segment of the file, or
+/// of its range for a bounded run. The trailer alone does not say so: a seek or a cancel
+/// writes one too.
 const EOF_MARKER: &str = "eof";
 
 /// The EXTINF durations FFmpeg has written for a generation, and its bytes on disk.
@@ -1080,6 +1041,10 @@ fn adopt_prior_runs(
         let Some((durations, bytes)) = read_generation(output_dir, run.generation) else {
             continue;
         };
+        let wrote_range = output_dir
+            .join(format!("gen_{}", run.generation))
+            .join(EOF_MARKER)
+            .exists();
         register_run(
             state,
             run.generation,
@@ -1089,36 +1054,61 @@ fn adopt_prior_runs(
         );
         if run.end_segment.is_some() {
             state.overlay_generations.insert(run.generation);
-        } else if output_dir
-            .join(format!("gen_{}", run.generation))
-            .join(EOF_MARKER)
-            .exists()
-        {
+        } else if wrote_range {
             finished.insert(run.generation);
         }
-        let limit = run
-            .end_segment
-            .unwrap_or(u32::MAX)
-            .min(state.segment_index.len() as u32);
-        let count = durations.len() as u32;
-        for abs in run.run_start..(run.run_start + count).min(limit) {
-            state.segment_index[abs as usize] = Some(SegmentEntry {
-                generation: run.generation,
-                run_start: run.run_start,
-            });
-        }
-        if let Some(r) = state.runs.get_mut(&run.run_start) {
-            r.segment_count = count;
-            r.estimated_bytes = bytes;
-            r.segment_durations = durations;
-        }
+        fill_run(state, run.generation, durations, bytes, wrote_range);
     }
     finished
 }
 
-fn contiguous_range_end(index: &[Option<SegmentEntry>], start: u32) -> u32 {
+fn fill_run(
+    state: &mut SessionState,
+    generation: u32,
+    durations: Vec<f64>,
+    bytes: u64,
+    wrote_range: bool,
+) {
+    let Some(run) = state.runs.get_mut(&generation) else {
+        return;
+    };
+    let old_count = run.segment_count;
+    let count = durations.len() as u32;
+    run.segment_count = count;
+    run.estimated_bytes = bytes;
+    run.segment_durations = durations;
+    run.complete = run.end_segment.is_some() && wrote_range;
+    let run_start = run.run_start;
+    let bounded = run.end_segment.is_some();
+    let limit = run.end_segment.unwrap_or(u32::MAX);
+    for abs in (run_start + old_count)..(run_start + count).min(limit) {
+        let displaced = state.runs.values().any(|other| {
+            other.generation != generation
+                && other.claims(abs)
+                && (!bounded || other.generation > generation)
+        });
+        if displaced {
+            continue;
+        }
+        // A copy run cuts on source keyframes, so it can need more slots than the
+        // fixed grid sized the index for.
+        if abs as usize >= state.segment_index.len() {
+            state.segment_index.resize(abs as usize + 1, None);
+        }
+        state.segment_index[abs as usize] = Some(SegmentEntry {
+            generation,
+            run_start,
+        });
+    }
+}
+
+fn contiguous_range_end(state: &SessionState, start: u32) -> u32 {
     let mut end = start;
-    while index.get(end as usize).is_some_and(|e| e.is_some()) {
+    while state
+        .segment_index
+        .get(end as usize)
+        .is_some_and(|e| e.is_some() || state.is_filler(end))
+    {
         end += 1;
     }
     end
@@ -1218,18 +1208,32 @@ fn session_loop_from_ctx(
     let initial_gen = config.initial_generation;
     generation.store(initial_gen, Ordering::Release);
     let seg_dur = config.segment_duration;
-    // Register initial run
     {
-        let abs_start = ((start_secs / seg_dur).floor() as u32).min(24 * 3600 / 2 - 1);
         let mut s = state.lock().unwrap();
-        register_run(
-            &mut s,
-            initial_gen,
-            abs_start,
-            config.overlay_end_segment,
-            start_secs,
-        );
+        match config.overlay_segments.clone() {
+            Some(slots) => register_run(
+                &mut s,
+                initial_gen,
+                slots.start,
+                Some(slots.end),
+                start_secs,
+            ),
+            None => {
+                let abs_start = ((start_secs / seg_dur).floor() as u32).min(24 * 3600 / 2 - 1);
+                register_run(&mut s, initial_gen, abs_start, None, start_secs);
+            }
+        }
     }
+    // A run starts on the keyframe the seek landed on, before the time it asked for;
+    // mapping times to its segments needs where it really starts.
+    let mut record_run_start = |secs: f64| {
+        let current = generation.load(Ordering::Acquire);
+        if let Ok(mut s) = state.lock()
+            && let Some(run) = s.runs.get_mut(&current)
+        {
+            run.start_time_secs = secs;
+        }
+    };
 
     loop {
         let current_gen = generation.load(Ordering::Acquire);
@@ -1247,6 +1251,7 @@ fn session_loop_from_ctx(
             &mut video_decoder,
             &mut audio_decoder,
             &cmd_rx,
+            &mut record_run_start,
         )? {
             GenResult::Completed | GenResult::Cancelled => break,
             GenResult::SeekTo(pos) => {
@@ -1280,9 +1285,9 @@ fn session_loop_from_ctx(
 ///   `abs_start` forward are wiped, and any runs starting at or after
 ///   `abs_start` are removed.
 /// - `Some(end)` — overlay-run behaviour: the new run claims only the slice
-///   `[abs_start, end)`. Index entries inside that slice are cleared, but
-///   everything after `end` is preserved so a copy-mode primary run
-///   producing post-corruption segments stays intact.
+///   `[abs_start, end)`. Index entries inside that slice are cleared and any
+///   overlay wholly inside it is replaced, but no primary run is removed: one
+///   that starts inside the slice is still writing the segments after it.
 fn register_run(
     state: &mut SessionState,
     generation: u32,
@@ -1295,37 +1300,26 @@ fn register_run(
         .unwrap_or(state.segment_index.len());
     let start = (abs_start as usize).min(end);
 
-    // Clear stale entries inside the claimed slice only.
     for slot in state.segment_index[start..end].iter_mut() {
         *slot = None;
     }
 
-    // Remove runs that fall entirely inside the claimed slice. For unbounded
-    // (primary/seek) runs that's "everything from abs_start onward" — same as
-    // before. For bounded (overlay) runs we keep any run whose range starts at
-    // or beyond `end`, so a copy primary that already produced post-overlay
-    // segments isn't dropped.
-    let to_remove: Vec<u32> = match end_exclusive {
-        None => state.runs.range(abs_start..).map(|(&k, _)| k).collect(),
-        Some(end_seg) => state
-            .runs
-            .range(abs_start..end_seg)
-            .map(|(&k, _)| k)
-            .collect(),
-    };
-    for k in to_remove {
-        state.runs.remove(&k);
-    }
+    state.runs.retain(|_, r| match end_exclusive {
+        None => r.run_start < abs_start,
+        Some(end_seg) => !(r.end_segment.is_some_and(|e| e <= end_seg) && r.run_start >= abs_start),
+    });
 
     state.runs.insert(
-        abs_start,
+        generation,
         TranscodeRun {
             generation,
+            run_start: abs_start,
             start_time_secs: start_time,
             segment_count: 0,
             estimated_bytes: 0,
             segment_durations: Vec::new(),
             end_segment: end_exclusive,
+            complete: false,
         },
     );
 }
@@ -1351,6 +1345,7 @@ fn run_generation(
     video_decoder: &mut Option<Decoder>,
     audio_decoder: &mut Option<Decoder>,
     cmd_rx: &std::sync::mpsc::Receiver<SessionCommand>,
+    record_run_start: &mut dyn FnMut(f64),
 ) -> Result<GenResult> {
     std::fs::create_dir_all(gen_dir).map_err(|e| {
         crate::error::FfmpegError::new(ffi::AVERROR_EXTERNAL, format!("mkdir: {e}"))
@@ -1372,18 +1367,20 @@ fn run_generation(
     out_ctx.set_option("hls_list_size", "0")?;
     out_ctx.set_option("hls_segment_options", "movflags=+frag_discont")?;
 
+    let mut buffered_packets: std::collections::VecDeque<Packet> =
+        std::collections::VecDeque::new();
     let mut video_encoder = None;
     if let Some(v_idx) = video_idx {
         let stream = in_ctx.stream(v_idx).unwrap();
         if video_copy {
             let osi = out_ctx.add_stream_copy(&stream)?;
-            let cid = unsafe { (*stream.codec_parameters()).codec_id };
-            if cid == ffi::AV_CODEC_ID_HEVC {
-                unsafe {
-                    let s = *ffi::kff_fmt_streams(out_ctx.as_ptr()).add(osi as usize);
-                    (*ffi::kff_stream_codecpar(s)).codec_tag = ffi::mktag(b'h', b'v', b'c', b'1');
-                }
-            }
+            crate::hevc_config::prepare_copied_hevc(
+                in_ctx,
+                v_idx,
+                &mut out_ctx,
+                osi,
+                &mut buffered_packets,
+            )?;
         } else if let Some(dec) = video_decoder.as_ref() {
             let cn = config.video_encoder.as_deref().unwrap();
 
@@ -1621,8 +1618,8 @@ fn run_generation(
     let mut buffered_audio_frames: std::collections::VecDeque<Frame> =
         std::collections::VecDeque::new();
     let mut reached_eof = false;
-    let mut buffered_packets: std::collections::VecDeque<Packet> =
-        std::collections::VecDeque::new();
+    let mut reached_end = false;
+    let mut run_start_recorded = false;
     if let Some(a_idx) = audio_idx {
         if audio_copy {
             let stream = in_ctx.stream(a_idx).unwrap();
@@ -1778,16 +1775,17 @@ fn run_generation(
         }
         let ps = pkt.stream_index();
 
-        // Bounded run (overlay): break once we've read past the requested
-        // end timestamp on the video stream. Audio is allowed to lag
-        // slightly behind so the encoder has paired samples to flush.
-        if let Some(end) = config.end_secs
-            && ps >= 0
-            && Some(ps as u32) == video_idx
-        {
+        if ps >= 0 && Some(ps as u32) == video_idx && pkt.pts() != ffi::AV_NOPTS_VALUE {
             let tb = in_ctx.stream(ps as u32).unwrap().time_base();
             let secs = pkt.pts() as f64 * tb.num as f64 / tb.den as f64;
-            if secs >= end {
+            if !run_start_recorded {
+                record_run_start(secs);
+                run_start_recorded = true;
+            }
+            // Audio is allowed to lag slightly behind so the encoder has paired
+            // samples to flush.
+            if config.end_secs.is_some_and(|end| secs >= end) {
+                reached_end = true;
                 break;
             }
         }
@@ -1906,7 +1904,7 @@ fn run_generation(
         zero_copy,
         video_out_tb,
     )?;
-    if reached_eof {
+    if reached_eof || (reached_end && config.overlay_segments.is_some()) {
         std::fs::write(gen_dir.join(EOF_MARKER), b"").map_err(|e| {
             crate::error::FfmpegError::new(ffi::AVERROR_EXTERNAL, format!("eof marker: {e}"))
         })?;
@@ -2108,15 +2106,28 @@ mod register_run_test {
         count: u32,
         seg_dur: f64,
     ) {
+        populate(state, run_start, generation, count, seg_dur, None);
+    }
+
+    fn populate(
+        state: &mut SessionState,
+        run_start: u32,
+        generation: u32,
+        count: u32,
+        seg_dur: f64,
+        end_segment: Option<u32>,
+    ) {
         state.runs.insert(
-            run_start,
+            generation,
             TranscodeRun {
                 generation,
+                run_start,
                 start_time_secs: run_start as f64 * seg_dur,
                 segment_count: count,
                 estimated_bytes: 0,
                 segment_durations: vec![seg_dur; count as usize],
-                end_segment: None,
+                end_segment,
+                complete: false,
             },
         );
         for i in 0..count {
@@ -2141,9 +2152,8 @@ mod register_run_test {
         assert!(state.segment_index[4].is_some());
         assert!(state.segment_index[5].is_none());
         assert!(state.segment_index[19].is_none());
-        // gen0 still in runs (starts at 0); the new run is at 5.
         assert!(state.runs.contains_key(&0));
-        assert!(state.runs.contains_key(&5));
+        assert_eq!(state.runs[&1].run_start, 5);
     }
 
     #[test]
@@ -2167,23 +2177,20 @@ mod register_run_test {
         );
         assert!(state.segment_index[19].is_some());
 
-        // Both the original primary run and the new overlay run live in the map.
         assert!(state.runs.contains_key(&0));
-        assert!(state.runs.contains_key(&5));
+        assert_eq!(state.runs[&1].run_start, 5);
     }
 
     #[test]
     fn bounded_register_replaces_overlapping_overlay() {
         let mut state = fresh_state(20);
-        populate_run(&mut state, 0, 0, 20, 6.0); // primary
-        populate_run(&mut state, 5, 1, 5, 6.0); // overlay gen1 covers [5,10)
+        populate_run(&mut state, 0, 0, 20, 6.0);
+        populate(&mut state, 5, 1, 5, 6.0, Some(10));
 
-        // A second overlay covering the same window — gen2 replaces gen1.
         register_run(&mut state, 2, 5, Some(10), 30.0);
 
-        // gen1 should be gone, gen2 registered.
-        assert!(!state.runs.contains_key(&5) || state.runs[&5].generation == 2);
-        assert_eq!(state.runs[&5].generation, 2);
+        assert!(!state.runs.contains_key(&1));
+        assert_eq!(state.runs[&2].run_start, 5);
         // Post-overlay copy segments still intact.
         assert!(state.segment_index[10].is_some());
     }
@@ -2201,12 +2208,12 @@ mod register_run_test {
             .iter()
             .filter(|(_, r)| r.generation != active_gen)
             .filter(|(_, r)| !state.overlay_generations.contains(&r.generation))
-            .filter(|&(&start, r)| {
-                let end = start + r.segment_count;
-                !(start <= playback_segment && end > playback_segment)
+            .filter(|(_, r)| {
+                let end = r.run_start + r.segment_count;
+                !(r.run_start <= playback_segment && end > playback_segment)
             })
-            .max_by_key(|&(&start, r)| {
-                let mid = start + r.segment_count / 2;
+            .max_by_key(|(_, r)| {
+                let mid = r.run_start + r.segment_count / 2;
                 mid.abs_diff(playback_segment)
             })
             .map(|(_, r)| r.generation)

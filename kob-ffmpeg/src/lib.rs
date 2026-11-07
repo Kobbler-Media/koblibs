@@ -45,6 +45,7 @@ pub(crate) mod fps_grid;
 pub mod audio;
 pub mod chromaprint;
 pub mod detect;
+pub(crate) mod hevc_config;
 #[cfg(feature = "hybrid-io")]
 pub mod hybrid_io;
 pub mod interlace;

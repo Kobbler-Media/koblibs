@@ -332,6 +332,22 @@ impl Encoder {
             return Ok(EncodeResult::Eof);
         }
         ff_check!(ret, "receiving packet from encoder")?;
+        // Encoders leave a video packet's duration unset, and the HLS muxer then ends
+        // a run's last segment a frame early.
+        unsafe {
+            let fr = (*self.ptr).framerate;
+            let pkt = packet.as_mut_ptr();
+            if (*pkt).duration == 0 && fr.num > 0 && fr.den > 0 {
+                (*pkt).duration = ffi::av_rescale_q(
+                    1,
+                    ffi::AVRational {
+                        num: fr.den,
+                        den: fr.num,
+                    },
+                    (*self.ptr).time_base,
+                );
+            }
+        }
         Ok(EncodeResult::Packet)
     }
 

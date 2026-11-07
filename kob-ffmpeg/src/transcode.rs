@@ -376,7 +376,7 @@ fn transcode_to_hls_inner(
     }
     out_ctx.set_option("hls_segment_options", "movflags=+frag_discont")?;
 
-    // Set up video path
+    let mut buffered_packets: VecDeque<Packet> = VecDeque::new();
     let mut video_decoder = None;
     let mut video_encoder = None;
     let mut encoder_pixel_format = crate::types::PixelFormat::YUV420P;
@@ -386,17 +386,13 @@ fn transcode_to_hls_inner(
         let stream = in_ctx.stream(v_idx).unwrap();
         if video_copy {
             let out_stream_idx = out_ctx.add_stream_copy(&stream)?;
-            // HEVC in HLS/fMP4 requires hvc1 codec tag for browser MSE compatibility.
-            // Without this, FFmpeg writes hev1 which Chrome/Safari reject.
-            let codec_id = unsafe { (*stream.codec_parameters()).codec_id };
-            if codec_id == ffi::AV_CODEC_ID_HEVC {
-                unsafe {
-                    let streams = ffi::kff_fmt_streams(out_ctx.as_ptr());
-                    let out_stream = *streams.add(out_stream_idx as usize);
-                    (*ffi::kff_stream_codecpar(out_stream)).codec_tag =
-                        ffi::mktag(b'h', b'v', b'c', b'1');
-                }
-            }
+            crate::hevc_config::prepare_copied_hevc(
+                &mut in_ctx,
+                v_idx,
+                &mut out_ctx,
+                out_stream_idx,
+                &mut buffered_packets,
+            )?;
         } else {
             let codec_name = config.video_encoder.as_deref().unwrap();
             // Transcode is a batch job — frame-threaded decode is a big win
@@ -643,7 +639,6 @@ fn transcode_to_hls_inner(
     // Filled when codec params lack sample_rate and we pre-roll to discover it
     // (e.g. LATM-AAC over MPEG-TS). Drained before the main read loop.
     let mut buffered_audio_frames: VecDeque<Frame> = VecDeque::new();
-    let mut buffered_packets: VecDeque<Packet> = VecDeque::new();
 
     if let Some(a_idx) = audio_idx {
         if audio_copy {

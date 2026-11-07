@@ -19,6 +19,8 @@ static INTERLACED_TS: OnceLock<PathBuf> = OnceLock::new();
 static NEAR_BLACK_VIDEO: OnceLock<PathBuf> = OnceLock::new();
 static MINUTE_VIDEO: OnceLock<PathBuf> = OnceLock::new();
 static ASS_MKV: OnceLock<PathBuf> = OnceLock::new();
+static HEVC_INBAND_PARAMS: OnceLock<PathBuf> = OnceLock::new();
+static UNEVEN_GOP_VIDEO: OnceLock<PathBuf> = OnceLock::new();
 
 fn fixture_dir() -> &'static Path {
     FIXTURE_DIR
@@ -432,6 +434,112 @@ pub fn ass_mkv() -> PathBuf {
                     "-i", ass.to_str().unwrap(),
                     "-c:v", "libx264", "-preset", "ultrafast", "-c:s", "ass",
                     "-map", "0:v", "-map", "1:s",
+                ],
+                &path,
+            );
+            path
+        })
+        .clone()
+}
+
+/// HEVC 160x120 @ 10fps, 4 seconds, keyframe every second, tagged `hev1` with its
+/// VPS/SPS/PPS only in-band: the `hvcC` record is cut down to its 23-byte header with no
+/// parameter-set arrays, the way some web-dl packagers ship it.
+pub fn hevc_inband_params() -> PathBuf {
+    HEVC_INBAND_PARAMS
+        .get_or_init(|| {
+            let full = fixture_dir().join("hevc_full_hvcc.mp4");
+            run_ffmpeg(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=duration=4:size=160x120:rate=10",
+                    "-c:v",
+                    "libx265",
+                    "-preset",
+                    "ultrafast",
+                    "-x265-params",
+                    "repeat-headers=1:keyint=10:log-level=error",
+                    "-tag:v",
+                    "hev1",
+                ],
+                &full,
+            );
+            let path = fixture_dir().join("hevc_inband_params.mp4");
+            std::fs::write(&path, strip_hvcc_arrays(&std::fs::read(&full).unwrap())).unwrap();
+            path
+        })
+        .clone()
+}
+
+// Shrinks the hvcC box in place and every ancestor box's size with it. Only valid while
+// moov follows mdat (ffmpeg's default), so no chunk offset moves.
+fn strip_hvcc_arrays(file: &[u8]) -> Vec<u8> {
+    let find = |tag: &[u8], from: usize| {
+        from + file[from..].windows(4).position(|w| w == tag).unwrap() - 4
+    };
+    let size_at = |at: usize| u32::from_be_bytes(file[at..at + 4].try_into().unwrap()) as usize;
+    let moov = find(b"moov", 0);
+    assert!(find(b"mdat", 0) < moov, "moov must follow mdat");
+    let hvcc = find(b"hvcC", moov);
+    let mut record = file[hvcc + 8..hvcc + 8 + 22].to_vec();
+    record.push(0);
+    let removed = size_at(hvcc) - (8 + record.len());
+    let mut out = file.to_vec();
+    for tag in [
+        b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd", b"hev1",
+    ] {
+        let at = find(tag, moov);
+        let size = size_at(at);
+        assert!(at < hvcc && hvcc < at + size);
+        out[at..at + 4].copy_from_slice(&((size - removed) as u32).to_be_bytes());
+    }
+    let mut stripped = out[..hvcc].to_vec();
+    stripped.extend_from_slice(&((8 + record.len()) as u32).to_be_bytes());
+    stripped.extend_from_slice(b"hvcC");
+    stripped.extend_from_slice(&record);
+    stripped.extend_from_slice(&out[hvcc + size_at(hvcc)..]);
+    stripped
+}
+
+/// Keyframes of [`uneven_gop_video`]: uneven spacing, so a stream copy cut on them never
+/// lines up with a fixed segment grid.
+pub const UNEVEN_KEYFRAMES: [f64; 11] = [
+    0.0, 8.7, 13.8, 20.4, 25.5, 34.1, 40.0, 46.8, 52.0, 57.3, 59.0,
+];
+
+/// H.264 160x120 @ 10fps, 60 seconds, keyframes only at [`UNEVEN_KEYFRAMES`] + AAC audio.
+pub fn uneven_gop_video() -> PathBuf {
+    UNEVEN_GOP_VIDEO
+        .get_or_init(|| {
+            let path = fixture_dir().join("uneven_gop.mp4");
+            let keyframes = UNEVEN_KEYFRAMES.map(|k| k.to_string()).join(",");
+            run_ffmpeg(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=duration=60:size=160x120:rate=10",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:duration=60",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "45",
+                    "-x264-params",
+                    "keyint=1000:min-keyint=1:scenecut=0",
+                    "-force_key_frames",
+                    &keyframes,
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "32k",
+                    "-shortest",
                 ],
                 &path,
             );
