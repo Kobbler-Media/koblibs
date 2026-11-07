@@ -21,6 +21,7 @@ static MINUTE_VIDEO: OnceLock<PathBuf> = OnceLock::new();
 static ASS_MKV: OnceLock<PathBuf> = OnceLock::new();
 static HEVC_INBAND_PARAMS: OnceLock<PathBuf> = OnceLock::new();
 static UNEVEN_GOP_VIDEO: OnceLock<PathBuf> = OnceLock::new();
+static HDR10_VIDEO: OnceLock<PathBuf> = OnceLock::new();
 
 fn fixture_dir() -> &'static Path {
     FIXTURE_DIR
@@ -540,6 +541,39 @@ pub fn uneven_gop_video() -> PathBuf {
                     "-b:a",
                     "32k",
                     "-shortest",
+                ],
+                &path,
+            );
+            path
+        })
+        .clone()
+}
+
+/// HEVC Main10 Dolby Vision profile 5, 256x144 @ 24fps, one second. FFmpeg can
+/// only write an RPU it was handed, so this one is checked in: a testsrc2 picture
+/// carrying the reshaping metadata of a real P5 stream, colour tags unspecified
+/// like the files it stands in for.
+pub fn dolby_vision_p5() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/dolby_vision_p5.mp4")
+}
+
+/// HEVC Main10 tagged BT.2020 / PQ, 256x144 @ 24fps, one second.
+pub fn hdr10_video() -> PathBuf {
+    HDR10_VIDEO
+        .get_or_init(|| {
+            let path = fixture_dir().join("hdr10.mp4");
+            run_ffmpeg(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=duration=1:size=256x144:rate=24",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-c:v",
+                    "libx265",
+                    "-x265-params",
+                    "log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc",
                 ],
                 &path,
             );

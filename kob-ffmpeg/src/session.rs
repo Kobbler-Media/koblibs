@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use crate::codec::decoder::{DecodeResult, Decoder};
 use crate::codec::encoder::{AudioEncoderConfig, EncodeResult, Encoder, VideoEncoderConfig};
 use crate::filter::graph::FilterGraph;
+use crate::filter::plan::CpuFilterPlan;
 use crate::format::input::{InputContext, MediaType};
 use crate::format::output::OutputContext;
 use crate::frame::Frame;
@@ -1355,6 +1356,9 @@ fn run_generation(
         crate::interlace::codec_parameters_interlaced(in_ctx.stream(v).unwrap().codec_parameters())
     });
     let deint_filter = config.deinterlace.filter_for(src_interlaced);
+    let reshape = video_idx.is_some_and(|v| unsafe {
+        crate::sdr::stream_needs_reshaping(in_ctx.stream(v).unwrap().codec_parameters())
+    });
 
     let playlist_path = gen_dir.join("stream.m3u8");
     let seg_pattern = gen_dir.join("seg_%05d.m4s");
@@ -1370,6 +1374,7 @@ fn run_generation(
     let mut buffered_packets: std::collections::VecDeque<Packet> =
         std::collections::VecDeque::new();
     let mut video_encoder = None;
+    let mut encoder_pixel_format = crate::types::PixelFormat::YUV420P;
     if let Some(v_idx) = video_idx {
         let stream = in_ctx.stream(v_idx).unwrap();
         if video_copy {
@@ -1391,7 +1396,7 @@ fn run_generation(
             // Deinterlace is a CPU-only filter here; the deferred GPU path emits
             // scale_* and nothing else, so zero-copy has to be given up for it.
             let use_zero_copy =
-                config.hw_device.is_some() && !needs_subtitle && deint_filter.is_none();
+                config.hw_device.is_some() && !needs_subtitle && deint_filter.is_none() && !reshape;
 
             // Auto-rotate is SW-only — CLI also skips it on HW paths because
             // there's no good transpose_cuda/vaapi without an extra hwdownload
@@ -1431,6 +1436,7 @@ fn run_generation(
                 // A format filter handles the actual pixel conversion with dithering.
                 crate::types::PixelFormat::YUV420P
             };
+            encoder_pixel_format = pix_fmt;
             let enc_hw_frames = if use_zero_copy {
                 let hw = config.hw_device.as_ref().unwrap();
                 Some(hw.create_frames_ctx(target_w, target_h)?)
@@ -1466,10 +1472,14 @@ fn run_generation(
                     stream.r_frame_rate(),
                     deint_filter.is_some(),
                 ),
-                color: unsafe {
-                    crate::filter::graph::VideoColorInfo::from_codec_parameters(
-                        stream.codec_parameters(),
-                    )
+                color: if reshape {
+                    crate::sdr::sdr_color()
+                } else {
+                    unsafe {
+                        crate::filter::graph::VideoColorInfo::from_codec_parameters(
+                            stream.codec_parameters(),
+                        )
+                    }
                 },
                 options: config.encoder_options(),
             })?;
@@ -1495,9 +1505,11 @@ fn run_generation(
 
     // Zero-copy flag matches encoder config: hw_device + no subtitles.
     let needs_subtitle = config.subtitle_burn_in.is_some();
-    let zero_copy = config.hw_device.is_some() && !needs_subtitle && deint_filter.is_none();
+    let zero_copy =
+        config.hw_device.is_some() && !needs_subtitle && deint_filter.is_none() && !reshape;
 
     let mut video_filter: Option<FilterGraph> = None;
+    let mut cpu_filter_plan: Option<CpuFilterPlan> = None;
     // Deferred HW scale filter: (src_w, src_h, dst_w, dst_h, time_base, hw_type)
     // Created lazily after first frame when decoder's hw_frames_ctx is available.
     let hw_type = config
@@ -1563,18 +1575,7 @@ fn run_generation(
             if let Some(d) = deint_filter {
                 filters.push(d.to_string());
             }
-            // Convert 10-bit sources to 8-bit yuv420p with dithering —
-            // browsers render 10-bit with visible banding in dark areas.
-            let src_pix_fmt = if config.hw_device.is_some() {
-                ffi::AV_PIX_FMT_NV12
-            } else {
-                dec.pixel_format_raw()
-            };
-            let needs_fmt_conv =
-                src_pix_fmt != ffi::AV_PIX_FMT_YUV420P && src_pix_fmt != ffi::AV_PIX_FMT_NV12;
-            if needs_scale {
-                filters.push(format!("scale={target_w}:{target_h}"));
-            }
+            let resize_at = filters.len();
             if let Some(sub_idx) = config.subtitle_burn_in
                 && let Some(ps) = input_path.and_then(|p| p.to_str())
             {
@@ -1586,27 +1587,32 @@ fn run_generation(
                     .unwrap_or(0);
                 filters.push(format!("subtitles='{escaped}':si={si}"));
             }
-            if needs_fmt_conv {
-                filters.push("format=pix_fmts=yuv420p".to_string());
+            let scale = needs_scale.then(|| format!("scale={target_w}:{target_h}"));
+            let mut untoned_chain = None;
+            if reshape {
+                let mut untoned = filters.clone();
+                untoned.splice(resize_at..resize_at, scale);
+                untoned_chain = Some(untoned.join(","));
+                filters.insert(
+                    resize_at,
+                    crate::sdr::sdr_filter(target_w, target_h, &encoder_pixel_format.name()),
+                );
+            } else if let Some(scale) = scale {
+                filters.insert(resize_at, scale);
             }
-
-            if !filters.is_empty() {
-                let params = crate::filter::graph::VideoFilterParams {
-                    width: dec.width(),
-                    height: dec.height(),
-                    pixel_format: src_pix_fmt,
-                    time_base: in_ctx.stream(v_idx).unwrap().time_base(),
-                    sample_aspect_ratio: ffi::AVRational { num: 1, den: 1 },
-                    hw_frames_ctx: None,
-                    color: unsafe {
-                        crate::filter::graph::VideoColorInfo::from_codec_parameters(
-                            in_ctx.stream(v_idx).unwrap().codec_parameters(),
-                        )
-                    },
-                    side_data_frame: std::ptr::null(),
-                };
-                video_filter = Some(FilterGraph::new_video(&params, &filters.join(","))?);
-            }
+            let stream = in_ctx.stream(v_idx).unwrap();
+            cpu_filter_plan = Some(CpuFilterPlan {
+                chain: filters.join(","),
+                time_base: stream.time_base(),
+                color: unsafe {
+                    crate::filter::graph::VideoColorInfo::from_codec_parameters(
+                        stream.codec_parameters(),
+                    )
+                },
+                target: encoder_pixel_format,
+                sample_aspect_ratio: ffi::AVRational { num: 1, den: 1 },
+                untoned_chain,
+            });
         }
     }
 
@@ -1724,6 +1730,7 @@ fn run_generation(
                     video_decoder,
                     &mut video_encoder,
                     &mut video_filter,
+                    cpu_filter_plan.as_ref(),
                     audio_decoder,
                     &mut audio_encoder,
                     &mut audio_filter,
@@ -1745,6 +1752,7 @@ fn run_generation(
                     video_decoder,
                     &mut video_encoder,
                     &mut video_filter,
+                    cpu_filter_plan.as_ref(),
                     audio_decoder,
                     &mut audio_encoder,
                     &mut audio_filter,
@@ -1846,6 +1854,7 @@ fn run_generation(
                         dec,
                         enc,
                         &mut video_filter,
+                        cpu_filter_plan.as_ref(),
                         &mut out_ctx,
                         &mut frame,
                         &mut filtered,
@@ -1891,6 +1900,7 @@ fn run_generation(
         video_decoder,
         &mut video_encoder,
         &mut video_filter,
+        cpu_filter_plan.as_ref(),
         audio_decoder,
         &mut audio_encoder,
         &mut audio_filter,
@@ -1917,6 +1927,7 @@ fn drain_video(
     dec: &mut Decoder,
     enc: &mut Encoder,
     filter: &mut Option<FilterGraph>,
+    plan: Option<&CpuFilterPlan>,
     out: &mut OutputContext,
     frame: &mut Frame,
     filt: &mut Frame,
@@ -1936,6 +1947,11 @@ fn drain_video(
                 } else {
                     &mut *frame
                 };
+                if filter.is_none()
+                    && let Some(plan) = plan
+                {
+                    *filter = Some(plan.build(src)?);
+                }
                 if let Some(f) = filter.as_mut() {
                     f.push_frame(src)?;
                     let filter_tb = f.output_time_base();
@@ -2026,6 +2042,7 @@ fn flush_all(
     vd: &mut Option<Decoder>,
     ve: &mut Option<Encoder>,
     vf: &mut Option<FilterGraph>,
+    vf_plan: Option<&CpuFilterPlan>,
     ad: &mut Option<Decoder>,
     ae: &mut Option<Encoder>,
     af: &mut Option<FilterGraph>,
@@ -2042,7 +2059,18 @@ fn flush_all(
     if let (Some(d), Some(e)) = (vd.as_mut(), ve.as_mut()) {
         let enc_tb = e.time_base();
         d.send_eof()?;
-        drain_video(d, e, vf, out, frame, filt, pkt, zero_copy, video_out_tb)?;
+        drain_video(
+            d,
+            e,
+            vf,
+            vf_plan,
+            out,
+            frame,
+            filt,
+            pkt,
+            zero_copy,
+            video_out_tb,
+        )?;
         if let Some(f) = vf.as_mut() {
             f.push_eof()?;
             let ftb = f.output_time_base();

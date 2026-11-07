@@ -54,12 +54,17 @@ impl HwFramesContext {
         unsafe { ffi::av_buffer_ref(self.buf_ref) }
     }
 
-    /// Transfer a frame from GPU to CPU memory.
+    /// Transfer a frame from GPU to CPU memory, keeping its timestamps, colour
+    /// tags and side data (Dolby Vision RPU included).
     pub fn download(hw_frame: &Frame, sw_frame: &mut Frame) -> Result<()> {
         unsafe {
             ff_check!(
                 ffi::av_hwframe_transfer_data(sw_frame.as_mut_ptr(), hw_frame.as_ptr(), 0,),
                 "downloading frame from GPU"
+            )?;
+            ff_check!(
+                ffi::av_frame_copy_props(sw_frame.as_mut_ptr(), hw_frame.as_ptr()),
+                "copying frame properties from GPU frame"
             )?;
         }
         Ok(())

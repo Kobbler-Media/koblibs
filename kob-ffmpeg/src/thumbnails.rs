@@ -9,12 +9,10 @@
 use std::path::Path;
 
 use crate::codec::decoder::DecodeResult;
-use crate::codec::encoder::{EncodeResult, Encoder, VideoEncoderConfig};
 use crate::format::input::{InputContext, MediaType};
 use crate::fps_grid::TargetFpsGrid;
 use crate::frame::Frame;
 use crate::packet::Packet;
-use crate::types::{PixelFormat, TimeBase};
 use crate::{Result, ffi};
 
 /// A thumbnail as JPEG bytes at a specific timestamp.
@@ -27,69 +25,6 @@ pub struct JpegFrame {
     pub width: i32,
     /// Image height in pixels.
     pub height: i32,
-}
-
-/// Encode a raw frame as JPEG using the mjpeg encoder.
-/// Returns (jpeg_bytes, width, height).
-fn encode_frame_as_jpeg(frame: &Frame, quality: i32) -> Result<(Vec<u8>, i32, i32)> {
-    let src_width = frame.width();
-    let src_height = frame.height();
-    let src_pix_fmt = frame.format() as ffi::AVPixelFormat;
-
-    // mjpeg requires YUVJ420P. The "deprecated pixel format" warning from
-    // swscale is suppressed by our AV_LOG_ERROR level setting.
-    let target_pix_fmt = ffi::AV_PIX_FMT_YUVJ420P;
-    let needs_convert = src_pix_fmt != target_pix_fmt;
-
-    let encode_frame;
-    let frame_ref = if needs_convert {
-        let scaler = crate::scale::Scaler::bilinear(
-            src_width,
-            src_height,
-            src_pix_fmt,
-            src_width,
-            src_height,
-            target_pix_fmt,
-        )?;
-        let mut converted = Frame::new()?;
-        scaler.scale_frame(frame, &mut converted)?;
-        encode_frame = converted;
-        &encode_frame
-    } else {
-        frame
-    };
-
-    let mut encoder = Encoder::video(VideoEncoderConfig {
-        codec_name: "mjpeg".to_string(),
-        width: src_width,
-        height: src_height,
-        pixel_format: PixelFormat::from_raw(target_pix_fmt),
-        time_base: TimeBase::new(1, 25),
-        bit_rate: None,
-        gop_size: None,
-        global_header: false,
-        quality: Some(quality.clamp(1, 31)),
-        hw_frames_ctx: None,
-        sample_aspect_ratio: None,
-        frame_rate: None,
-        color: Default::default(),
-        options: Vec::new(),
-    })?;
-
-    encoder.send_frame(frame_ref)?;
-    encoder.send_eof()?;
-
-    let mut pkt = Packet::new()?;
-    match encoder.receive_packet(&mut pkt)? {
-        EncodeResult::Packet => {
-            let data = pkt.data().to_vec();
-            Ok((data, src_width, src_height))
-        }
-        _ => Err(crate::error::FfmpegError::new(
-            ffi::AVERROR_EXTERNAL,
-            "mjpeg encoder produced no packet",
-        )),
-    }
 }
 
 /// Extract frames as JPEG by sequential decode (CPU only).
@@ -196,44 +131,16 @@ pub fn extract_frames_sequential_with_hw(
         dec
     };
 
-    let is_hw = hw_ref.is_some();
-    let src_width = decoder.width();
-    let src_height = decoder.height();
-
-    // Pre-create scaler for CPU path. For HW, create lazily after first frame download.
-    let mut scaler: Option<crate::scale::Scaler> = if !is_hw {
-        scale_width
-            .map(|w| {
-                let aspect = src_height as f64 / src_width as f64;
-                let h = ((w as f64 * aspect) as i32 + 1) & !1;
-                crate::scale::Scaler::bilinear(
-                    src_width,
-                    src_height,
-                    decoder.pixel_format().raw(),
-                    w,
-                    h,
-                    decoder.pixel_format().raw(),
-                )
-            })
-            .transpose()?
-    } else {
-        None
-    };
-
+    let mut jpeg = crate::jpeg::ScaledJpeg::new(scale_width, jpeg_quality);
     let mut results = Vec::new();
     let mut packet = Packet::new()?;
     let mut frame = Frame::new()?;
     let mut sw_frame = Frame::new()?;
 
-    // Per-frame processing shared between the main decode loop and the
-    // EOF flush loop. Returns `Ok(true)` when the caller should stop
-    // (frame past end_secs). Captures the immutable parameters by value
-    // (all Copy); mutable state is threaded in per call.
-    let process_frame = |frame: &Frame,
-                         sw_frame: &mut Frame,
-                         scaler: &mut Option<crate::scale::Scaler>,
-                         grid: &mut TargetFpsGrid,
-                         results: &mut Vec<JpegFrame>|
+    let mut process_frame = |frame: &Frame,
+                             sw_frame: &mut Frame,
+                             grid: &mut TargetFpsGrid,
+                             results: &mut Vec<JpegFrame>|
      -> Result<bool> {
         let pts = frame.pts();
         if pts == ffi::AV_NOPTS_VALUE {
@@ -247,45 +154,15 @@ pub fn extract_frames_sequential_with_hw(
             return Ok(false);
         }
 
-        // Transfer HW frame to CPU if needed
-        let cpu_frame = if is_hw && frame.is_hw_format() {
+        let cpu_frame = if frame.is_hw_format() {
             sw_frame.unref();
             crate::hw::frames::HwFramesContext::download(frame, sw_frame)?;
-            // Create scaler lazily from first downloaded frame
-            if scaler.is_none()
-                && let Some(w) = scale_width
-            {
-                let sw = sw_frame.width();
-                let sh = sw_frame.height();
-                let aspect = sh as f64 / sw as f64;
-                let h = ((w as f64 * aspect) as i32 + 1) & !1;
-                *scaler = Some(crate::scale::Scaler::bilinear(
-                    sw,
-                    sh,
-                    sw_frame.format() as ffi::AVPixelFormat,
-                    w,
-                    h,
-                    sw_frame.format() as ffi::AVPixelFormat,
-                )?);
-            }
             &*sw_frame
         } else {
             frame
         };
 
-        let output_frame = if let Some(ref sc) = *scaler {
-            let mut dst = Frame::new()?;
-            sc.scale_frame(cpu_frame, &mut dst)?;
-            dst
-        } else {
-            let mut dst = Frame::new()?;
-            unsafe {
-                ffi::av_frame_ref(dst.as_mut_ptr(), cpu_frame.as_ptr());
-            }
-            dst
-        };
-
-        match encode_frame_as_jpeg(&output_frame, jpeg_quality) {
+        match jpeg.encode(cpu_frame) {
             Ok((jpeg_data, w, h)) => {
                 results.push(JpegFrame {
                     timestamp_secs: frame_time,
@@ -310,7 +187,7 @@ pub fn extract_frames_sequential_with_hw(
         loop {
             match decoder.receive_frame(&mut frame)? {
                 DecodeResult::Frame => {
-                    if process_frame(&frame, &mut sw_frame, &mut scaler, &mut grid, &mut results)? {
+                    if process_frame(&frame, &mut sw_frame, &mut grid, &mut results)? {
                         break 'outer;
                     }
                 }
@@ -328,7 +205,7 @@ pub fn extract_frames_sequential_with_hw(
     loop {
         match decoder.receive_frame(&mut frame)? {
             DecodeResult::Frame => {
-                if process_frame(&frame, &mut sw_frame, &mut scaler, &mut grid, &mut results)? {
+                if process_frame(&frame, &mut sw_frame, &mut grid, &mut results)? {
                     break;
                 }
             }

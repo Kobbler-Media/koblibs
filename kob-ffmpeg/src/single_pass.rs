@@ -34,7 +34,6 @@ use std::time::{Duration, Instant};
 
 use crate::audio::AudioGraphState;
 use crate::codec::decoder::DecodeResult;
-use crate::codec::encoder::{EncodeResult, Encoder, VideoEncoderConfig};
 pub use crate::filter::detect::BlackFramesParams;
 use crate::filter::detect::{
     BlackInterval, SilenceInterval, parse_black_metadata, parse_silence_metadata,
@@ -43,11 +42,13 @@ use crate::filter::graph::{FilterGraph, VideoFilterParams};
 use crate::format::input::{InputContext, MediaType};
 use crate::fps_grid::TargetFpsGrid;
 use crate::frame::Frame;
+use crate::jpeg::{ScaledJpeg, even_height_for};
 use crate::packet::Packet;
 use crate::progress::RunContext;
 use crate::scale::Scaler;
+use crate::sdr::SdrConverter;
 use crate::thumbnails::JpegFrame;
-use crate::types::{ChannelLayout, PixelFormat, SampleFormat, TimeBase};
+use crate::types::{ChannelLayout, SampleFormat};
 use crate::{FfmpegError, Result, ffi};
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -407,15 +408,9 @@ enum VideoJpegOutput {
 
 /// Per-branch state for a video sink that produces JPEGs at a target fps with a target width.
 struct VideoJpegSink {
-    width: i32,
-    quality: i32,
     grid: TargetFpsGrid,
     windows: Vec<(f64, f64)>,
-    scaler: Option<Scaler>,
-    // Cached source dims to know when to rebuild the scaler.
-    src_w: i32,
-    src_h: i32,
-    src_fmt: ffi::AVPixelFormat,
+    jpeg: ScaledJpeg,
     output: VideoJpegOutput,
 }
 
@@ -454,34 +449,11 @@ impl VideoJpegSink {
         output: VideoJpegOutput,
     ) -> Self {
         Self {
-            width,
-            quality,
             grid: TargetFpsGrid::new(fps, 0.0),
             windows,
-            scaler: None,
-            src_w: 0,
-            src_h: 0,
-            src_fmt: ffi::AV_PIX_FMT_NONE,
+            jpeg: ScaledJpeg::new(Some(width), quality),
             output,
         }
-    }
-
-    fn ensure_scaler(&mut self, frame: &Frame) -> Result<()> {
-        let w = frame.width();
-        let h = frame.height();
-        let fmt = frame.format() as ffi::AVPixelFormat;
-        if self.scaler.is_some() && w == self.src_w && h == self.src_h && fmt == self.src_fmt {
-            return Ok(());
-        }
-        let aspect = h as f64 / w as f64;
-        let dst_h = ((self.width as f64 * aspect) as i32 + 1) & !1;
-        // Scale into the same source format — the JPEG encoder converts to YUVJ420P
-        // afterwards, matching `extract_frames_sequential_with_hw`'s behaviour.
-        self.scaler = Some(Scaler::bilinear(w, h, fmt, self.width, dst_h, fmt)?);
-        self.src_w = w;
-        self.src_h = h;
-        self.src_fmt = fmt;
-        Ok(())
     }
 
     fn feed(&mut self, frame: &Frame, frame_time: f64) -> Result<()> {
@@ -491,14 +463,7 @@ impl VideoJpegSink {
         if !time_in_windows(frame_time, &self.windows) {
             return Ok(());
         }
-        self.ensure_scaler(frame)?;
-
-        let mut scaled = Frame::new()?;
-        self.scaler
-            .as_ref()
-            .unwrap()
-            .scale_frame(frame, &mut scaled)?;
-        let (jpeg, w, h) = encode_jpeg(&scaled, self.quality)?;
+        let (jpeg, w, h) = self.jpeg.encode(frame)?;
         let out = JpegFrame {
             timestamp_secs: frame_time,
             jpeg_data: jpeg,
@@ -540,6 +505,7 @@ struct VhashSink {
     src_w: i32,
     src_h: i32,
     src_fmt: ffi::AVPixelFormat,
+    sdr: SdrConverter,
     descriptors: Vec<VhashDescriptor>,
 }
 
@@ -554,6 +520,7 @@ impl VhashSink {
             src_w: 0,
             src_h: 0,
             src_fmt: ffi::AV_PIX_FMT_NONE,
+            sdr: SdrConverter::new(),
             descriptors: Vec::new(),
         }
     }
@@ -569,8 +536,7 @@ impl VhashSink {
         {
             return Ok(());
         }
-        let aspect = h as f64 / w as f64;
-        let inter_h = ((self.intermediate_width as f64 * aspect) as i32 + 1) & !1;
+        let inter_h = even_height_for(self.intermediate_width, w, h);
         // Stage 1: scale to intermediate (e.g. 64-wide), keep source pixfmt.
         self.intermediate_scaler = Some(Scaler::bilinear(
             w,
@@ -602,6 +568,8 @@ impl VhashSink {
         if !time_in_windows(frame_time, &self.windows) {
             return Ok(());
         }
+        let sdr = self.sdr.convert(frame)?;
+        let frame = sdr.as_ref().unwrap_or(frame);
         self.ensure_scalers(frame)?;
 
         let mut intermediate = Frame::new()?;
@@ -1767,51 +1735,6 @@ fn take_branch<S, F>(
         }
         Some(Err(e)) => result.per_branch_errors.push((id, e)),
         None => {}
-    }
-}
-
-fn encode_jpeg(frame: &Frame, quality: i32) -> Result<(Vec<u8>, i32, i32)> {
-    let src_w = frame.width();
-    let src_h = frame.height();
-    let src_fmt = frame.format() as ffi::AVPixelFormat;
-    let target_fmt = ffi::AV_PIX_FMT_YUVJ420P;
-
-    let converted_holder;
-    let frame_ref: &Frame = if src_fmt == target_fmt {
-        frame
-    } else {
-        let scaler = Scaler::bilinear(src_w, src_h, src_fmt, src_w, src_h, target_fmt)?;
-        let mut converted = Frame::new()?;
-        scaler.scale_frame(frame, &mut converted)?;
-        converted_holder = converted;
-        &converted_holder
-    };
-
-    let mut encoder = Encoder::video(VideoEncoderConfig {
-        codec_name: "mjpeg".to_string(),
-        width: src_w,
-        height: src_h,
-        pixel_format: PixelFormat::from_raw(target_fmt),
-        time_base: TimeBase::new(1, 25),
-        bit_rate: None,
-        gop_size: None,
-        global_header: false,
-        quality: Some(quality.clamp(1, 31)),
-        hw_frames_ctx: None,
-        sample_aspect_ratio: None,
-        frame_rate: None,
-        color: Default::default(),
-        options: Vec::new(),
-    })?;
-    encoder.send_frame(frame_ref)?;
-    encoder.send_eof()?;
-    let mut pkt = Packet::new()?;
-    match encoder.receive_packet(&mut pkt)? {
-        EncodeResult::Packet => Ok((pkt.data().to_vec(), src_w, src_h)),
-        _ => Err(FfmpegError::new(
-            ffi::AVERROR_EXTERNAL,
-            "mjpeg encoder produced no packet",
-        )),
     }
 }
 

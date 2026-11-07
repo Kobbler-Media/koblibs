@@ -281,6 +281,17 @@ impl FilterGraph {
     /// - `"blackdetect=d=0.08:pix_th=0.10"` — detect black frames
     /// - `"overlay"` — overlay subtitles
     pub fn new_video(params: &VideoFilterParams, filter_descr: &str) -> Result<Self> {
+        Self::new_video_on_device(params, filter_descr, None)
+    }
+
+    /// [`new_video`](Self::new_video) with `hw_device_ctx` handed to every filter,
+    /// as CLI `-filter_hw_device` does, so device-backed filters share one device
+    /// instead of each opening its own.
+    pub fn new_video_on_device(
+        params: &VideoFilterParams,
+        filter_descr: &str,
+        hw_device_ctx: Option<*mut ffi::AVBufferRef>,
+    ) -> Result<Self> {
         let graph = unsafe { ffi::avfilter_graph_alloc() };
         if graph.is_null() {
             return Err(crate::error::FfmpegError::new(
@@ -436,23 +447,33 @@ impl FilterGraph {
                 "creating buffersink filter"
             )?;
 
-            // Parse and connect the filter graph
             let c_descr = CString::new(filter_descr).map_err(|_| {
                 crate::error::FfmpegError::new(
                     ffi::AVERROR_EINVAL,
                     "filter description contains null byte",
                 )
             })?;
+            match hw_device_ctx {
+                Some(device) => fg.link_chain_on_device(&c_descr, device, filter_descr)?,
+                None => fg.link_chain(&c_descr, filter_descr)?,
+            }
+
+            ff_check!(
+                ffi::avfilter_graph_config(fg.graph, ptr::null_mut()),
+                "configuring filter graph"
+            )?;
+        }
+
+        Ok(fg)
+    }
+
+    unsafe fn link_chain(&mut self, c_descr: &CString, filter_descr: &str) -> Result<()> {
+        unsafe {
             let mut inputs = ffi::avfilter_inout_alloc();
             let mut outputs = ffi::avfilter_inout_alloc();
-
             if inputs.is_null() || outputs.is_null() {
-                if !inputs.is_null() {
-                    ffi::avfilter_inout_free(&mut inputs);
-                }
-                if !outputs.is_null() {
-                    ffi::avfilter_inout_free(&mut outputs);
-                }
+                ffi::avfilter_inout_free(&mut inputs);
+                ffi::avfilter_inout_free(&mut outputs);
                 return Err(crate::error::FfmpegError::new(
                     ffi::AVERROR_ENOMEM,
                     "allocating filter inout",
@@ -460,37 +481,115 @@ impl FilterGraph {
             }
 
             (*outputs).name = ffi::av_strdup(c"in".as_ptr());
-            (*outputs).filter_ctx = fg.src_ctx;
+            (*outputs).filter_ctx = self.src_ctx;
             (*outputs).pad_idx = 0;
             (*outputs).next = ptr::null_mut();
 
             (*inputs).name = ffi::av_strdup(c"out".as_ptr());
-            (*inputs).filter_ctx = fg.sink_ctx;
+            (*inputs).filter_ctx = self.sink_ctx;
             (*inputs).pad_idx = 0;
             (*inputs).next = ptr::null_mut();
 
+            let ret = ffi::avfilter_graph_parse_ptr(
+                self.graph,
+                c_descr.as_ptr(),
+                &mut inputs,
+                &mut outputs,
+                ptr::null_mut(),
+            );
+            ffi::avfilter_inout_free(&mut inputs);
+            ffi::avfilter_inout_free(&mut outputs);
+            ff_check!(ret, "parsing filter graph: {}", filter_descr)?;
+        }
+        Ok(())
+    }
+
+    /// `avfilter_graph_parse_ptr` initialises each filter as it creates it, and
+    /// libplacebo picks its Vulkan device during init — so the device has to be
+    /// attached between creation and init, which only the segment API allows.
+    unsafe fn link_chain_on_device(
+        &mut self,
+        c_descr: &CString,
+        device: *mut ffi::AVBufferRef,
+        filter_descr: &str,
+    ) -> Result<()> {
+        unsafe {
+            let mut seg = ptr::null_mut();
             ff_check!(
-                ffi::avfilter_graph_parse_ptr(
-                    fg.graph,
-                    c_descr.as_ptr(),
-                    &mut inputs,
-                    &mut outputs,
-                    ptr::null_mut(),
-                ),
+                ffi::avfilter_graph_segment_parse(self.graph, c_descr.as_ptr(), 0, &mut seg),
                 "parsing filter graph: {}",
                 filter_descr
             )?;
-
-            ff_check!(
-                ffi::avfilter_graph_config(fg.graph, ptr::null_mut()),
-                "configuring filter graph"
-            )?;
-
+            let mut inputs = ptr::null_mut();
+            let mut outputs = ptr::null_mut();
+            let linked = self.apply_segment(seg, device, &mut inputs, &mut outputs, filter_descr);
+            ffi::avfilter_graph_segment_free(&mut seg);
             ffi::avfilter_inout_free(&mut inputs);
             ffi::avfilter_inout_free(&mut outputs);
+            linked
         }
+    }
 
-        Ok(fg)
+    unsafe fn apply_segment(
+        &mut self,
+        seg: *mut ffi::AVFilterGraphSegment,
+        device: *mut ffi::AVBufferRef,
+        inputs: &mut *mut ffi::AVFilterInOut,
+        outputs: &mut *mut ffi::AVFilterInOut,
+        filter_descr: &str,
+    ) -> Result<()> {
+        unsafe {
+            ff_check!(
+                ffi::avfilter_graph_segment_create_filters(seg, 0),
+                "creating filters: {}",
+                filter_descr
+            )?;
+            for c in 0..(*seg).nb_chains {
+                let chain = *(*seg).chains.add(c);
+                for f in 0..(*chain).nb_filters {
+                    let filter = (*(*(*chain).filters.add(f))).filter;
+                    if !filter.is_null() {
+                        ffi::av_buffer_unref(&mut (*filter).hw_device_ctx);
+                        (*filter).hw_device_ctx = ffi::av_buffer_ref(device);
+                    }
+                }
+            }
+            ff_check!(
+                ffi::avfilter_graph_segment_apply(seg, 0, inputs, outputs),
+                "applying filter graph: {}",
+                filter_descr
+            )?;
+            let (input, output) = (*inputs, *outputs);
+            if input.is_null()
+                || output.is_null()
+                || !(*input).next.is_null()
+                || !(*output).next.is_null()
+            {
+                return Err(crate::error::FfmpegError::new(
+                    ffi::AVERROR_EINVAL,
+                    format!("filter graph is not a single chain: {filter_descr}"),
+                ));
+            }
+            ff_check!(
+                ffi::avfilter_link(
+                    self.src_ctx,
+                    0,
+                    (*input).filter_ctx,
+                    (*input).pad_idx as u32
+                ),
+                "linking buffersrc"
+            )?;
+            ff_check!(
+                ffi::avfilter_link(
+                    (*output).filter_ctx,
+                    (*output).pad_idx as u32,
+                    self.sink_ctx,
+                    0
+                ),
+                "linking buffersink"
+            )?;
+        }
+        Ok(())
     }
 
     /// Create an audio filter graph from a filter description string.

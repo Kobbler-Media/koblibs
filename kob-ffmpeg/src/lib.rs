@@ -45,14 +45,17 @@ pub(crate) mod fps_grid;
 pub mod audio;
 pub mod chromaprint;
 pub mod detect;
+pub mod dovi;
 pub(crate) mod hevc_config;
 #[cfg(feature = "hybrid-io")]
 pub mod hybrid_io;
 pub mod interlace;
 pub mod iptv;
+pub(crate) mod jpeg;
 pub mod pcm_stream;
 pub mod probe;
 pub mod remux;
+pub mod sdr;
 pub mod session;
 pub mod single_pass;
 pub mod streaming;

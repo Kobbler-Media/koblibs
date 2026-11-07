@@ -9,6 +9,7 @@
 #include <libavutil/channel_layout.h>
 #include <libavutil/dict.h>
 #include <libavutil/display.h>
+#include <libavutil/dovi_meta.h>
 #include <libavutil/downmix_info.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>

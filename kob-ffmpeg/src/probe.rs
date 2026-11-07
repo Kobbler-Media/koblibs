@@ -40,6 +40,7 @@ pub struct VideoStream {
     pub bit_depth: Option<i16>,
     pub is_hdr: bool,
     pub hdr_format: Option<String>,
+    pub dolby_vision: Option<crate::dovi::DolbyVision>,
     pub is_interlaced: bool,
 }
 
@@ -349,11 +350,12 @@ fn extract_video_stream(stream: &crate::format::input::Stream<'_>) -> Option<Vid
         }
     };
 
-    let is_hdr = detect_hdr(color_trc, color_pri, bit_depth);
-    let hdr_format = if is_hdr {
-        detect_hdr_format(color_trc)
-    } else {
-        None
+    let dolby_vision = unsafe { crate::dovi::DolbyVision::from_codec_parameters(params) };
+    let is_hdr = dolby_vision.is_some() || detect_hdr(color_trc, color_pri, bit_depth);
+    let hdr_format = match dolby_vision {
+        Some(dv) => Some(dv.label()),
+        None if is_hdr => detect_hdr_format(color_trc),
+        None => None,
     };
 
     let is_interlaced = unsafe { crate::interlace::codec_parameters_interlaced(params) };
@@ -373,6 +375,7 @@ fn extract_video_stream(stream: &crate::format::input::Stream<'_>) -> Option<Vid
         bit_depth,
         is_hdr,
         hdr_format,
+        dolby_vision,
         is_interlaced,
     })
 }
@@ -474,8 +477,6 @@ fn detect_hdr(
 }
 
 fn detect_hdr_format(color_trc: ffi::AVColorTransferCharacteristic) -> Option<String> {
-    // Side data for DV/HDR10+ would require packet-level inspection.
-    // For the common case, transfer characteristic is sufficient.
     match color_trc {
         ffi::AVCOL_TRC_ARIB_STD_B67 => Some("HLG".to_string()),
         ffi::AVCOL_TRC_SMPTE2084 => Some("HDR10".to_string()),
