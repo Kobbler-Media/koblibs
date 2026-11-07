@@ -1173,7 +1173,8 @@ pub struct TtsGenerateRequest {
     /// hold it for the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<String>,
-    /// Voice-design instructions (only meaningful without a cloned `voice`).
+    /// Voice-design instructions; with a cloned `voice` they steer its delivery
+    /// (tone, emotion, pace) while the clone keeps its identity.
     /// E.g. "a gruff sea captain, slow and gravelly".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
@@ -1201,7 +1202,8 @@ pub struct TtsGenerateRequest {
     pub top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repetition_penalty: Option<f64>,
-    /// Deterministic sampling seed; omit for server-random.
+    /// Sampling seed; omitted, the engine uses a fixed one, so a render
+    /// repeats unless a seed varies it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     /// Classifier-free guidance strength for an `instructions` prompt. `1` (or
