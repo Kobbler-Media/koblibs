@@ -117,10 +117,17 @@ fn color_tags(path: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-fn run_session(input: &Path, dir: &Path, encoder: &str, hw: Option<SharedHwDevice>) -> PathBuf {
+fn run_session(
+    input: &Path,
+    dir: &Path,
+    encoder: &str,
+    hw: Option<SharedHwDevice>,
+    tone_map_hdr: bool,
+) -> PathBuf {
     let mut config = SessionConfig::new(dir, 1.0)
         .segment_duration(1.0)
-        .video_encoder(encoder);
+        .video_encoder(encoder)
+        .tone_map_hdr(tone_map_hdr);
     if let Some(hw) = hw {
         config = config.hw_device(hw);
     }
@@ -249,7 +256,7 @@ fn a_cpu_session_tone_maps_dolby_vision_to_bt709() {
     let _gpu = one_gpu_user();
     let source = fixtures::dolby_vision_p5();
     let dir = tempfile::tempdir().unwrap();
-    let first = run_session(&source, dir.path(), "libx264", None);
+    let first = run_session(&source, dir.path(), "libx264", None, false);
     assert_eq!(color_tags(&first), "bt709,bt709");
     assert_tone_mapped(&source, &rgb_frame(&first, None));
 }
@@ -260,7 +267,7 @@ fn a_gpu_session_tone_maps_dolby_vision_to_bt709() {
     let Some(hw) = cuda() else { return };
     let source = fixtures::dolby_vision_p5();
     let dir = tempfile::tempdir().unwrap();
-    let first = run_session(&source, dir.path(), "h264_nvenc", Some(hw));
+    let first = run_session(&source, dir.path(), "h264_nvenc", Some(hw), false);
     assert_eq!(color_tags(&first), "bt709,bt709");
     assert_tone_mapped(&source, &rgb_frame(&first, None));
 }
@@ -285,5 +292,48 @@ fn an_hls_transcode_tone_maps_dolby_vision_to_bt709() {
         let first = joined_first_segment(dir.path());
         assert_eq!(color_tags(&first), "bt709,bt709", "{encoder}");
         assert_tone_mapped(&source, &rgb_frame(&first, None));
+    }
+}
+
+#[test]
+fn a_session_tone_maps_hdr10_only_when_asked() {
+    let _gpu = one_gpu_user();
+    let source = fixtures::hdr10_video();
+    for (tone_map_hdr, tags) in [(true, "bt709,bt709"), (false, "smpte2084,bt2020")] {
+        let dir = tempfile::tempdir().unwrap();
+        let first = run_session(&source, dir.path(), "libx264", None, tone_map_hdr);
+        assert_eq!(color_tags(&first), tags, "tone_map_hdr={tone_map_hdr}");
+        if tone_map_hdr {
+            assert_tone_mapped(&source, &rgb_frame(&first, None));
+        }
+    }
+}
+
+#[test]
+fn an_hls_transcode_tone_maps_hdr10_only_when_asked() {
+    let _gpu = one_gpu_user();
+    let source = fixtures::hdr10_video();
+    let mut legs: Vec<(&str, Option<SharedHwDevice>)> = vec![("libx264", None)];
+    if let Some(hw) = cuda() {
+        legs.push(("h264_nvenc", Some(hw)));
+    }
+    for (encoder, hw) in legs {
+        for (tone_map_hdr, tags) in [(true, "bt709,bt709"), (false, "smpte2084,bt2020")] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = HlsConfig::new(dir.path())
+                .segment_duration(1.0)
+                .video_encoder(encoder)
+                .tone_map_hdr(tone_map_hdr);
+            if let Some(hw) = hw.clone() {
+                config = config.hw_device(hw);
+            }
+            transcode_to_hls(&source, &config).unwrap();
+            let first = joined_first_segment(dir.path());
+            let what = format!("{encoder} tone_map_hdr={tone_map_hdr}");
+            assert_eq!(color_tags(&first), tags, "{what}");
+            if tone_map_hdr {
+                assert_tone_mapped(&source, &rgb_frame(&first, None));
+            }
+        }
     }
 }

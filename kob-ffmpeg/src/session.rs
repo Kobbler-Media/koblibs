@@ -79,6 +79,9 @@ pub struct SessionConfig {
     /// whatever of them is contiguous from it, so only what was never produced is
     /// transcoded again.
     pub prior_runs: Vec<PriorRun>,
+    /// Tone-maps HDR10, HLG and Dolby Vision sources to BT.709 SDR. Dolby Vision
+    /// without a compatible base layer is reshaped regardless.
+    pub tone_map_hdr: bool,
 }
 
 /// A run of segments one generation produced, as [`TranscodeSession::runs`] reports it.
@@ -116,6 +119,7 @@ impl SessionConfig {
             preset: None,
             tune: None,
             prior_runs: Vec::new(),
+            tone_map_hdr: false,
         }
     }
 
@@ -193,6 +197,12 @@ impl SessionConfig {
     #[must_use]
     pub fn deinterlace(mut self, mode: crate::filter::graph::Deinterlace) -> Self {
         self.deinterlace = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn tone_map_hdr(mut self, tone_map_hdr: bool) -> Self {
+        self.tone_map_hdr = tone_map_hdr;
         self
     }
 }
@@ -1357,7 +1367,10 @@ fn run_generation(
     });
     let deint_filter = config.deinterlace.filter_for(src_interlaced);
     let reshape = video_idx.is_some_and(|v| unsafe {
-        crate::sdr::stream_needs_reshaping(in_ctx.stream(v).unwrap().codec_parameters())
+        crate::sdr::stream_needs_reshaping(
+            in_ctx.stream(v).unwrap().codec_parameters(),
+            config.tone_map_hdr,
+        )
     });
 
     let playlist_path = gen_dir.join("stream.m3u8");

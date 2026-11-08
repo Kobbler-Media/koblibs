@@ -88,6 +88,9 @@ pub struct HlsConfig {
     /// Encoder tuning (`zerolatency`, `film`, …). `zerolatency` disables the
     /// lookahead and frame threading that otherwise cost ~1s on a live path.
     pub tune: Option<String>,
+    /// Tone-maps HDR10, HLG and Dolby Vision sources to BT.709 SDR. Dolby Vision
+    /// without a compatible base layer is reshaped regardless.
+    pub tone_map_hdr: bool,
 }
 
 impl HlsConfig {
@@ -113,6 +116,7 @@ impl HlsConfig {
             deinterlace: crate::filter::graph::Deinterlace::None,
             preset: None,
             tune: None,
+            tone_map_hdr: false,
         }
     }
 
@@ -186,6 +190,12 @@ impl HlsConfig {
     #[must_use]
     pub fn deinterlace(mut self, mode: crate::filter::graph::Deinterlace) -> Self {
         self.deinterlace = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn tone_map_hdr(mut self, tone_map_hdr: bool) -> Self {
+        self.tone_map_hdr = tone_map_hdr;
         self
     }
 
@@ -267,7 +277,10 @@ fn transcode_to_hls_inner(
     });
     let deint_filter = config.deinterlace.filter_for(src_interlaced);
     let reshape = video_idx.is_some_and(|v| unsafe {
-        crate::sdr::stream_needs_reshaping(in_ctx.stream(v).unwrap().codec_parameters())
+        crate::sdr::stream_needs_reshaping(
+            in_ctx.stream(v).unwrap().codec_parameters(),
+            config.tone_map_hdr,
+        )
     });
     // DVB SD is 720x576 with a 64:45 pixel aspect — 16:9 on screen. Dropping it
     // and letting the output default to square pixels renders it as 5:4.

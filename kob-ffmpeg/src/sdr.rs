@@ -118,14 +118,24 @@ pub fn libplacebo_available() -> bool {
     })
 }
 
-/// A stream whose base layer only displays correctly after RPU reshaping, and
-/// a libplacebo that can do it.
+/// Whether a transcode of this stream goes through libplacebo to BT.709. A
+/// Dolby Vision base layer with no compatible picture always does; any other
+/// HDR stream only when `tone_map_hdr` asks for SDR output.
 ///
 /// # Safety
 /// `params` must be null or point to a valid `AVCodecParameters`.
-pub unsafe fn stream_needs_reshaping(params: *const ffi::AVCodecParameters) -> bool {
+pub unsafe fn stream_needs_reshaping(
+    params: *const ffi::AVCodecParameters,
+    tone_map_hdr: bool,
+) -> bool {
+    if params.is_null() {
+        return false;
+    }
     let dv = unsafe { crate::dovi::DolbyVision::from_codec_parameters(params) };
-    dv.is_some_and(|dv| !dv.has_compatible_base_layer()) && libplacebo_available()
+    let trc = unsafe { (*params).color_trc };
+    let hdr = dv.is_some() || trc == ffi::AVCOL_TRC_SMPTE2084 || trc == ffi::AVCOL_TRC_ARIB_STD_B67;
+    let reshape = dv.is_some_and(|dv| !dv.has_compatible_base_layer()) || (tone_map_hdr && hdr);
+    reshape && libplacebo_available()
 }
 
 pub fn frame_is_hdr(frame: &Frame) -> bool {
