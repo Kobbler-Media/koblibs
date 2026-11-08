@@ -150,6 +150,9 @@ pub enum StructuralRejectReason {
     SessionMismatch,
     SessionMissing,
     EventNotYetHeld,
+    /// A movie still new enough to be in cinemas, from a release with no
+    /// source tag: in that window an unlabelled copy is a CAM/TS.
+    UnsourcedNewMovie,
 }
 
 impl StructuralRejectReason {
@@ -195,6 +198,7 @@ impl std::fmt::Display for StructuralRejectReason {
             Self::SessionMismatch => write!(f, "session_mismatch"),
             Self::SessionMissing => write!(f, "session_missing"),
             Self::EventNotYetHeld => write!(f, "event_not_yet_held"),
+            Self::UnsourcedNewMovie => write!(f, "unsourced_new_movie"),
         }
     }
 }
