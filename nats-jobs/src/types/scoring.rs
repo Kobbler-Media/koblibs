@@ -171,6 +171,7 @@ impl StructuralRejectReason {
                 | Self::EpisodeWantPackRejected
                 | Self::YearMismatch
                 | Self::EventNotYetHeld
+                | Self::UnsourcedNewMovie
         )
     }
 }
