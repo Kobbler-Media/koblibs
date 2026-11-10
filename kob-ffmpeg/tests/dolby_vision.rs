@@ -25,15 +25,40 @@ fn one_gpu_user() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Renders a reference with the ffmpeg CLI. libplacebo opens a Vulkan device of its own but
+/// refuses a software driver, so where it finds none (a GPU-less host has only lavapipe) the
+/// render is retried with FFmpeg's device handed to it, as production does.
+fn ffmpeg(filter: &str, args: &[&std::ffi::OsStr]) -> std::process::Output {
+    let run = |shared_device: bool| {
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-v", "error"]);
+        if shared_device {
+            cmd.args(["-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk"]);
+        }
+        cmd.args(args).output().expect("ffmpeg must be available")
+    };
+    let out = run(false);
+    if out.status.success() || !filter.contains("libplacebo") {
+        return out;
+    }
+    run(true)
+}
+
 fn rgb_frame(input: &Path, filter_prefix: Option<&str>) -> Vec<u8> {
     let mut vf = filter_prefix.map(|f| format!("{f},")).unwrap_or_default();
     vf.push_str(&format!("scale={PROBE_W}:{PROBE_H},format=rgb24"));
-    let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(input)
-        .args(["-vf", &vf, "-frames:v", "1", "-f", "rawvideo", "-"])
-        .output()
-        .expect("ffmpeg must be available");
+    let out = ffmpeg(
+        &vf,
+        &[
+            "-i".as_ref(),
+            input.as_os_str(),
+            "-vf".as_ref(),
+            vf.as_ref(),
+        ]
+        .into_iter()
+        .chain(["-frames:v", "1", "-f", "rawvideo", "-"].map(AsRef::as_ref))
+        .collect::<Vec<_>>(),
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -59,15 +84,25 @@ fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
 
 fn jpeg_of(source: &Path, filter: &str) -> Vec<u8> {
     let tmp = tempfile::Builder::new().suffix(".jpg").tempfile().unwrap();
-    let status = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(source)
-        .args(["-vf", &format!("{filter}format=yuvj420p"), "-frames:v", "1"])
-        .args(["-q:v", "2", "-update", "1", "-y"])
-        .arg(tmp.path())
-        .status()
-        .expect("ffmpeg must be available");
-    assert!(status.success());
+    let vf = format!("{filter}format=yuvj420p");
+    let out = ffmpeg(
+        filter,
+        &[
+            "-i".as_ref(),
+            source.as_os_str(),
+            "-vf".as_ref(),
+            vf.as_ref(),
+        ]
+        .into_iter()
+        .chain(["-frames:v", "1", "-q:v", "2", "-update", "1", "-y"].map(AsRef::as_ref))
+        .chain([tmp.path().as_os_str()])
+        .collect::<Vec<_>>(),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     std::fs::read(tmp.path()).unwrap()
 }
 

@@ -42,7 +42,34 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ${{ matrix.crate }}
+          workspaces: |
+            ${{ matrix.crate }} -> target
+            ${{ matrix.crate }} -> target-tools
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - if: matrix.crate != 'kob-ffmpeg'
+        run: cargo test
+      # kob-ffmpeg's tests pin FFmpeg behaviour (tone-mapped colour tags) that differs between
+      # releases, so they run against the FFmpeg kobbler's image ships, not the runner's.
+      # Pulled once that package is public, built from a kobbler checkout until then.
+      - name: kobbler-tools image
+        if: matrix.crate == 'kob-ffmpeg'
+        working-directory: .
+        run: |
+          if docker pull ghcr.io/kobbler-media/kobbler-tools:latest; then
+            docker tag ghcr.io/kobbler-media/kobbler-tools:latest kobbler-tools:latest
+          else
+            git clone --depth 1 https://github.com/Kobbler-Media/kobbler.git "$RUNNER_TEMP/kobbler"
+            docker build -f "$RUNNER_TEMP/kobbler/docker/tools.Dockerfile" -t kobbler-tools:latest "$RUNNER_TEMP/kobbler"
+          fi
+      # Own target dir: the FFmpeg bindings are generated from the headers present, and cargo
+      # does not notice those changing between host and image.
+      - name: test (in kobbler-tools)
+        if: matrix.crate == 'kob-ffmpeg'
+        working-directory: .
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/w/kob-ffmpeg/target-tools \
+            -e CARGO_TERM_COLOR=always \
+            -v "$HOME/.cargo:/cargo" -v "$GITHUB_WORKSPACE:/w" -w /w/kob-ffmpeg \
+            kobbler-tools:latest cargo test
