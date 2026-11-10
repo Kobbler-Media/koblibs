@@ -29,13 +29,13 @@ jobs:
         working-directory: ${{ matrix.crate }}
     steps:
       - uses: actions/checkout@v7
-      - name: System build deps (ffmpeg headers + libclang for bindgen)
+      - name: System build deps (ffmpeg headers + libclang for bindgen, ffmpeg for test fixtures)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libavformat-dev libavcodec-dev libavutil-dev libavfilter-dev \
             libswresample-dev libswscale-dev libchromaprint-dev \
-            clang libclang-dev pkg-config
+            clang libclang-dev pkg-config ffmpeg
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99"
