@@ -10,7 +10,7 @@
 //! names this requester as an evictor" — then the acquire blocks until budget
 //! frees.
 //!
-//! Design (HANDOFF-multi-gpu-scheduler.md §8a):
+//! Design:
 //!
 //! - A [`Placer`] (in `placement.rs`) owns the card list, the per-service
 //!   [`EngineDesc`] config, and the live ledger of resident placements. It is
@@ -70,8 +70,8 @@ pub enum AdmitFailure {
     /// retry — this is the eviction-cooldown case and must never be reordered
     /// around.
     EvictionUnconfirmed,
-    /// The box is in exclusive ("Beefy") mode for `keep`: one service owns BOTH
-    /// cards and nothing outside its allow-list may be admitted. Clears when an
+    /// The box is in exclusive ("Beefy") mode for `keep`: one service owns EVERY
+    /// card and nothing outside its allow-list may be admitted. Clears when an
     /// operator leaves the mode ([`GpuLock::set_exclusive`]). An ALLOWED kind that
     /// does not fit the reservation gets [`AdmitFailure::Place`] instead — that one
     /// is a resource state and clears on its own.
@@ -162,7 +162,7 @@ pub enum ServiceKind {
     Sa3,
     /// Krea-2-Turbo text→image (`krea2` container, the same sd.cpp fork as
     /// `Flux`). Its OWN budget line, not a second flux slot: a ~7.75 GiB nvfp4
-    /// DiT that cannot co-reside with FLUX.2 on the 5060 Ti.
+    /// DiT that cannot co-reside with FLUX.2 on a 16 GB card.
     Krea2,
     /// MiniMax-H3 joint audio+video (`minimax-h3` container, the same sd.cpp
     /// fork as `Ltx`). Its OWN budget line rather than a second LTX slot: it is
@@ -179,7 +179,7 @@ pub enum ServiceKind {
     /// two solve the same problem and share nothing, and this one peaks around
     /// 8.7 GiB against spar3d's 2.6 — accounting a rig against spar3d's
     /// reservation would let the scheduler admit a co-tenant onto a 12 GB card
-    /// that has no room for one. It is also 3060-pinned by UUID in compose.
+    /// that has no room for one. Its deployment usually pins it to one card by UUID.
     Pixal3d,
     /// The always-on EmbeddingGemma-2 text embedder (`embed-text`). Its requests
     /// never acquire: like the LLM it holds a STANDING reservation on its home
@@ -455,7 +455,7 @@ pub struct GpuLock {
     ///
     /// 🔴 A MODE THAT SUSPENDS THE SCHEDULER, not a placement. A two-card
     /// reservation is not representable — [`Placement`] carries exactly one
-    /// `card_uuid` and `free_mb` is per-card — so a 25 GiB both-cards model
+    /// `card_uuid` and `free_mb` is per-card — so a model split across cards
     /// cannot be a ledger row, and the ledger stays a harmless lie while this is
     /// set.
     ///

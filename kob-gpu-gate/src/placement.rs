@@ -3,7 +3,7 @@
 //! This is the config-driven per-device bin-packer. There is **no** heavy/light
 //! lane any more — every GPU service is uniform. The [`crate::GpuLock`] holds one
 //! async mutex over a [`Placer`] and consults it on every `acquire`; the only
-//! synchronization is VRAM-budget admission (HANDOFF-multi-gpu-scheduler.md §8a).
+//! synchronization is VRAM-budget admission.
 //!
 //! Model:
 //! - A [`Card`] list (uuid, total_mb, fast, enabled) — loaded from koblem's DB.
@@ -40,7 +40,7 @@ use crate::ServiceKind;
 
 /// A physical GPU the scheduler may place work on. Seeded from koblem's `gpu_cards`
 /// table; `enabled=false` removes it from placement and drains it (the operator's
-/// "serve on the 5060 while I bench on the 3060" feature).
+/// way to keep serving on one card while another is taken out for other work).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Card {
     /// GPU UUID (e.g. `GPU-3b9ac5cf-…`). This is what gets sent to the C++ server
@@ -48,7 +48,7 @@ pub struct Card {
     pub uuid: String,
     /// Total VRAM in MiB (reported `memory.total`).
     pub total_mb: u32,
-    /// Faster card (the 5060 Ti). Drives `fast`-first spill ranking.
+    /// Faster card. Drives `fast`-first spill ranking.
     pub fast: bool,
     /// Operator enable flag. Disabled cards are excluded from placement and
     /// drained.
@@ -57,7 +57,7 @@ pub struct Card {
 
 /// Per-service placement descriptor. Loaded from koblem's `gpu_engine_config`
 /// table and pushed into the gate at startup + on every edit, so tuning the peak
-/// table is a form field, not a recompile (HANDOFF §8b).
+/// table is a form field, not a recompile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EngineDesc {
     /// Tested worst-case peak VRAM at the configured `--max-vram` (MiB). Reserved
@@ -265,9 +265,9 @@ struct Inner {
 
 /// A keeper whose real footprint is a per-card operator number, not its ledger row.
 ///
-/// 🔴 Beefy is ONE service on BOTH cards, and a [`Placement`] carries one
+/// 🔴 Beefy is ONE service spread across cards, and a [`Placement`] carries one
 /// `card_uuid` — so the keeper's ledger row is wrong in both directions (its whole
-/// peak on one card, nothing on the other). While a hold is set, each card's used
+/// peak on one card, nothing on the others). While a hold is set, each card's used
 /// budget is `reserved + Σ(every OTHER resident's peak)`: the reservation stands in
 /// for the keeper there, so the keeper's own row is not counted twice.
 ///
@@ -838,7 +838,7 @@ impl Inner {
                 .iter()
                 // 🔴 Never the held keeper, force or not. Its row is a stand-in (see
                 // [`Hold`]), so "evicting" it frees no budget here — and its unload
-                // URL is the 27B's, so firing it would take down the model the hold
+                // URL is the large model's, so firing it would take down the model the hold
                 // exists to protect. The LLM names stt/vision/tts in `evictable_by`,
                 // so without this line every allowed co-tenant would do exactly that.
                 .filter(|p| Some(p.kind) != keeper)

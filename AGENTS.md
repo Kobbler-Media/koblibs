@@ -1,6 +1,6 @@
 # koblibs engineering conventions
 
-Shared libraries for the Kobbler ecosystem: eight standalone Rust crates plus the
+Shared libraries for the Kobbler ecosystem: nine standalone Rust crates plus the
 `@koblibs/ui` Svelte package at the repo root. Consumed by kobbler, kobload and koblem.
 
 Machine-specific notes — your build box, your deployment steps, your local paths — belong in

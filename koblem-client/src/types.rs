@@ -719,8 +719,8 @@ pub struct HealthResponse {
     /// 🔴 DERIVED, NEVER PROBED. `/v1/models` reports nothing about the mmproj,
     /// so there is no way to ask the server whether it has an audio encoder.
     /// koblem derives it from WHICH server it is pointed at: the resident gemma
-    /// ships a unified vision+audio mmproj, Beefy mode's Qwen3.8-27B ships a
-    /// VISION-ONLY one. Images work in both.
+    /// ships a unified vision+audio mmproj, Beefy mode's larger model may
+    /// ship a VISION-ONLY one. Images work in both.
     ///
     /// Defaults to `true` so an older koblem — which had no Beefy mode and was
     /// therefore always on gemma — is read correctly rather than as "no audio".
@@ -826,7 +826,7 @@ pub struct GpuCardOccupancy {
     /// budget-derived `free_mb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured_free_mb: Option<i64>,
-    /// Beefy's reservation on this card while it holds the box — the 27B's
+    /// Beefy's reservation on this card while it holds the box — the large model's
     /// footprint, standing in for its single-card ledger row, so `used_mb` is
     /// NOT the sum of `residents` then. Absent when Beefy is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1707,9 +1707,8 @@ pub struct GpuLogsStats {
 // ── ACE-Step music generation (koblem ↔ ace-server) ───────────────────
 //
 // koblem fronts acestep.cpp's ace-server as the GPU "music" engine. Three
-// modes are exposed, all on the turbo DiT (see acestep.cpp/HANDOFF-koblem-
-// integration.md): `generate` (text2music, runs the LM code-sketch then the
-// turbo DiT), `cover` (lyric-swap via ace `cover-nofsq`, no LM), and `repaint`
+// modes are exposed, all on the turbo DiT: `generate` (text2music, runs the LM
+// code-sketch then the turbo DiT), `cover` (lyric-swap via ace `cover-nofsq`, no LM), and `repaint`
 // (regenerate a time window via ace `repaint`, no LM). cover/repaint carry a
 // source-audio upload, so they're multipart with this request as the JSON part.
 
@@ -2294,7 +2293,7 @@ pub struct Sa3Props {
 
 /// Bit-slice attention block — opt-in DiT-perf knob bundle. Defaults are
 /// **off** (dense); the `radius=1 + self_frame=true + bitmap=true` combo is the
-/// bit-exact bitmap config (`HANDOFF-DiT-lap31.md` Stage 2). Other shapes
+/// bit-exact bitmap config. Other shapes
 /// (`radius >= 2`, no bitmap) are owner-eyeball-gated quality tradeoffs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AvatarBsaConfig {
@@ -3158,7 +3157,7 @@ pub const LTX_LORA_CATALOG: &[LtxLoraProfile] = &[
         file: LTX_LORA_FACEID_SHEET,
         label: "Face-ID sheet",
         blurb: "4-panel character sheets. Sets the Sheet identity regime.",
-        // The scale every faceid-sheet fold used (HANDOFF-faceid-character-sheets.md).
+        // The scale every faceid-sheet fold used.
         default_multiplier: 1.0,
         trigger: None,
         trigger_required: false,
@@ -3739,7 +3738,7 @@ pub struct LtxSegment {
 /// Named LTX quality profile. Each profile materialises the shared engine request
 /// contract (base sampler/sigmas/steps/cfg, negative prompt, and the multi-stage
 /// `hires_chain`). `Standard` is the default and is byte-identical to the historical
-/// single-hires ver3 request. See HANDOFF-ltx-quality-profiles.md.
+/// single-hires ver3 request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LtxQualityProfile {
@@ -6993,7 +6992,7 @@ pub enum BlockedReason {
     HeadReserved { head: String },
     /// The operator paused the queue, or held this row.
     Paused,
-    /// The box is in exclusive ("Beefy") mode: one service owns BOTH cards and
+    /// The box is in exclusive ("Beefy") mode: one service owns every card and
     /// nothing else may be admitted. Clears when an operator leaves the mode.
     /// Like `ServiceDisabled` this is an operator state, so the job WAITS and
     /// says so — it is never failed, and it never earns a head reservation.
@@ -7241,7 +7240,7 @@ pub struct QueueSnapshot {
     ///
     /// 🔴 Carried HERE rather than polled. Every page already holds this
     /// snapshot open (the topbar queue indicator does), so a whole-app banner
-    /// for "the box is handed to the 27B and nothing else can run" costs zero
+    /// for "the box is handed to the large model and nothing else can run" costs zero
     /// new network traffic. It is a mutex read on the gate, not a DB or HTTP
     /// call — cheap enough for a 10 s snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
