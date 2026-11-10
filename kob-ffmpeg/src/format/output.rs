@@ -4,6 +4,7 @@ use std::ffi::CString;
 use std::ptr;
 
 use crate::bsf::BitstreamFilter;
+use crate::error::ErrorKind;
 use crate::ffi;
 use crate::packet::Packet;
 use crate::{Result, ff_check};
@@ -32,7 +33,10 @@ struct DtsTracker {
 /// `Send` but not `Sync`.
 pub struct OutputContext {
     ptr: *mut ffi::AVFormatContext,
-    header_written: bool,
+    /// Set once the header is written; cleared by the trailer and by a write that failed on
+    /// the output rather than on the packet (a packet the muxer rejects leaves it intact).
+    /// After an output failure, FFmpeg's HLS muxer has crashed writing a trailer.
+    trailer_pending: bool,
     /// Custom AVIO context for channel-based output. Holds the avio pointer and the
     /// boxed opaque data (channel sender) to keep it alive.
     custom_io: Option<(*mut ffi::AVIOContext, Box<Box<dyn std::any::Any + Send>>)>,
@@ -98,7 +102,7 @@ impl OutputContext {
 
         Ok(Self {
             ptr,
-            header_written: false,
+            trailer_pending: false,
             custom_io: None,
             bsf_filters: Vec::new(),
             dts_correction: Vec::new(),
@@ -157,7 +161,7 @@ impl OutputContext {
 
         Ok(Self {
             ptr,
-            header_written: false,
+            trailer_pending: false,
             custom_io: None,
             bsf_filters: Vec::new(),
             dts_correction: Vec::new(),
@@ -245,7 +249,7 @@ impl OutputContext {
 
         Ok(Self {
             ptr,
-            header_written: false,
+            trailer_pending: false,
             custom_io: Some((avio_ctx, opaque)),
             bsf_filters: Vec::new(),
             dts_correction: Vec::new(),
@@ -409,7 +413,7 @@ impl OutputContext {
                 "writing output header"
             )?;
         }
-        self.header_written = true;
+        self.trailer_pending = true;
         Ok(())
     }
 
@@ -426,13 +430,13 @@ impl OutputContext {
         if let Some(Some(bsf)) = self.bsf_filters.get_mut(idx) {
             bsf.filter_packet(packet)?;
         }
-        unsafe {
+        let written = unsafe {
             ff_check!(
                 ffi::av_interleaved_write_frame(self.ptr, packet.as_mut_ptr()),
                 "writing interleaved packet"
-            )?;
-        }
-        Ok(())
+            )
+        };
+        self.muxed(written)
     }
 
     /// Write a copy-mode packet, rescaling timestamps from input to output time_base.
@@ -511,33 +515,46 @@ impl OutputContext {
                 tracker.last_dts = final_dts;
                 tracker.initialized = true;
             }
-
-            ff_check!(
-                ffi::av_interleaved_write_frame(self.ptr, pkt),
-                "writing rescaled packet"
-            )?;
         }
-        Ok(())
+        let written = unsafe {
+            ff_check!(
+                ffi::av_interleaved_write_frame(self.ptr, packet.as_mut_ptr()),
+                "writing rescaled packet"
+            )
+        };
+        self.muxed(written)
     }
 
     /// Write a packet to the output (non-interleaved).
     pub fn write_packet(&mut self, packet: &mut Packet) -> Result<()> {
-        unsafe {
+        let written = unsafe {
             ff_check!(
                 ffi::av_write_frame(self.ptr, packet.as_mut_ptr()),
                 "writing packet"
-            )?;
+            )
+        };
+        self.muxed(written)
+    }
+
+    fn muxed(&mut self, written: Result<i32>) -> Result<()> {
+        if let Err(e) = &written
+            && !matches!(
+                e.kind(),
+                ErrorKind::InvalidArgument | ErrorKind::InvalidData
+            )
+        {
+            self.trailer_pending = false;
         }
-        Ok(())
+        written.map(|_| ())
     }
 
     /// Write the file trailer. Must be called before closing.
     pub fn write_trailer(&mut self) -> Result<()> {
-        if self.header_written {
+        if self.trailer_pending {
+            self.trailer_pending = false;
             unsafe {
                 ff_check!(ffi::av_write_trailer(self.ptr), "writing output trailer")?;
             }
-            self.header_written = false;
         }
         Ok(())
     }
@@ -592,7 +609,7 @@ impl OutputContext {
 
 impl Drop for OutputContext {
     fn drop(&mut self) {
-        if self.header_written {
+        if self.trailer_pending {
             unsafe { ffi::av_write_trailer(self.ptr) };
         }
 
