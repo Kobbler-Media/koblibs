@@ -93,6 +93,13 @@ use std::sync::Once;
 
 static FFMPEG_INIT: Once = Once::new();
 
+// bindgen types a va_list parameter as the ABI passes it: a pointer into the one-element
+// __va_list_tag array on x86-64, the opaque va_list itself by value on aarch64.
+#[cfg(target_arch = "x86_64")]
+type VaListArg = *mut ffi::__va_list_tag;
+#[cfg(not(target_arch = "x86_64"))]
+type VaListArg = ffi::va_list;
+
 /// Custom av_log callback that routes FFmpeg's C-level logging through Rust's
 /// tracing framework. This replaces the default callback which writes to stderr.
 ///
@@ -103,7 +110,7 @@ unsafe extern "C" fn ffmpeg_log_callback(
     ptr: *mut std::os::raw::c_void,
     level: std::os::raw::c_int,
     fmt: *const std::os::raw::c_char,
-    vl: *mut ffi::__va_list_tag,
+    vl: VaListArg,
 ) {
     // Filter by the globally configured log level (same as default callback).
     if level > unsafe { ffi::av_log_get_level() } {

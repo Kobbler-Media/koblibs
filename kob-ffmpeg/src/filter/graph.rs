@@ -628,7 +628,7 @@ impl FilterGraph {
         unsafe {
             ffi::av_channel_layout_describe(
                 &params.channel_layout,
-                ch_buf.as_mut_ptr() as *mut i8,
+                ch_buf.as_mut_ptr() as *mut std::os::raw::c_char,
                 ch_buf.len(),
             );
         }

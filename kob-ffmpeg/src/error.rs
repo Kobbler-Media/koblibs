@@ -102,7 +102,7 @@ impl FfmpegError {
     pub fn av_description(&self) -> String {
         let mut buf = [0u8; 256];
         unsafe {
-            ffi::av_strerror(self.code, buf.as_mut_ptr() as *mut i8, buf.len());
+            ffi::av_strerror(self.code, buf.as_mut_ptr() as *mut std::os::raw::c_char, buf.len());
         }
         CStr::from_bytes_until_nul(&buf)
             .unwrap_or(c"Unknown error")
