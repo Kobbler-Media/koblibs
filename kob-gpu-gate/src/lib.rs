@@ -2242,20 +2242,14 @@ mod tests {
         g.set_engine_config(ServiceKind::Krea2, desc(7500, A, &[A], &[], false));
         g.set_engine_config(ServiceKind::Ltx, desc(7500, A, &[A], &[], false));
 
-        let held = g
-            .try_acquire(ServiceKind::Krea2)
-            .await
-            .expect("first fits");
+        let held = g.try_acquire(ServiceKind::Krea2).await.expect("first fits");
         assert_eq!(held.chosen_gpu(), Some(A));
 
         let blocked = g.try_acquire(ServiceKind::Ltx).await.err();
         let Some(AdmitFailure::Place(PlaceBlock::NoCardFits { blockers, .. })) = blocked else {
             panic!("expected a reasoned refusal, got {blocked:?}");
         };
-        assert!(
-            blockers.contains(&ServiceKind::Krea2),
-            "names the resident"
-        );
+        assert!(blockers.contains(&ServiceKind::Krea2), "names the resident");
 
         drop(held);
         assert!(g.try_acquire(ServiceKind::Ltx).await.is_ok());
