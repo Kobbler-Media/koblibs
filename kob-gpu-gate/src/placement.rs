@@ -1272,7 +1272,7 @@ mod tests {
     }
 
     /// A resident that doesn't name the requester is not a victim, even if other
-    /// services could evict it: avatar can't evict the LLM (only flux/songgen can).
+    /// services could evict it: krea2 can't evict the LLM (only flux/songgen can).
     #[test]
     fn non_naming_requester_cannot_evict() {
         let p = Placer::new();
@@ -1292,9 +1292,9 @@ mod tests {
                 true,
             ),
         );
-        p.set_engine(ServiceKind::Avatar, desc(7500, A, &[A], &[], false));
+        p.set_engine(ServiceKind::Krea2, desc(7500, A, &[A], &[], false));
         let _ = p.try_place(ServiceKind::Llm).unwrap();
-        let d = p.try_place(ServiceKind::Avatar).unwrap();
+        let d = p.try_place(ServiceKind::Krea2).unwrap();
         assert_eq!(d.card_uuid, None);
     }
 
@@ -1307,9 +1307,9 @@ mod tests {
             fast: false,
             enabled: true,
         }]);
-        p.set_engine(ServiceKind::Avatar, desc(7500, A, &[A], &[], false));
+        p.set_engine(ServiceKind::Krea2, desc(7500, A, &[A], &[], false));
         p.set_engine(ServiceKind::Ltx, desc(7500, A, &[A], &[], false));
-        let _ = p.try_place(ServiceKind::Avatar).unwrap();
+        let _ = p.try_place(ServiceKind::Krea2).unwrap();
         let d = p.try_place(ServiceKind::Ltx).unwrap();
         assert_eq!(d.card_uuid, None);
     }

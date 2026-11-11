@@ -1173,9 +1173,9 @@ pub struct TtsGenerateRequest {
     /// hold it for the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<String>,
-    /// Voice-design instructions; with a cloned `voice` they steer its delivery
-    /// (tone, emotion, pace) while the clone keeps its identity.
-    /// E.g. "a gruff sea captain, slow and gravelly".
+    /// Delivery instructions (tone, emotion, pace); with a cloned `voice` they
+    /// steer its delivery while the clone keeps its identity.
+    /// E.g. "gruff, slow and gravelly".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     /// Built-in speaker token, `"S0"`..`"S9"` (default `"S0"`). A closed list.
@@ -2287,277 +2287,6 @@ pub struct Sa3Props {
     pub healthy: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-}
-
-// ─── Avatar (LongCat-Video-Avatar) ────────────────────────────────────────────
-
-/// Bit-slice attention block — opt-in DiT-perf knob bundle. Defaults are
-/// **off** (dense); the `radius=1 + self_frame=true + bitmap=true` combo is the
-/// bit-exact bitmap config. Other shapes
-/// (`radius >= 2`, no bitmap) are owner-eyeball-gated quality tradeoffs.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AvatarBsaConfig {
-    pub enable: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub radius: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub self_frame: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bookend: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cube_h: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cube_w: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bitmap: Option<bool>,
-}
-
-/// How the avatar pipeline gets the driving audio.
-///
-/// - `Upload` is a multipart file uploaded with the request itself.
-/// - `LibraryClipId` references a previously-saved TTS render (see
-///   `TtsVoice.library` paths).
-/// - `Url` lets the API fetch a remote wav.
-/// - `Tts { script, voice, engine }` asks koblem to run TTS first (against the
-///   already-resident engine) and use that wav. `script_from_brief` lets the
-///   main 9B write the script before TTS runs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AvatarAudioSource {
-    Upload,
-    LibraryClipId {
-        id: String,
-    },
-    Url {
-        url: String,
-    },
-    Tts {
-        /// Final script. Use this OR `script_from_brief`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        script: Option<String>,
-        /// Free-form brief — koblem asks the main 9B to write a short spoken
-        /// script (no stage directions / markdown). Used only when `script` is
-        /// `None`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        script_from_brief: Option<String>,
-        /// Voice id understood by the TTS engine.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        voice: Option<String>,
-        /// Forward-compat hook for picking a TTS engine. Currently ignored —
-        /// koblem speaks one TTS engine (`tts-breeze`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        engine: Option<String>,
-    },
-}
-
-/// How the avatar pipeline gets the reference portrait.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AvatarImageSource {
-    Upload,
-    LibraryAssetId { id: String },
-    Url { url: String },
-}
-
-/// `auto | true | false` — the avatar offload knob. Prod ships offload-only
-/// (`true`); `Auto` keeps the supervisor's heuristic ("offload for >40f or any
-/// chain"); `False` is a perf-bench knob only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AvatarOffload {
-    #[default]
-    True,
-    False,
-    Auto,
-}
-
-/// Output orientation. The 480p/720p tiers are quality levels, not fixed
-/// shapes — `Landscape` transposes the tier dims (e.g. 480p → 832×480).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AvatarOrientation {
-    #[default]
-    Portrait,
-    Landscape,
-}
-
-/// Request body for `POST /api/v1/avatar/generate`. Mirrors the supervisor's
-/// `/generate` shape plus the TTS / LLM-script preprocessing knobs.
-///
-/// **Defaults derived from `PERF.md` lap 22**: `segment_frames=53` (sweet
-/// spot), `cont_cond_frames=13`, `steps=8`, `offload=true`. The model quant
-/// (`q4_k`) is baked in at server launch, not selectable per-request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AvatarGenerateRequest {
-    pub image_source: AvatarImageSource,
-    pub audio_source: AvatarAudioSource,
-
-    /// DiT prompt — default "a person talking".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
-
-    /// Quality tier — "480p" | "720p" (or raw "WxH"). Default "480p".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolution: Option<String>,
-    /// Output shape. `Landscape` transposes the resolved tier dims.
-    #[serde(default)]
-    pub orientation: AvatarOrientation,
-    /// Overrides `segments` when set — koblem picks the smallest segment count
-    /// covering this duration at 25 fps.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_sec: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub segments: Option<u32>,
-    /// Default 53 (PERF.md sweet spot).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub segment_frames: Option<u32>,
-    /// Default 13 (per-segment overlap for chained renders).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cont_cond_frames: Option<u32>,
-
-    /// DMD steps — default 8.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub steps: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cfg_scale: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seed: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audio_mouth_scale: Option<f64>,
-    /// Hz; 0/None = off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audio_lowpass_hz: Option<u32>,
-    /// Default `True` — prod assumes offload (§2 of GO-LIVE-PLAN).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offload: Option<AvatarOffload>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vae_tiling: Option<bool>,
-
-    /// Opt-in DiT-perf bundle. Default off (dense).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bsa: Option<AvatarBsaConfig>,
-    /// Debug env override for the playground (LONGCAT_* / GGML_* / CUDA_*
-    /// only; the supervisor enforces this namespace).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub debug_env: Option<std::collections::BTreeMap<String, String>>,
-
-    /// Persist the rendered clip under AVATARS_DIR and link to the gpu_logs row.
-    #[serde(default = "default_true")]
-    pub save_clip: bool,
-}
-
-impl Default for AvatarGenerateRequest {
-    fn default() -> Self {
-        Self {
-            image_source: AvatarImageSource::Upload,
-            audio_source: AvatarAudioSource::Upload,
-            prompt: None,
-            resolution: None,
-            orientation: AvatarOrientation::default(),
-            duration_sec: None,
-            segments: None,
-            segment_frames: None,
-            cont_cond_frames: None,
-            steps: None,
-            cfg_scale: None,
-            seed: None,
-            audio_mouth_scale: None,
-            audio_lowpass_hz: None,
-            offload: None,
-            vae_tiling: None,
-            bsa: None,
-            debug_env: None,
-            save_clip: true,
-        }
-    }
-}
-
-/// One rendered avatar clip — mirrors `MusicTrack`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AvatarClip {
-    /// Filename under AVATARS_DIR (and the last path segment of `url`).
-    pub filename: String,
-    /// koblem-relative URL: `/api/v1/avatar/file/{filename}`.
-    pub url: String,
-    /// `video/webm`.
-    pub content_type: String,
-    pub bytes: u64,
-    /// Clip wall length in milliseconds, from the muxed audio. Optional —
-    /// koblem fills it in from ffprobe when persisting.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<u64>,
-}
-
-/// Response body for `POST /api/v1/avatar/generate`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AvatarGenerateResponse {
-    pub clip: AvatarClip,
-    pub segments_rendered: u32,
-    pub render_ms: u64,
-    /// Total wall spent waiting on the GPU gate (drain + light-peer eviction).
-    pub gate_wait_ms: u64,
-    /// The script TTS actually rendered — useful when the 9B wrote it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub script_used: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gpu_log_id: Option<i64>,
-    /// `auto | true | false` actually used (post-resolution of `Auto`).
-    pub offload_used: bool,
-}
-
-/// `GET /api/v1/avatar/props` — UI bootstrap.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AvatarProps {
-    pub healthy: bool,
-    /// PERF.md sweet spot — `53` today; surfaced so the UI can label the
-    /// slider correctly without hard-coding.
-    pub default_segment_frames: u32,
-    pub default_cont_cond_frames: u32,
-    pub default_steps: u32,
-    pub default_resolution: String,
-    /// `last_render_sec` from the supervisor's `/health`, when known. Used
-    /// to seed a sensible UI progress estimate before the first render.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_render_sec: Option<f64>,
-}
-
-/// `POST /api/v1/avatar/script-from-llm` — koblem asks the main 9B to write a
-/// short spoken script from a brief. Mirrors music's `draft-lyrics`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AvatarScriptFromLlmRequest {
-    pub brief: String,
-    /// Target seconds at normal speech rate (~2.5 wps). None → ~10 s default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_sec: Option<f64>,
-    /// An existing spoken script to improve in place instead of writing fresh
-    /// from the brief. When present, the model revises it under the same script
-    /// rules (spoken words only, target duration).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refine_source: Option<String>,
-    /// Free-form change to apply to `refine_source`. Empty with a `refine_source`
-    /// set → a general polish. Ignored when `refine_source` is absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refine_instruction: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AvatarScriptFromLlmResponse {
-    pub script: String,
-}
-
-/// One saved character portrait, from `GET /api/v1/avatar/assets`. Lets the
-/// kid re-pick a character without re-uploading the same image every run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AvatarAsset {
-    pub id: String,
-    pub filename: String,
-    pub url: String,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AvatarAssetsResponse {
-    pub assets: Vec<AvatarAsset>,
 }
 
 // ─── LTX multi-segment video ───────────────────────────────────────────────
@@ -4035,7 +3764,7 @@ impl LtxVideoGenerateRequest {
     }
 }
 
-/// One rendered LTX clip — mirrors `AvatarClip`.
+/// One rendered LTX clip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LtxVideoClip {
     pub filename: String,
@@ -4110,10 +3839,10 @@ pub struct LtxVideoProps {
     pub beats_enabled: Option<bool>,
 }
 
-// ─── Async video jobs (ltx-video / ltx-2b / wan-vace share one wire shape) ────
+// ─── Async video jobs (ltx-video) ─────────────────────────────────────────────
 
 /// Lifecycle of a koblem-side video render job. Mirrors the server's
-/// `ltx_jobs::LtxJobState` / `wan_jobs::WanJobState`.
+/// `ltx_jobs::LtxJobState`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoJobState {
@@ -5798,7 +5527,7 @@ pub struct VideoJobPartial {
     pub url: String,
 }
 
-/// `GET /api/v1/{ltx-video,ltx-2b,wan-vace}/jobs/{id}`.
+/// `GET /api/v1/ltx-video/jobs/{id}`.
 ///
 /// On LTX there is no numeric progress: state transitions plus
 /// `created_at`/`gate_wait_ms`/`render_ms` and `partials` are the whole signal. **MiniMax-H3 does
@@ -5891,7 +5620,7 @@ pub struct VideoJobStatus {
     pub generations_done: Option<u32>,
 }
 
-/// `GET /api/v1/{ltx-video,ltx-2b,wan-vace}/jobs`.
+/// `GET /api/v1/ltx-video/jobs`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VideoJobListResponse {
     #[serde(default)]
@@ -6202,184 +5931,6 @@ impl Default for LtxRelipRequest {
             lipdub_strength: None,
         }
     }
-}
-
-// ─── Wan2.2-VACE video ──────────────────────────────────────────────────────
-//
-// The Wan2.2-VACE general-purpose video engine (T2V / I2V / continuation): a
-// prompt (or a per-segment prompt list for continuation) rendered by the warm
-// wan-vace video-server into a single stitched clip. koblem posts the render
-// request + optional init/reference images to `POST /wan/v1/generate` (returns a
-// server job id) and polls `GET /sdcpp/v1/jobs/{id}` to completion — the SAME
-// async job contract as the ltx-video-server. The internal VACE tuning flags
-// (skip-blocks / strength-tail / anchor-frames) are baked server-side and never
-// crossed the wire.
-
-/// Which Wan2.2-VACE render path to run. `Continuation` windows a per-segment
-/// prompt list into one long clip (server-side); `T2v`/`I2v` are single prompts.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WanVaceMode {
-    #[default]
-    T2v,
-    I2v,
-    Continuation,
-}
-
-/// How the Wan pipeline gets an optional image (init frame for i2v, or the
-/// identity-anchor reference). `None` = no image for this slot.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WanImageSource {
-    #[default]
-    None,
-    Upload,
-    Url {
-        url: String,
-    },
-}
-
-/// One beat of a Wan continuation script (single prompt for t2v/i2v).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WanSegment {
-    pub prompt: String,
-    /// Per-segment length in seconds (UI-facing; koblem maps to frames via fps).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seconds: Option<f64>,
-}
-
-/// Request body for `POST /api/v1/wan-vace/generate`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WanVaceGenerateRequest {
-    #[serde(default)]
-    pub mode: WanVaceMode,
-    /// Per-segment prompts (>=1). t2v/i2v use the first; continuation uses all.
-    pub segments: Vec<WanSegment>,
-    /// Init frame (i2v) — the clip starts from this image.
-    #[serde(default)]
-    pub init_source: WanImageSource,
-    /// Identity-anchor reference image (keeps the subject consistent).
-    #[serde(default)]
-    pub reference_source: WanImageSource,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub negative_prompt: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub width: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub height: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fps: Option<u32>,
-    /// Total frames for a monolithic render (cap ~65; longer → server windowing).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frames: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seed: Option<i64>,
-    /// Weight quant: "nvfp4" (default) or "q4_k" (fallback).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quant: Option<String>,
-
-    /// Persist the rendered clip to the generations gallery.
-    #[serde(default = "default_true")]
-    pub save_clip: bool,
-
-    /// Resume a failed/cancelled render from the server's banked segments.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume_job_id: Option<String>,
-}
-
-impl Default for WanVaceGenerateRequest {
-    fn default() -> Self {
-        Self {
-            mode: WanVaceMode::default(),
-            segments: Vec::new(),
-            init_source: WanImageSource::default(),
-            reference_source: WanImageSource::default(),
-            negative_prompt: None,
-            width: None,
-            height: None,
-            fps: None,
-            frames: None,
-            seed: None,
-            quant: None,
-            save_clip: true,
-            resume_job_id: None,
-        }
-    }
-}
-
-/// `GET /api/v1/wan-vace/props` — UI bootstrap.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WanVaceProps {
-    pub healthy: bool,
-    pub default_frames: u32,
-    pub default_fps: u32,
-    pub default_resolution: String,
-    pub default_quant: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_render_sec: Option<f64>,
-}
-
-/// `POST /api/v1/wan-vace/script-from-llm` — koblem asks the main LLM to expand a brief
-/// (and/or an opening image) into N per-segment continuation prompts. Unlike LTX, the
-/// system prompt encodes Wan2.2-VACE CONTINUATION-IDENTITY guidance: every shot must keep
-/// the SAME subject/appearance/setting and only continue the motion, because VACE temporal
-/// extension drifts to a new subject when per-segment prompts diverge.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WanScriptFromLlmRequest {
-    pub brief: String,
-    /// How many segments to produce.
-    pub n_segments: u32,
-    /// Target seconds per segment (informs the per-beat action density). None → engine default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seconds_per_segment: Option<f64>,
-    /// Bare base64 opening/anchor frame (no `data:` prefix). Present → the VL model sees the
-    /// subject (i2v init frame or identity-anchor reference) and keeps it across every shot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WanScriptFromLlmResponse {
-    /// One continuation prompt per segment.
-    pub segments: Vec<String>,
-}
-
-/// `POST /api/v1/wan-vace/prompt-from-llm` — write ONE detailed Wan 2.2 shot prompt for a single
-/// prompt field. Reuses [`LtxPromptImage`] as the shared per-shot image DTO (init frame / anchor).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WanPromptFromLlmRequest {
-    /// Optional seed idea / the field's current text to build on.
-    #[serde(default)]
-    pub idea: String,
-    /// Wan mode (drives t2v vs i2v guidance; continuation adds the identity-continuity clause).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<WanVaceMode>,
-    /// Target shot length (seconds); the prompt's motion detail is scaled to fill it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seconds: Option<f64>,
-    /// Attached subject images (init frame / identity anchor) fed to the VL model.
-    #[serde(default)]
-    pub images: Vec<LtxPromptImage>,
-    /// Neighbouring shot prompts for continuity (optional).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prev_prompt: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_prompt: Option<String>,
-    /// An existing shot prompt to improve in place. With `instruction` set, the
-    /// change is applied in place; without one, the prompt is reworded for a
-    /// fresh take on the same scene. Same behaviour as the LTX shot drafter.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rewrite: Option<String>,
-    /// Free-form directed change to apply. With `rewrite` set, revises that
-    /// prompt in place; otherwise writes a fresh prompt toward the instruction.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instruction: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WanPromptFromLlmResponse {
-    pub prompt: String,
 }
 
 // ── Image generation (FLUX.2) ───────────────────────────────────────
@@ -6822,9 +6373,6 @@ pub enum JobKind {
     Upscale,
     Krea2,
     Flux2,
-    Avatar,
-    WanVace,
-    Ltx2b,
     Songgen,
     Sa3,
     Pixal3dRig,
@@ -6837,16 +6385,13 @@ pub enum JobKind {
 }
 
 impl JobKind {
-    pub const ALL: [JobKind; 14] = [
+    pub const ALL: [JobKind; 11] = [
         JobKind::Ltx25,
         JobKind::H3,
         JobKind::Music3,
         JobKind::Upscale,
         JobKind::Krea2,
         JobKind::Flux2,
-        JobKind::Avatar,
-        JobKind::WanVace,
-        JobKind::Ltx2b,
         JobKind::Songgen,
         JobKind::Sa3,
         JobKind::Pixal3dRig,
@@ -6862,9 +6407,6 @@ impl JobKind {
             JobKind::Upscale => "upscale",
             JobKind::Krea2 => "krea2",
             JobKind::Flux2 => "flux2",
-            JobKind::Avatar => "avatar",
-            JobKind::WanVace => "wan_vace",
-            JobKind::Ltx2b => "ltx_2b",
             JobKind::Songgen => "songgen",
             JobKind::Sa3 => "sa3",
             JobKind::Pixal3dRig => "pixal3d_rig",
@@ -6873,6 +6415,9 @@ impl JobKind {
         }
     }
 
+    /// `None` for a kind this build does not run — including a retired engine's
+    /// kind still on historical `gpu_jobs` rows. Callers must treat that as
+    /// unknown, never substitute a live kind.
     pub fn parse(s: &str) -> Option<Self> {
         JobKind::ALL.into_iter().find(|k| k.as_str() == s)
     }
@@ -6882,7 +6427,7 @@ impl JobKind {
     pub fn unit_noun(self) -> &'static str {
         match self {
             JobKind::H3 => "generation",
-            JobKind::Ltx25 | JobKind::Upscale | JobKind::Ltx2b | JobKind::WanVace => "segment",
+            JobKind::Ltx25 | JobKind::Upscale => "segment",
             JobKind::LtxRelip => "window",
             JobKind::Music3 | JobKind::Songgen | JobKind::Sa3 => "track",
             JobKind::Pixal3dRig => "tier",
@@ -8300,10 +7845,8 @@ mod tests {
         assert!(MusicGenerateRequest::default().save_song);
         assert!(SonggenGenerateRequest::default().save_song);
         assert!(Sa3GenerateRequest::default().save);
-        assert!(AvatarGenerateRequest::default().save_clip);
         assert!(LtxVideoGenerateRequest::default().save_clip);
         assert!(LtxRelipRequest::default().save_clip);
-        assert!(WanVaceGenerateRequest::default().save_clip);
         assert_eq!(ImageGenerateRequest::default().model, "auto");
 
         // Same value whether the field is omitted on the wire or left to Default.

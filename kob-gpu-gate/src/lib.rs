@@ -129,12 +129,9 @@ pub struct HeavyService {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum HeavyKind {
     Llm,
-    Avatar,
     Flux,
     Songgen,
     Ltx,
-    WanVace,
-    Ltx2b,
     Krea2,
     MinimaxH3,
 }
@@ -145,7 +142,6 @@ pub enum HeavyKind {
 pub enum ServiceKind {
     Llm,
     Tts,
-    Avatar,
     Music,
     Vision,
     Stt,
@@ -155,8 +151,6 @@ pub enum ServiceKind {
     Songgen,
     Ltx,
     Matting,
-    WanVace,
-    Ltx2b,
     // `Sa3` is the split-out peer of `Music` (acestep): its own budget line,
     // not a shared Music slot.
     Sa3,
@@ -189,10 +183,9 @@ pub enum ServiceKind {
 }
 
 impl ServiceKind {
-    pub const ALL: [ServiceKind; 18] = [
+    pub const ALL: [ServiceKind; 15] = [
         ServiceKind::Llm,
         ServiceKind::Tts,
-        ServiceKind::Avatar,
         ServiceKind::Music,
         ServiceKind::Vision,
         ServiceKind::Stt,
@@ -200,8 +193,6 @@ impl ServiceKind {
         ServiceKind::Songgen,
         ServiceKind::Ltx,
         ServiceKind::Matting,
-        ServiceKind::WanVace,
-        ServiceKind::Ltx2b,
         ServiceKind::Sa3,
         ServiceKind::Krea2,
         ServiceKind::MinimaxH3,
@@ -214,7 +205,6 @@ impl ServiceKind {
         match self {
             ServiceKind::Llm => "llm",
             ServiceKind::Tts => "tts",
-            ServiceKind::Avatar => "avatar",
             ServiceKind::Music => "music",
             ServiceKind::Vision => "vision",
             ServiceKind::Stt => "stt",
@@ -222,8 +212,6 @@ impl ServiceKind {
             ServiceKind::Songgen => "songgen",
             ServiceKind::Ltx => "ltx",
             ServiceKind::Matting => "matting",
-            ServiceKind::WanVace => "wan_vace",
-            ServiceKind::Ltx2b => "ltx_2b",
             ServiceKind::Sa3 => "sa3",
             ServiceKind::Krea2 => "krea2",
             ServiceKind::MinimaxH3 => "minimax_h3",
@@ -239,7 +227,6 @@ impl ServiceKind {
         match s {
             "llm" => Some(ServiceKind::Llm),
             "tts" => Some(ServiceKind::Tts),
-            "avatar" => Some(ServiceKind::Avatar),
             "music" => Some(ServiceKind::Music),
             "vision" => Some(ServiceKind::Vision),
             "stt" => Some(ServiceKind::Stt),
@@ -247,8 +234,6 @@ impl ServiceKind {
             "songgen" => Some(ServiceKind::Songgen),
             "ltx" => Some(ServiceKind::Ltx),
             "matting" => Some(ServiceKind::Matting),
-            "wan_vace" => Some(ServiceKind::WanVace),
-            "ltx_2b" => Some(ServiceKind::Ltx2b),
             "sa3" => Some(ServiceKind::Sa3),
             "krea2" => Some(ServiceKind::Krea2),
             "minimax_h3" => Some(ServiceKind::MinimaxH3),
@@ -290,12 +275,9 @@ impl ServiceKind {
     fn heavy_kind(self) -> Option<HeavyKind> {
         match self {
             ServiceKind::Llm => Some(HeavyKind::Llm),
-            ServiceKind::Avatar => Some(HeavyKind::Avatar),
             ServiceKind::Flux => Some(HeavyKind::Flux),
             ServiceKind::Songgen => Some(HeavyKind::Songgen),
             ServiceKind::Ltx => Some(HeavyKind::Ltx),
-            ServiceKind::WanVace => Some(HeavyKind::WanVace),
-            ServiceKind::Ltx2b => Some(HeavyKind::Ltx2b),
             ServiceKind::Krea2 => Some(HeavyKind::Krea2),
             ServiceKind::MinimaxH3 => Some(HeavyKind::MinimaxH3),
             _ => None,
@@ -320,7 +302,7 @@ struct ServiceUrls {
 /// Length of the per-service `service_enabled` array. Kept in lockstep with the
 /// `ServiceKind` enum + `ServiceKind::ALL` by the const assert below, so adding a
 /// variant without extending both fails to compile instead of panicking at runtime.
-const SERVICE_COUNT: usize = 18;
+const SERVICE_COUNT: usize = 15;
 const _: () = assert!(
     ServiceKind::ALL.len() == SERVICE_COUNT,
     "ServiceKind::ALL and the service_enabled array must stay in lockstep"
@@ -527,12 +509,9 @@ pub type GpuSttGuard = Acquisition;
 pub type GpuVisionGuard = Acquisition;
 pub type GpuMusicGuard = Acquisition;
 pub type GpuHeavyGuard = Acquisition;
-pub type GpuAvatarGuard = Acquisition;
 pub type GpuFluxGuard = Acquisition;
 pub type GpuSonggenGuard = Acquisition;
 pub type GpuLtxGuard = Acquisition;
-pub type GpuWanVaceGuard = Acquisition;
-pub type GpuLtx2bGuard = Acquisition;
 pub type GpuKrea2Guard = Acquisition;
 pub type GpuMinimaxH3Guard = Acquisition;
 pub type GpuLlmGuard = Acquisition;
@@ -574,7 +553,6 @@ impl GpuLock {
             service_enabled: Arc::new([
                 AtomicBool::new(true), // Llm
                 AtomicBool::new(true), // Tts
-                AtomicBool::new(true), // Avatar
                 AtomicBool::new(true), // Music
                 AtomicBool::new(true), // Vision
                 AtomicBool::new(true), // Stt
@@ -582,8 +560,6 @@ impl GpuLock {
                 AtomicBool::new(true), // Songgen
                 AtomicBool::new(true), // Ltx
                 AtomicBool::new(true), // Matting
-                AtomicBool::new(true), // WanVace
-                AtomicBool::new(true), // Ltx2b
                 AtomicBool::new(true), // Sa3
                 AtomicBool::new(true), // Krea2
                 AtomicBool::new(true), // MinimaxH3
@@ -671,10 +647,6 @@ impl GpuLock {
         urls.heavy.push(svc);
     }
 
-    pub fn set_avatar_service(&self, svc: HeavyService) {
-        debug_assert!(matches!(svc.kind, HeavyKind::Avatar));
-        self.register_heavy(svc);
-    }
     pub fn set_llm_service(&self, svc: HeavyService) {
         debug_assert!(matches!(svc.kind, HeavyKind::Llm));
         self.register_heavy(svc);
@@ -689,14 +661,6 @@ impl GpuLock {
     }
     pub fn set_ltx_service(&self, svc: HeavyService) {
         debug_assert!(matches!(svc.kind, HeavyKind::Ltx));
-        self.register_heavy(svc);
-    }
-    pub fn set_wan_vace_service(&self, svc: HeavyService) {
-        debug_assert!(matches!(svc.kind, HeavyKind::WanVace));
-        self.register_heavy(svc);
-    }
-    pub fn set_ltx2b_service(&self, svc: HeavyService) {
-        debug_assert!(matches!(svc.kind, HeavyKind::Ltx2b));
         self.register_heavy(svc);
     }
     pub fn set_krea2_service(&self, svc: HeavyService) {
@@ -765,12 +729,9 @@ impl GpuLock {
             for h in &urls.heavy {
                 let kind = match h.kind {
                     HeavyKind::Llm => ServiceKind::Llm,
-                    HeavyKind::Avatar => ServiceKind::Avatar,
                     HeavyKind::Flux => ServiceKind::Flux,
                     HeavyKind::Songgen => ServiceKind::Songgen,
                     HeavyKind::Ltx => ServiceKind::Ltx,
-                    HeavyKind::WanVace => ServiceKind::WanVace,
-                    HeavyKind::Ltx2b => ServiceKind::Ltx2b,
                     HeavyKind::Krea2 => ServiceKind::Krea2,
                     HeavyKind::MinimaxH3 => ServiceKind::MinimaxH3,
                 };
@@ -1500,12 +1461,9 @@ impl GpuLock {
                 success
             }
             ServiceKind::Llm
-            | ServiceKind::Avatar
             | ServiceKind::Flux
             | ServiceKind::Songgen
             | ServiceKind::Ltx
-            | ServiceKind::WanVace
-            | ServiceKind::Ltx2b
             | ServiceKind::Krea2
             | ServiceKind::MinimaxH3 => {
                 // Drain/unload services go via `evict_for_placement` → `post`.
@@ -1805,9 +1763,6 @@ impl GpuLock {
     pub async fn acquire_for_matting(&self) -> Option<Acquisition> {
         self.acquire(ServiceKind::Matting).await
     }
-    pub async fn acquire_for_avatar(&self) -> Option<GpuAvatarGuard> {
-        self.acquire(ServiceKind::Avatar).await
-    }
     pub async fn acquire_for_flux(&self) -> Option<GpuFluxGuard> {
         self.acquire(ServiceKind::Flux).await
     }
@@ -1816,12 +1771,6 @@ impl GpuLock {
     }
     pub async fn acquire_for_ltx(&self) -> Option<GpuLtxGuard> {
         self.acquire(ServiceKind::Ltx).await
-    }
-    pub async fn acquire_for_wan_vace(&self) -> Option<GpuWanVaceGuard> {
-        self.acquire(ServiceKind::WanVace).await
-    }
-    pub async fn acquire_for_ltx2b(&self) -> Option<GpuLtx2bGuard> {
-        self.acquire(ServiceKind::Ltx2b).await
     }
     pub async fn acquire_for_krea2(&self) -> Option<GpuKrea2Guard> {
         self.acquire(ServiceKind::Krea2).await
@@ -1840,10 +1789,6 @@ impl GpuLock {
 
     /// Always false — there is no heavy slot any more.
     pub fn is_heavy_busy(&self) -> bool {
-        false
-    }
-    /// Back-compat alias of [`Self::is_heavy_busy`].
-    pub fn is_avatar_busy(&self) -> bool {
         false
     }
     /// Always false — TTS no longer preempts via a cancel token.
@@ -1972,9 +1917,9 @@ mod tests {
     async fn two_cards_run_concurrently() {
         let g = GpuLock::new();
         g.set_cards(cards());
-        g.set_engine_config(ServiceKind::Avatar, desc(7500, B, &[B], &[], false));
+        g.set_engine_config(ServiceKind::Krea2, desc(7500, B, &[B], &[], false));
         g.set_engine_config(ServiceKind::Llm, desc(10000, A, &[A], &[], false));
-        let av = g.acquire(ServiceKind::Avatar).await.unwrap();
+        let av = g.acquire(ServiceKind::Krea2).await.unwrap();
         let llm = g.acquire(ServiceKind::Llm).await.unwrap();
         assert_eq!(av.chosen_gpu(), Some(B));
         assert_eq!(llm.chosen_gpu(), Some(A));
@@ -1991,10 +1936,10 @@ mod tests {
             enabled: true,
         }]);
         // Two mutually-un-evictable 7.5GB services can't co-reside on a 12GB card.
-        g.set_engine_config(ServiceKind::Avatar, desc(7500, A, &[A], &[], false));
+        g.set_engine_config(ServiceKind::Krea2, desc(7500, A, &[A], &[], false));
         g.set_engine_config(ServiceKind::Ltx, desc(7500, A, &[A], &[], false));
 
-        let first = g.acquire(ServiceKind::Avatar).await.unwrap();
+        let first = g.acquire(ServiceKind::Krea2).await.unwrap();
         assert_eq!(first.chosen_gpu(), Some(A));
 
         let order = Arc::new(StdMutex::new(Vec::<&'static str>::new()));
@@ -2294,11 +2239,11 @@ mod tests {
             fast: false,
             enabled: true,
         }]);
-        g.set_engine_config(ServiceKind::Avatar, desc(7500, A, &[A], &[], false));
+        g.set_engine_config(ServiceKind::Krea2, desc(7500, A, &[A], &[], false));
         g.set_engine_config(ServiceKind::Ltx, desc(7500, A, &[A], &[], false));
 
         let held = g
-            .try_acquire(ServiceKind::Avatar)
+            .try_acquire(ServiceKind::Krea2)
             .await
             .expect("first fits");
         assert_eq!(held.chosen_gpu(), Some(A));
@@ -2308,7 +2253,7 @@ mod tests {
             panic!("expected a reasoned refusal, got {blocked:?}");
         };
         assert!(
-            blockers.contains(&ServiceKind::Avatar),
+            blockers.contains(&ServiceKind::Krea2),
             "names the resident"
         );
 
