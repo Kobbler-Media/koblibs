@@ -238,7 +238,9 @@ fn single_pass_silence_matches_standalone() {
 #[test]
 fn single_pass_lufs_matches_standalone() {
     let path = fixtures::basic_video();
-    let standalone = kob_ffmpeg::audio::measure_lufs(&path, None).expect("standalone");
+    let standalone = kob_ffmpeg::audio::measure_loudness(&path, None)
+        .expect("standalone")
+        .integrated_lufs;
 
     let req = SinglePassRequest {
         input_path: path,
@@ -263,6 +265,34 @@ fn single_pass_lufs_matches_standalone() {
         ),
         (None, None) => {}
         (a, b) => panic!("LUFS presence mismatch: standalone {a:?} vs single_pass {b:?}"),
+    }
+}
+
+#[test]
+fn single_pass_loudness_reports_downmix_peak_matching_standalone() {
+    for (layout, amplitude) in [("stereo", 0.5), ("5.1(side)", 0.5), ("7.1", 0.25)] {
+        let path = fixtures::in_phase_sine(layout, amplitude);
+        let standalone = kob_ffmpeg::audio::measure_loudness(&path, None)
+            .expect("standalone")
+            .downmix_peak_db
+            .expect("standalone peak");
+        let mut req = SinglePassRequest::new(path);
+        req.loudness = true;
+        req.silence = Some(SilenceParams {
+            noise_db: -50.0,
+            min_duration_secs: 0.5,
+        });
+        let result = run_single_pass(req, None).expect("run_single_pass");
+        assert!(
+            result.per_branch_errors.is_empty(),
+            "{layout}: {:?}",
+            result.per_branch_errors
+        );
+        let peak = result.downmix_peak_db.expect("single-pass peak");
+        assert!(
+            (peak - standalone).abs() < 0.01,
+            "{layout}: single_pass {peak} vs standalone {standalone}"
+        );
     }
 }
 

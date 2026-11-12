@@ -200,23 +200,25 @@ fn test_convert_to_wav() {
 }
 
 #[test]
-fn test_measure_lufs() {
-    let result = kob_ffmpeg::audio::measure_lufs(&fixtures::basic_video(), None);
+fn test_measure_loudness() {
+    let result = kob_ffmpeg::audio::measure_loudness(&fixtures::basic_video(), None);
     assert!(result.is_ok(), "should not error: {:?}", result.err());
     // Short synthetic files may not produce LUFS metadata
-    if let Some(val) = result.unwrap() {
+    if let Some(val) = result.unwrap().integrated_lufs {
         assert!((-100.0..=0.0).contains(&val), "LUFS {val} out of range");
     }
 }
 
 #[test]
 #[ignore]
-fn test_measure_lufs_real_file() {
+fn test_measure_loudness_real_file() {
     let Some(input) = real_mkv_path() else {
         return;
     };
     let input = input.as_path();
-    let result = kob_ffmpeg::audio::measure_lufs(input, None).unwrap();
+    let result = kob_ffmpeg::audio::measure_loudness(input, None)
+        .unwrap()
+        .integrated_lufs;
     eprintln!("LUFS: {result:?}");
     assert!(result.is_some(), "real file must produce LUFS value");
     let val = result.unwrap();
@@ -228,26 +230,59 @@ fn test_measure_lufs_real_file() {
 }
 
 #[test]
-fn test_measure_lufs_corrupt_audio_packets() {
+fn test_measure_loudness_corrupt_audio_packets() {
     // AVI with a few corrupted audio packets — should still succeed
-    let result = kob_ffmpeg::audio::measure_lufs(&fixtures::corrupt_audio_avi(), None);
+    let result = kob_ffmpeg::audio::measure_loudness(&fixtures::corrupt_audio_avi(), None);
     assert!(
         result.is_ok(),
-        "measure_lufs should tolerate corrupt packets: {:?}",
+        "measure_loudness should tolerate corrupt packets: {:?}",
         result.err()
     );
 }
 
 #[test]
-fn test_measure_lufs_channel_layout_change() {
+fn test_measure_loudness_channel_layout_change() {
     // AC3 file where first frame is stereo but rest is 5.1.
     // The filter graph must handle the layout change gracefully.
-    let result = kob_ffmpeg::audio::measure_lufs(&fixtures::ac3_channel_change_mkv(), None);
+    let result = kob_ffmpeg::audio::measure_loudness(&fixtures::ac3_channel_change_mkv(), None);
     assert!(
         result.is_ok(),
-        "measure_lufs should handle AC3 channel layout changes: {:?}",
+        "measure_loudness should handle AC3 channel layout changes: {:?}",
         result.err()
     );
+}
+
+const DOWNMIX_PEAK_CASES: &[(&str, f64, f64)] = &[
+    ("mono", 0.5, -6.021),
+    ("stereo", 0.5, -6.021),
+    ("5.1(side)", 0.5, 1.635),
+    ("5.1", 0.5, 1.635),
+    ("7.1", 0.25, -2.154),
+    ("quad", 0.5, -1.375),
+];
+
+#[test]
+fn test_measure_loudness_reports_unnormalized_stereo_downmix_peak() {
+    for &(layout, amplitude, expected_db) in DOWNMIX_PEAK_CASES {
+        let loudness =
+            kob_ffmpeg::audio::measure_loudness(&fixtures::in_phase_sine(layout, amplitude), None)
+                .unwrap();
+        let peak = loudness
+            .downmix_peak_db
+            .unwrap_or_else(|| panic!("{layout}: no downmix peak"));
+        assert!(
+            (peak - expected_db).abs() < 0.05,
+            "{layout}: downmix peak {peak:.3} dB, expected {expected_db:.3} dB"
+        );
+        assert!(loudness.integrated_lufs.is_some(), "{layout}: no LUFS");
+    }
+}
+
+#[test]
+fn test_measure_loudness_peak_survives_channel_layout_change() {
+    let loudness =
+        kob_ffmpeg::audio::measure_loudness(&fixtures::ac3_channel_change_mkv(), None).unwrap();
+    assert!(loudness.downmix_peak_db.is_some());
 }
 
 #[test]

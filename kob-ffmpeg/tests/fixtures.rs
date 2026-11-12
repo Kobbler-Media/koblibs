@@ -581,3 +581,44 @@ pub fn hdr10_video() -> PathBuf {
         })
         .clone()
 }
+
+/// Three seconds of the same in-phase 1 kHz sine at `amplitude` on every channel of
+/// `layout` (an ffmpeg layout name), as 16-bit PCM WAV.
+pub fn in_phase_sine(layout: &str, amplitude: f64) -> PathBuf {
+    let channels = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-show_entries",
+            "stream=channels",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(format!("aevalsrc=0:s=48000:d=0.1:c={layout}"))
+        .output()
+        .expect("ffprobe must be available");
+    let channels: usize = String::from_utf8_lossy(&channels.stdout)
+        .trim()
+        .parse()
+        .expect("channel count");
+    let pan = (0..channels)
+        .map(|c| format!("c{c}=c0"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let path =
+        fixture_dir().join(format!("sine_{layout}_{amplitude}.wav").replace(['(', ')'], "_"));
+    run_ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("aevalsrc={amplitude}*sin(2*PI*1000*t):s=48000:d=3,pan={layout}|{pan}"),
+            "-c:a",
+            "pcm_s16le",
+        ],
+        &path,
+    );
+    path
+}

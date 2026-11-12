@@ -11,7 +11,8 @@
 //! - `embed_src`: wide JPEGs at moderate fps, returned in memory for SigLIP embedding
 //! - `chromaprint`: full-file 8 kHz mono fingerprint via libchromaprint
 //! - `silence`: silencedetect intervals
-//! - `loudness`: integrated LUFS via ebur128
+//! - `loudness`: integrated LUFS via ebur128, plus the true peak of the stereo
+//!   fold-down (`downmix_peak_db`) from a second graph over the same frames
 //! - `audio_peaks`: 1 kHz mono PCM bucketed into (min_i8, max_i8) pairs
 //! - `corruption`: time ranges where the SW decoder hit error-concealment / missing
 //!   references / invalid bitstream — used to drive per-segment transcode-on-demand
@@ -32,8 +33,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::audio::AudioGraphState;
+use crate::audio::{AudioGraphState, Loudness};
 use crate::codec::decoder::DecodeResult;
+use crate::downmix_peak::DownmixPeakMeter;
 pub use crate::filter::detect::BlackFramesParams;
 use crate::filter::detect::{
     BlackInterval, SilenceInterval, parse_black_metadata, parse_silence_metadata,
@@ -340,6 +342,7 @@ pub struct SinglePassResult {
     pub chromaprint: Option<ChromaprintResult>,
     pub silence: Option<Vec<SilenceInterval>>,
     pub loudness: Option<f64>,
+    pub downmix_peak_db: Option<f64>,
     pub audio_peaks: Option<AudioPeaksResult>,
     pub black_frames: Option<Vec<BlackInterval>>,
     pub corruption: Option<Vec<CorruptRange>>,
@@ -756,6 +759,7 @@ struct AudioMetadataSink {
     intervals: Vec<SilenceInterval>,
     silence_current_start: Option<f64>,
     last_lufs: Option<f64>,
+    downmix: Option<DownmixPeakMeter>,
 }
 
 impl AudioMetadataSink {
@@ -779,6 +783,7 @@ impl AudioMetadataSink {
             intervals: Vec::new(),
             silence_current_start: None,
             last_lufs: None,
+            downmix: loudness.then(DownmixPeakMeter::new),
         }
     }
 
@@ -790,12 +795,15 @@ impl AudioMetadataSink {
             time_base,
             &self.filter_str,
         )?;
+        if let Some(downmix) = self.downmix.as_mut() {
+            downmix.feed(frame, time_base)?;
+        }
         self.graph.as_mut().unwrap().push_frame_keep_ref(frame)?;
         self.drain()?;
         Ok(())
     }
 
-    fn finalize(mut self) -> Result<(Option<Vec<SilenceInterval>>, Option<f64>)> {
+    fn finalize(mut self) -> Result<(Option<Vec<SilenceInterval>>, Loudness)> {
         if self.graph.is_some() {
             self.graph.as_mut().unwrap().push_eof()?;
             self.drain()?;
@@ -805,10 +813,12 @@ impl AudioMetadataSink {
         } else {
             None
         };
-        let loudness = if self.want_loudness {
-            self.last_lufs
-        } else {
-            None
+        let loudness = Loudness {
+            integrated_lufs: self.last_lufs.filter(|_| self.want_loudness),
+            downmix_peak_db: match self.downmix.take() {
+                Some(meter) => meter.finish()?,
+                None => None,
+            },
         };
         Ok((silence, loudness))
     }
@@ -1495,12 +1505,13 @@ pub fn run_single_pass_from_ctx_with_sinks(
                     .or_default() += elapsed;
             }
             match outcome {
-                Ok((silence, lufs)) => {
+                Ok((silence, loudness)) => {
                     if let Some(intervals) = silence {
                         result.silence = Some(intervals);
                     }
                     if want_loudness {
-                        result.loudness = lufs;
+                        result.loudness = loudness.integrated_lufs;
+                        result.downmix_peak_db = loudness.downmix_peak_db;
                     }
                 }
                 Err(e) => {

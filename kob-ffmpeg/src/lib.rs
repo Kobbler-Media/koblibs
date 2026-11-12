@@ -46,6 +46,7 @@ pub mod audio;
 pub mod chromaprint;
 pub mod detect;
 pub mod dovi;
+pub(crate) mod downmix_peak;
 pub(crate) mod hevc_config;
 #[cfg(feature = "hybrid-io")]
 pub mod hybrid_io;

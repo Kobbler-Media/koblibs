@@ -712,7 +712,7 @@ pub fn split_audio_segment(
 /// actual frame, `swr_convert` reads NULL channel pointers → segfault.
 ///
 /// This struct snapshots frame properties and detects when they change, triggering
-/// a rebuild. Used by `extract_pcm_range`, `convert_to_wav`, `measure_lufs`, `chromaprint`,
+/// a rebuild. Used by `extract_pcm_range`, `convert_to_wav`, `measure_loudness`, `chromaprint`,
 /// and `detect_silence`.
 pub(crate) struct AudioGraphState {
     pub(crate) sample_rate: i32,
@@ -839,15 +839,22 @@ impl AudioGraphState {
     }
 }
 
-/// Measure integrated loudness (LUFS) of an audio file.
-///
-/// Replaces: `ffmpeg -i file -vn -sn -af ebur128=peak=none -f null -`
-///
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Loudness {
+    pub integrated_lufs: Option<f64>,
+    /// True peak (dBTP) of the unnormalized stereo fold-down players render the
+    /// track as, which for surround runs several dB hotter than any one channel.
+    pub downmix_peak_db: Option<f64>,
+}
+
 /// Like the ffmpeg CLI, this detects mid-stream audio property changes (channel
 /// layout, sample rate, sample format) and reconfigures the filter graph. Some
 /// codecs (notably AC3) can have initial frames with a different channel layout
 /// than the stream's declared layout.
-pub fn measure_lufs(path: &Path, run: Option<&crate::progress::RunContext>) -> Result<Option<f64>> {
+pub fn measure_loudness(
+    path: &Path,
+    run: Option<&crate::progress::RunContext>,
+) -> Result<Loudness> {
     use crate::filter::graph::{AudioFilterParams, FilterGraph};
 
     let mut ctx = InputContext::open_path(path)?;
@@ -871,6 +878,7 @@ pub fn measure_lufs(path: &Path, run: Option<&crate::progress::RunContext>) -> R
     let mut decode_errors: u64 = 0;
     let mut graph: Option<FilterGraph> = None;
     let mut graph_state: Option<AudioGraphState> = None;
+    let mut downmix = crate::downmix_peak::DownmixPeakMeter::new();
 
     let ensure_graph = |graph: &mut Option<FilterGraph>,
                         graph_state: &mut Option<AudioGraphState>,
@@ -937,6 +945,7 @@ pub fn measure_lufs(path: &Path, run: Option<&crate::progress::RunContext>) -> R
                         &mut last_lufs,
                         time_base,
                     )?;
+                    downmix.feed(&mut frame, time_base)?;
                     graph.as_mut().unwrap().push_frame(&mut frame)?;
                     while graph.as_mut().unwrap().pull_frame(&mut out_frame)? {
                         if let Some(lufs) = unsafe { extract_lufs(&out_frame) } {
@@ -975,6 +984,7 @@ pub fn measure_lufs(path: &Path, run: Option<&crate::progress::RunContext>) -> R
                     &mut last_lufs,
                     time_base,
                 )?;
+                downmix.feed(&mut frame, time_base)?;
                 graph.as_mut().unwrap().push_frame(&mut frame)?;
                 while graph.as_mut().unwrap().pull_frame(&mut out_frame)? {
                     if let Some(lufs) = unsafe { extract_lufs(&out_frame) } {
@@ -1001,5 +1011,8 @@ pub fn measure_lufs(path: &Path, run: Option<&crate::progress::RunContext>) -> R
         }
     }
 
-    Ok(last_lufs)
+    Ok(Loudness {
+        integrated_lufs: last_lufs,
+        downmix_peak_db: downmix.finish()?,
+    })
 }
