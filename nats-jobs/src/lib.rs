@@ -47,6 +47,7 @@ pub mod client;
 mod consumer;
 pub mod db;
 pub mod publisher;
+pub mod running;
 pub mod scheduler;
 pub mod test_fixtures;
 pub mod types;

@@ -704,6 +704,8 @@ async fn process_message(
         }
     };
 
+    let _running = crate::running::track_running(&job.job_type, job.id);
+
     // Get delivery count from NATS message info (this is the actual retry count)
     // num_delivered starts at 1 for first delivery, so subtract 1 to get retry count
     let delivery_count = msg.info().map(|info| info.delivered).unwrap_or(1);
