@@ -138,6 +138,9 @@ pub struct StreamOption {
     pub binge_group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playback: Option<StreamPlayback>,
+    /// A viewer marked this copy as bad. It reads as `playback: failed` until withdrawn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reported_bad: bool,
     /// `ready`: we resolved it on this account recently. `likely`: a third party reports it
     /// cached. `uncached`: it would have to download first. `cached` is `availability == ready`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
