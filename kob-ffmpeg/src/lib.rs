@@ -62,6 +62,7 @@ pub mod single_pass;
 pub mod streaming;
 pub mod subtitles;
 pub mod thumbnails;
+pub mod track_loudness;
 pub mod transcode;
 
 /// Re-export the sys crate for advanced usage requiring direct FFI access.

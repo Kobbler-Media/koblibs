@@ -307,9 +307,9 @@ impl InputContext {
     /// Sets `AVDISCARD_ALL` on every other stream so the demuxer skips
     /// their packets entirely. Critical for NFS performance when only
     /// one stream type (e.g. audio) is needed from a large container.
-    pub fn discard_all_except(&mut self, keep_index: u32) {
+    pub fn discard_all_except(&mut self, keep: &[u32]) {
         for i in 0..self.nb_streams() {
-            if i != keep_index
+            if !keep.contains(&i)
                 && let Some(mut stream) = self.stream_mut(i)
             {
                 stream.set_discard(ffi::AVDISCARD_ALL);

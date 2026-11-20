@@ -97,7 +97,7 @@ pub fn detect_silence(
         crate::error::FfmpegError::new(ffi::AVERROR_STREAM_NOT_FOUND, "no audio stream")
     })?;
 
-    ctx.discard_all_except(audio_idx);
+    ctx.discard_all_except(&[audio_idx]);
 
     let stream = ctx.stream(audio_idx).unwrap();
     let time_base = stream.time_base();
@@ -170,7 +170,7 @@ pub fn detect_silence_range(
         crate::error::FfmpegError::new(ffi::AVERROR_STREAM_NOT_FOUND, "no audio stream")
     })?;
 
-    ctx.discard_all_except(audio_idx);
+    ctx.discard_all_except(&[audio_idx]);
 
     // Seek to start
     let seek_ts = (start_secs * ffi::AV_TIME_BASE as f64) as i64;

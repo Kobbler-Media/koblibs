@@ -22,6 +22,7 @@ static ASS_MKV: OnceLock<PathBuf> = OnceLock::new();
 static HEVC_INBAND_PARAMS: OnceLock<PathBuf> = OnceLock::new();
 static UNEVEN_GOP_VIDEO: OnceLock<PathBuf> = OnceLock::new();
 static HDR10_VIDEO: OnceLock<PathBuf> = OnceLock::new();
+static DUBBED_MKV: OnceLock<PathBuf> = OnceLock::new();
 
 fn fixture_dir() -> &'static Path {
     FIXTURE_DIR
@@ -621,4 +622,55 @@ pub fn in_phase_sine(layout: &str, amplitude: f64) -> PathBuf {
         &path,
     );
     path
+}
+
+/// MKV: 1 video + a quiet default-flagged dub (cze, 0.05 sine) ahead of the original
+/// (eng, 0.5 sine, 20 dB louder), 4 seconds — a dub release's layout.
+pub fn dubbed_mkv() -> PathBuf {
+    DUBBED_MKV
+        .get_or_init(|| {
+            let path = fixture_dir().join("dubbed.mkv");
+            run_ffmpeg(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=duration=4:size=160x120:rate=10",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "aevalsrc=0.05*sin(2*PI*440*t):s=48000:d=4",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "aevalsrc=0.5*sin(2*PI*440*t):s=48000:d=4",
+                    "-map",
+                    "0:v",
+                    "-map",
+                    "1:a",
+                    "-map",
+                    "2:a",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "40",
+                    "-c:a",
+                    "flac",
+                    "-metadata:s:a:0",
+                    "language=cze",
+                    "-metadata:s:a:1",
+                    "language=eng",
+                    "-disposition:a:0",
+                    "default",
+                    "-disposition:a:1",
+                    "0",
+                    "-shortest",
+                ],
+                &path,
+            );
+            path
+        })
+        .clone()
 }

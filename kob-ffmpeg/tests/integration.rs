@@ -204,7 +204,7 @@ fn test_measure_loudness() {
     let result = kob_ffmpeg::audio::measure_loudness(&fixtures::basic_video(), None);
     assert!(result.is_ok(), "should not error: {:?}", result.err());
     // Short synthetic files may not produce LUFS metadata
-    if let Some(val) = result.unwrap().integrated_lufs {
+    if let Some(val) = result.unwrap()[0].loudness.integrated_lufs {
         assert!((-100.0..=0.0).contains(&val), "LUFS {val} out of range");
     }
 }
@@ -216,8 +216,8 @@ fn test_measure_loudness_real_file() {
         return;
     };
     let input = input.as_path();
-    let result = kob_ffmpeg::audio::measure_loudness(input, None)
-        .unwrap()
+    let result = kob_ffmpeg::audio::measure_loudness(input, None).unwrap()[0]
+        .loudness
         .integrated_lufs;
     eprintln!("LUFS: {result:?}");
     assert!(result.is_some(), "real file must produce LUFS value");
@@ -266,7 +266,8 @@ fn test_measure_loudness_reports_unnormalized_stereo_downmix_peak() {
     for &(layout, amplitude, expected_db) in DOWNMIX_PEAK_CASES {
         let loudness =
             kob_ffmpeg::audio::measure_loudness(&fixtures::in_phase_sine(layout, amplitude), None)
-                .unwrap();
+                .unwrap()[0]
+                .loudness;
         let peak = loudness
             .downmix_peak_db
             .unwrap_or_else(|| panic!("{layout}: no downmix peak"));
@@ -282,7 +283,7 @@ fn test_measure_loudness_reports_unnormalized_stereo_downmix_peak() {
 fn test_measure_loudness_peak_survives_channel_layout_change() {
     let loudness =
         kob_ffmpeg::audio::measure_loudness(&fixtures::ac3_channel_change_mkv(), None).unwrap();
-    assert!(loudness.downmix_peak_db.is_some());
+    assert!(loudness[0].loudness.downmix_peak_db.is_some());
 }
 
 #[test]

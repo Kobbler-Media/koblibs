@@ -41,7 +41,7 @@ pub fn extract_fingerprint(
     // subtitle packets but does NOT reduce wire bytes — lavf still walks the
     // byte stream to find audio packet boundaries. The savings are CPU only.
     // Measured 2026-04-13: byte-identical CIFS read with vs without discard.
-    ctx.discard_all_except(audio_idx);
+    ctx.discard_all_except(&[audio_idx]);
 
     if let Some(offset) = offset_secs {
         let seek_ts = (offset * ffi::AV_TIME_BASE as f64) as i64;

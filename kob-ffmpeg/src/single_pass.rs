@@ -11,8 +11,8 @@
 //! - `embed_src`: wide JPEGs at moderate fps, returned in memory for SigLIP embedding
 //! - `chromaprint`: full-file 8 kHz mono fingerprint via libchromaprint
 //! - `silence`: silencedetect intervals
-//! - `loudness`: integrated LUFS via ebur128, plus the true peak of the stereo
-//!   fold-down (`downmix_peak_db`) from a second graph over the same frames
+//! - `loudness`: integrated LUFS via ebur128 plus the true peak of the stereo
+//!   fold-down, for every audio stream — not just the one the other audio branches use
 //! - `audio_peaks`: 1 kHz mono PCM bucketed into (min_i8, max_i8) pairs
 //! - `corruption`: time ranges where the SW decoder hit error-concealment / missing
 //!   references / invalid bitstream — used to drive per-segment transcode-on-demand
@@ -33,9 +33,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::audio::{AudioGraphState, Loudness};
+use crate::audio::AudioGraphState;
 use crate::codec::decoder::DecodeResult;
-use crate::downmix_peak::DownmixPeakMeter;
 pub use crate::filter::detect::BlackFramesParams;
 use crate::filter::detect::{
     BlackInterval, SilenceInterval, parse_black_metadata, parse_silence_metadata,
@@ -50,6 +49,9 @@ use crate::progress::RunContext;
 use crate::scale::Scaler;
 use crate::sdr::SdrConverter;
 use crate::thumbnails::JpegFrame;
+use crate::track_loudness::{
+    DecodingLoudnessMeter, LoudnessMeter, TrackLoudness, audio_stream_indices,
+};
 use crate::types::{ChannelLayout, SampleFormat};
 use crate::{FfmpegError, Result, ffi};
 
@@ -329,10 +331,7 @@ impl SinglePassRequest {
 /// `branch_durations` records cumulative wall time per branch — sum of every
 /// `feed()` call across all frames plus the final `finalize()`. Useful for
 /// "where did the 270s go" profiling. Branches that were never requested
-/// (no slot allocated) won't appear in the map. The combined silence+LUFS
-/// `audio_meta` sink is attributed to whichever branches were requested
-/// (slight over-counting if both were on, but matches per-branch error
-/// fan-out semantics).
+/// (no slot allocated) won't appear in the map.
 #[derive(Default)]
 pub struct SinglePassResult {
     pub input_duration_secs: f64,
@@ -341,8 +340,8 @@ pub struct SinglePassResult {
     pub embed_src: Option<EmbedSrcResult>,
     pub chromaprint: Option<ChromaprintResult>,
     pub silence: Option<Vec<SilenceInterval>>,
-    pub loudness: Option<f64>,
-    pub downmix_peak_db: Option<f64>,
+    /// In stream order; empty unless loudness was requested.
+    pub track_loudness: Vec<TrackLoudness>,
     pub audio_peaks: Option<AudioPeaksResult>,
     pub black_frames: Option<Vec<BlackInterval>>,
     pub corruption: Option<Vec<CorruptRange>>,
@@ -741,49 +740,25 @@ impl ChromaprintSink {
     }
 }
 
-/// Combined silence + LUFS sink. Both filters are passthrough metadata-emitters
-/// in lavfi, so chaining them as `silencedetect=…,ebur128=…` lets us run one
-/// filter graph (one push, one drain per audio frame) instead of two parallel
-/// graphs. Each lavfi.* metadata key is parsed independently from the same
-/// output frames.
-///
-/// Result is kept split so the caller still gets `silence: Vec<SilenceInterval>`
-/// and `loudness: Option<f64>` separately — the combination is purely an
-/// implementation detail of how we run the graph.
-struct AudioMetadataSink {
+struct SilenceSink {
     filter_str: String,
     graph: Option<FilterGraph>,
     state: Option<AudioGraphState>,
-    want_silence: bool,
-    want_loudness: bool,
     intervals: Vec<SilenceInterval>,
-    silence_current_start: Option<f64>,
-    last_lufs: Option<f64>,
-    downmix: Option<DownmixPeakMeter>,
+    current_start: Option<f64>,
 }
 
-impl AudioMetadataSink {
-    fn new(silence: Option<&SilenceParams>, loudness: bool) -> Self {
-        let mut parts: Vec<String> = Vec::with_capacity(2);
-        if let Some(p) = silence {
-            parts.push(format!(
-                "silencedetect=noise={}dB:d={}",
-                p.noise_db, p.min_duration_secs
-            ));
-        }
-        if loudness {
-            parts.push("ebur128=peak=none:metadata=1".to_string());
-        }
+impl SilenceSink {
+    fn new(params: &SilenceParams) -> Self {
         Self {
-            filter_str: parts.join(","),
+            filter_str: format!(
+                "silencedetect=noise={}dB:d={}",
+                params.noise_db, params.min_duration_secs
+            ),
             graph: None,
             state: None,
-            want_silence: silence.is_some(),
-            want_loudness: loudness,
             intervals: Vec::new(),
-            silence_current_start: None,
-            last_lufs: None,
-            downmix: loudness.then(DownmixPeakMeter::new),
+            current_start: None,
         }
     }
 
@@ -795,54 +770,25 @@ impl AudioMetadataSink {
             time_base,
             &self.filter_str,
         )?;
-        if let Some(downmix) = self.downmix.as_mut() {
-            downmix.feed(frame, time_base)?;
-        }
         self.graph.as_mut().unwrap().push_frame_keep_ref(frame)?;
-        self.drain()?;
-        Ok(())
+        self.drain()
     }
 
-    fn finalize(mut self) -> Result<(Option<Vec<SilenceInterval>>, Loudness)> {
-        if self.graph.is_some() {
-            self.graph.as_mut().unwrap().push_eof()?;
+    fn finalize(mut self) -> Result<Vec<SilenceInterval>> {
+        if let Some(g) = self.graph.as_mut() {
+            g.push_eof()?;
             self.drain()?;
         }
-        let silence = if self.want_silence {
-            Some(self.intervals)
-        } else {
-            None
-        };
-        let loudness = Loudness {
-            integrated_lufs: self.last_lufs.filter(|_| self.want_loudness),
-            downmix_peak_db: match self.downmix.take() {
-                Some(meter) => meter.finish()?,
-                None => None,
-            },
-        };
-        Ok((silence, loudness))
+        Ok(self.intervals)
     }
 
-    /// Pull all available output frames out of the filter graph and parse the
-    /// per-filter metadata into `self`. Splits graph borrow from `&mut self`
-    /// borrow by destructuring up front.
     fn drain(&mut self) -> Result<()> {
         let Some(graph) = self.graph.as_mut() else {
             return Ok(());
         };
-        let want_silence = self.want_silence;
-        let want_loudness = self.want_loudness;
-        let intervals = &mut self.intervals;
-        let silence_current_start = &mut self.silence_current_start;
-        let last_lufs = &mut self.last_lufs;
         let mut out = Frame::new()?;
         while graph.pull_frame(&mut out)? {
-            if want_silence {
-                parse_silence_metadata(&out, intervals, silence_current_start);
-            }
-            if want_loudness && let Some(lufs) = unsafe { extract_lufs(&out) } {
-                *last_lufs = Some(lufs);
-            }
+            parse_silence_metadata(&out, &mut self.intervals, &mut self.current_start);
             out.unref();
         }
         Ok(())
@@ -1158,18 +1104,30 @@ pub fn run_single_pass_from_ctx_with_sinks(
         ));
     }
 
+    let other_loudness_streams: Vec<u32> = if req.loudness {
+        audio_stream_indices(&ctx)
+            .into_iter()
+            .filter(|&i| Some(i) != audio_idx)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Optionally discard streams we don't care about. We only do this when one of
     // (video, audio) is fully unused — leaving both enabled when both are needed
     // matches the existing extraction code.
     if want_video && !want_audio {
         if let Some(idx) = video_idx {
-            ctx.discard_all_except(idx);
+            ctx.discard_all_except(&[idx]);
         }
     } else if want_audio
         && !want_video
         && let Some(idx) = audio_idx
     {
-        ctx.discard_all_except(idx);
+        let keep: Vec<u32> = std::iter::once(idx)
+            .chain(other_loudness_streams.iter().copied())
+            .collect();
+        ctx.discard_all_except(&keep);
     }
 
     let mut input_duration_secs = 0.0_f64;
@@ -1240,11 +1198,10 @@ pub fn run_single_pass_from_ctx_with_sinks(
     let mut audio_tb = ffi::AVRational { num: 1, den: 1 };
     let mut audio_tb_f64 = 0.0_f64;
     let mut chromaprint_sink: Option<std::result::Result<ChromaprintSink, FfmpegError>> = None;
-    // Combined silence + LUFS sink — one chained `silencedetect,ebur128` filter
-    // graph, parsed metadata split into separate result fields.
-    let mut audio_meta_sink: Option<std::result::Result<AudioMetadataSink, FfmpegError>> = None;
-    let want_silence = req.silence.is_some();
-    let want_loudness = req.loudness;
+    let mut silence_sink: Option<std::result::Result<SilenceSink, FfmpegError>> = None;
+    let mut loudness_meter: Option<std::result::Result<LoudnessMeter, FfmpegError>> = None;
+    let mut other_loudness: Vec<DecodingLoudnessMeter> = Vec::new();
+    let mut loudness_errors: Vec<FfmpegError> = Vec::new();
     let mut audio_peaks_sink: Option<std::result::Result<AudioPeaksSink, FfmpegError>> = None;
     if let Some(idx) = audio_idx
         && want_audio
@@ -1257,11 +1214,17 @@ pub fn run_single_pass_from_ctx_with_sinks(
         if let Some(p) = &req.chromaprint {
             chromaprint_sink = Some(ChromaprintSink::new(p));
         }
-        if want_silence || want_loudness {
-            audio_meta_sink = Some(Ok(AudioMetadataSink::new(
-                req.silence.as_ref(),
-                want_loudness,
-            )));
+        if let Some(p) = &req.silence {
+            silence_sink = Some(Ok(SilenceSink::new(p)));
+        }
+        if req.loudness {
+            loudness_meter = Some(LoudnessMeter::new(audio_tb));
+            for &i in &other_loudness_streams {
+                match DecodingLoudnessMeter::new(&ctx, i) {
+                    Ok(meter) => other_loudness.push(meter),
+                    Err(e) => loudness_errors.push(e),
+                }
+            }
         }
         if let Some(p) = &req.audio_peaks {
             audio_peaks_sink = Some(Ok(AudioPeaksSink::new(p.sample_rate)));
@@ -1353,17 +1316,27 @@ pub fn run_single_pass_from_ctx_with_sinks(
                             frame_time,
                             audio_tb,
                             &mut chromaprint_sink,
-                            &mut audio_meta_sink,
+                            &mut silence_sink,
+                            &mut loudness_meter,
                             &mut audio_peaks_sink,
                             &mut branch_durations,
-                            want_silence,
-                            want_loudness,
                         );
                     }
                     DecodeResult::NeedsInput => break,
                     DecodeResult::Eof => break,
                 }
             }
+        } else if let Some(pos) = other_loudness
+            .iter()
+            .position(|m| m.stream_index() == stream_idx)
+        {
+            let started = Instant::now();
+            if let Err(e) = other_loudness[pos].feed(&packet) {
+                tracing::warn!(stream = stream_idx, error = %e, "loudness meter failed");
+                other_loudness.swap_remove(pos);
+                loudness_errors.push(e);
+            }
+            *branch_durations.entry(BranchId::Loudness).or_default() += started.elapsed();
         }
     }
 
@@ -1415,11 +1388,10 @@ pub fn run_single_pass_from_ctx_with_sinks(
                         frame_time,
                         audio_tb,
                         &mut chromaprint_sink,
-                        &mut audio_meta_sink,
+                        &mut silence_sink,
+                        &mut loudness_meter,
                         &mut audio_peaks_sink,
                         &mut branch_durations,
-                        want_silence,
-                        want_loudness,
                     );
                 }
                 _ => break,
@@ -1472,57 +1444,39 @@ pub fn run_single_pass_from_ctx_with_sinks(
             Ok(())
         },
     );
-    // Combined silence + LUFS finalize. On error, fan the failure out under
-    // each requested branch so per-branch error reporting stays unchanged.
-    let push_audio_meta_err = |result: &mut SinglePassResult, e: FfmpegError| {
-        let dup = || FfmpegError::new(e.code(), format!("{e}"));
-        match (want_silence, want_loudness) {
-            (true, true) => {
-                result.per_branch_errors.push((BranchId::Silence, dup()));
-                result.per_branch_errors.push((BranchId::Loudness, e));
-            }
-            (true, false) => result.per_branch_errors.push((BranchId::Silence, e)),
-            (false, true) => result.per_branch_errors.push((BranchId::Loudness, e)),
-            (false, false) => {}
-        }
-    };
-    match audio_meta_sink {
-        Some(Ok(sink)) => {
-            let started = Instant::now();
-            let outcome = sink.finalize();
-            let elapsed = started.elapsed();
-            // Same fan-out as feed_audio_sinks for the combined sink.
-            if want_silence {
-                *result
-                    .branch_durations
-                    .entry(BranchId::Silence)
-                    .or_default() += elapsed;
-            }
-            if want_loudness {
-                *result
-                    .branch_durations
-                    .entry(BranchId::Loudness)
-                    .or_default() += elapsed;
-            }
-            match outcome {
-                Ok((silence, loudness)) => {
-                    if let Some(intervals) = silence {
-                        result.silence = Some(intervals);
-                    }
-                    if want_loudness {
-                        result.loudness = loudness.integrated_lufs;
-                        result.downmix_peak_db = loudness.downmix_peak_db;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "audio metadata finalize failed");
-                    push_audio_meta_err(&mut result, e);
-                }
-            }
-        }
-        Some(Err(e)) => push_audio_meta_err(&mut result, e),
-        None => {}
+    take_branch(BranchId::Silence, silence_sink, &mut result, |sink, r| {
+        r.silence = Some(sink.finalize()?);
+        Ok(())
+    });
+    if let Some(stream_index) = audio_idx {
+        take_branch(
+            BranchId::Loudness,
+            loudness_meter,
+            &mut result,
+            |meter, r| {
+                r.track_loudness.push(TrackLoudness {
+                    stream_index,
+                    loudness: meter.finish()?,
+                });
+                Ok(())
+            },
+        );
     }
+    for meter in other_loudness {
+        let started = Instant::now();
+        match meter.finish() {
+            Ok(track) => result.track_loudness.push(track),
+            Err(e) => loudness_errors.push(e),
+        }
+        *result
+            .branch_durations
+            .entry(BranchId::Loudness)
+            .or_default() += started.elapsed();
+    }
+    result
+        .per_branch_errors
+        .extend(loudness_errors.into_iter().map(|e| (BranchId::Loudness, e)));
+    result.track_loudness.sort_by_key(|t| t.stream_index);
     take_branch(
         BranchId::AudioPeaks,
         audio_peaks_sink,
@@ -1682,11 +1636,10 @@ fn feed_audio_sinks(
     frame_time: f64,
     time_base: ffi::AVRational,
     chromaprint: &mut Option<std::result::Result<ChromaprintSink, FfmpegError>>,
-    audio_meta: &mut Option<std::result::Result<AudioMetadataSink, FfmpegError>>,
+    silence: &mut Option<std::result::Result<SilenceSink, FfmpegError>>,
+    loudness: &mut Option<std::result::Result<LoudnessMeter, FfmpegError>>,
     audio_peaks: &mut Option<std::result::Result<AudioPeaksSink, FfmpegError>>,
     timings: &mut HashMap<BranchId, Duration>,
-    want_silence: bool,
-    want_loudness: bool,
 ) {
     try_feed(
         chromaprint,
@@ -1695,28 +1648,12 @@ fn feed_audio_sinks(
         timings,
         |s| s.feed(frame, frame_time),
     );
-    // audio_meta is a combined silence+LUFS sink; attribute its feed time to
-    // both branches if both were requested. Mirrors the per-branch error
-    // fan-out done in run_single_pass for the same sink. Inlined rather than
-    // going through `try_feed` because we need to fan the elapsed wall-time
-    // across two BranchIds, which the generic helper doesn't model.
-    if let Some(slot_ref) = audio_meta
-        && let Ok(sink) = slot_ref
-    {
-        let started = Instant::now();
-        let outcome = sink.feed(frame, time_base);
-        let elapsed = started.elapsed();
-        if want_silence {
-            *timings.entry(BranchId::Silence).or_default() += elapsed;
-        }
-        if want_loudness {
-            *timings.entry(BranchId::Loudness).or_default() += elapsed;
-        }
-        if let Err(e) = outcome {
-            tracing::warn!(branch = "audio_meta", error = %e, "branch failed at frame time {frame_time:.1}s");
-            *slot_ref = Err(e);
-        }
-    }
+    try_feed(silence, BranchId::Silence, frame_time, timings, |s| {
+        s.feed(frame, time_base)
+    });
+    try_feed(loudness, BranchId::Loudness, frame_time, timings, |s| {
+        s.feed(frame)
+    });
     try_feed(
         audio_peaks,
         BranchId::AudioPeaks,
@@ -1762,21 +1699,4 @@ fn copy_gray8_frame(frame: &Frame) -> Vec<u8> {
         }
     }
     data
-}
-
-unsafe fn extract_lufs(frame: &Frame) -> Option<f64> {
-    unsafe {
-        let metadata = (*frame.as_ptr()).metadata;
-        if metadata.is_null() {
-            return None;
-        }
-        let entry = ffi::av_dict_get(metadata, c"lavfi.r128.I".as_ptr(), std::ptr::null(), 0);
-        if entry.is_null() || (*entry).value.is_null() {
-            return None;
-        }
-        std::ffi::CStr::from_ptr((*entry).value)
-            .to_string_lossy()
-            .parse::<f64>()
-            .ok()
-    }
 }

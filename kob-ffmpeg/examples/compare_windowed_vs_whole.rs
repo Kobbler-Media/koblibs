@@ -116,7 +116,7 @@ fn run(path: PathBuf, label: &str, windows_on: bool, duration: f64) {
         "  black_frames:   {} intervals",
         result.black_frames.as_ref().map(|v| v.len()).unwrap_or(0)
     );
-    println!("  loudness:       {:?}", result.loudness);
+    println!("  loudness:       {:?}", result.track_loudness);
     println!(
         "  audio_peaks:    {} bytes",
         result

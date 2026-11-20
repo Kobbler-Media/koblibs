@@ -9,6 +9,7 @@ use crate::format::input::{InputContext, MediaType};
 use crate::format::output::OutputContext;
 use crate::frame::Frame;
 use crate::packet::Packet;
+use crate::track_loudness::{DecodingLoudnessMeter, TrackLoudness, audio_stream_indices};
 use crate::{Result, ffi};
 
 /// Encodes audio frames and writes the packets to one output stream.
@@ -156,27 +157,6 @@ pub fn probe_audio_sample_rate(
     })
 }
 
-/// Extract integrated LUFS from ebur128 filter output frame metadata.
-///
-/// # Safety
-/// Caller must ensure `frame` contains a valid AVFrame pointer with valid metadata.
-unsafe fn extract_lufs(frame: &Frame) -> Option<f64> {
-    unsafe {
-        let metadata = (*frame.as_ptr()).metadata;
-        if metadata.is_null() {
-            return None;
-        }
-        let entry = ffi::av_dict_get(metadata, c"lavfi.r128.I".as_ptr(), std::ptr::null(), 0);
-        if entry.is_null() || (*entry).value.is_null() {
-            return None;
-        }
-        std::ffi::CStr::from_ptr((*entry).value)
-            .to_string_lossy()
-            .parse::<f64>()
-            .ok()
-    }
-}
-
 /// Extract raw PCM audio data (mono, specified sample rate, s16le) over a time range.
 ///
 /// Replaces: `ffmpeg -ss <offset> -i input -t <duration> -vn -sn -ac 1 -ar <rate> -f s16le -acodec pcm_s16le pipe:1`
@@ -224,7 +204,7 @@ pub(crate) fn extract_pcm_from(
     // subtitle packets but does NOT reduce wire bytes — lavf still walks the
     // byte stream to find audio packet boundaries. The savings are CPU only.
     // Measured 2026-04-13: byte-identical CIFS read with vs without discard.
-    ctx.discard_all_except(audio_idx);
+    ctx.discard_all_except(&[audio_idx]);
 
     if offset_secs > 0.0 {
         let seek_ts = (offset_secs * ffi::AV_TIME_BASE as f64) as i64;
@@ -351,7 +331,7 @@ pub fn convert_to_wav_with_options(
         crate::error::FfmpegError::new(ffi::AVERROR_STREAM_NOT_FOUND, "no audio stream")
     })?;
 
-    in_ctx.discard_all_except(audio_idx);
+    in_ctx.discard_all_except(&[audio_idx]);
 
     let stream = in_ctx.stream(audio_idx).unwrap();
     let mut decoder = stream.decoder()?;
@@ -528,7 +508,7 @@ pub fn split_audio_segment(
         crate::error::FfmpegError::new(ffi::AVERROR_STREAM_NOT_FOUND, "no audio stream")
     })?;
 
-    in_ctx.discard_all_except(audio_idx);
+    in_ctx.discard_all_except(&[audio_idx]);
 
     // Seek to start
     let seek_ts = (start_secs * ffi::AV_TIME_BASE as f64) as i64;
@@ -847,172 +827,38 @@ pub struct Loudness {
     pub downmix_peak_db: Option<f64>,
 }
 
-/// Like the ffmpeg CLI, this detects mid-stream audio property changes (channel
-/// layout, sample rate, sample format) and reconfigures the filter graph. Some
-/// codecs (notably AC3) can have initial frames with a different channel layout
-/// than the stream's declared layout.
+/// Every audio stream's loudness, in stream order. Players pick their own track, so a
+/// dub flagged default says nothing about the original playing beside it.
 pub fn measure_loudness(
     path: &Path,
     run: Option<&crate::progress::RunContext>,
-) -> Result<Loudness> {
-    use crate::filter::graph::{AudioFilterParams, FilterGraph};
-
+) -> Result<Vec<TrackLoudness>> {
     let mut ctx = InputContext::open_path(path)?;
     ctx.find_stream_info()?;
 
-    let audio_idx = ctx.find_best_stream(MediaType::Audio).ok_or_else(|| {
-        crate::error::FfmpegError::new(ffi::AVERROR_STREAM_NOT_FOUND, "no audio stream")
-    })?;
-
-    ctx.discard_all_except(audio_idx);
-
-    let stream = ctx.stream(audio_idx).unwrap();
-    let time_base = stream.time_base();
-    let mut decoder = stream.decoder()?;
-
-    let mut packet = Packet::new()?;
-    let mut frame = Frame::new()?;
-    let mut out_frame = Frame::new()?;
-    let mut last_lufs: Option<f64> = None;
-    let mut frames_decoded: u64 = 0;
-    let mut decode_errors: u64 = 0;
-    let mut graph: Option<FilterGraph> = None;
-    let mut graph_state: Option<AudioGraphState> = None;
-    let mut downmix = crate::downmix_peak::DownmixPeakMeter::new();
-
-    let ensure_graph = |graph: &mut Option<FilterGraph>,
-                        graph_state: &mut Option<AudioGraphState>,
-                        frame: &Frame,
-                        out_frame: &mut Frame,
-                        last_lufs: &mut Option<f64>,
-                        time_base: ffi::AVRational|
-     -> Result<()> {
-        let needs_rebuild = match graph_state {
-            None => true,
-            Some(state) => !state.matches_frame(frame),
-        };
-        if needs_rebuild {
-            // Flush the old graph before replacing it
-            if let Some(g) = graph {
-                g.push_eof()?;
-                while g.pull_frame(out_frame)? {
-                    if let Some(lufs) = unsafe { extract_lufs(out_frame) } {
-                        *last_lufs = Some(lufs);
-                    }
-                    out_frame.unref();
-                }
-            }
-            let state = unsafe { AudioGraphState::from_frame(frame) };
-            let params = AudioFilterParams {
-                sample_rate: state.sample_rate,
-                sample_format: state.sample_format,
-                channel_layout: state.channel_layout,
-                time_base,
-                side_data_frame: frame.as_ptr(),
-            };
-            *graph = Some(FilterGraph::new_audio(
-                &params,
-                "ebur128=peak=none:metadata=1",
-            )?);
-            *graph_state = Some(unsafe { AudioGraphState::from_frame(frame) });
-            tracing::debug!(
-                sample_rate = state.sample_rate,
-                "reconfigured LUFS filter graph for new audio properties"
-            );
-        }
-        Ok(())
-    };
-
-    while ctx.read_packet(&mut packet)? {
-        crate::progress::check_cancel(run)?;
-        if packet.stream_index() != audio_idx as i32 {
-            continue;
-        }
-        if let Err(e) = decoder.send_packet(&packet) {
-            tracing::debug!("skipping malformed audio packet: {e}");
-            decode_errors += 1;
-            continue;
-        }
-        loop {
-            match decoder.receive_frame(&mut frame) {
-                Ok(DecodeResult::Frame) => {
-                    frames_decoded += 1;
-                    ensure_graph(
-                        &mut graph,
-                        &mut graph_state,
-                        &frame,
-                        &mut out_frame,
-                        &mut last_lufs,
-                        time_base,
-                    )?;
-                    downmix.feed(&mut frame, time_base)?;
-                    graph.as_mut().unwrap().push_frame(&mut frame)?;
-                    while graph.as_mut().unwrap().pull_frame(&mut out_frame)? {
-                        if let Some(lufs) = unsafe { extract_lufs(&out_frame) } {
-                            last_lufs = Some(lufs);
-                        }
-                        out_frame.unref();
-                    }
-                }
-                Ok(DecodeResult::NeedsInput) => break,
-                Ok(DecodeResult::Eof) => break,
-                Err(e) => {
-                    tracing::debug!("skipping undecodable audio frame: {e}");
-                    decode_errors += 1;
-                    break;
-                }
-            }
-        }
-    }
-
-    if frames_decoded == 0 && decode_errors > 0 {
+    let indices = audio_stream_indices(&ctx);
+    if indices.is_empty() {
         return Err(crate::error::FfmpegError::new(
-            ffi::AVERROR_INVALIDDATA,
-            format!("all {decode_errors} audio packets failed to decode"),
+            ffi::AVERROR_STREAM_NOT_FOUND,
+            "no audio stream",
         ));
     }
+    ctx.discard_all_except(&indices);
 
-    decoder.send_eof()?;
-    loop {
-        match decoder.receive_frame(&mut frame) {
-            Ok(DecodeResult::Frame) => {
-                ensure_graph(
-                    &mut graph,
-                    &mut graph_state,
-                    &frame,
-                    &mut out_frame,
-                    &mut last_lufs,
-                    time_base,
-                )?;
-                downmix.feed(&mut frame, time_base)?;
-                graph.as_mut().unwrap().push_frame(&mut frame)?;
-                while graph.as_mut().unwrap().pull_frame(&mut out_frame)? {
-                    if let Some(lufs) = unsafe { extract_lufs(&out_frame) } {
-                        last_lufs = Some(lufs);
-                    }
-                    out_frame.unref();
-                }
-            }
-            Err(e) => {
-                tracing::debug!("error during flush: {e}");
-                break;
-            }
-            _ => break,
+    let mut meters = indices
+        .iter()
+        .map(|&i| DecodingLoudnessMeter::new(&ctx, i))
+        .collect::<Result<Vec<_>>>()?;
+    let mut packet = Packet::new()?;
+    while ctx.read_packet(&mut packet)? {
+        crate::progress::check_cancel(run)?;
+        let stream = packet.stream_index() as u32;
+        if let Some(meter) = meters.iter_mut().find(|m| m.stream_index() == stream) {
+            meter.feed(&packet)?;
         }
     }
-
-    if let Some(ref mut g) = graph {
-        g.push_eof()?;
-        while g.pull_frame(&mut out_frame)? {
-            if let Some(lufs) = unsafe { extract_lufs(&out_frame) } {
-                last_lufs = Some(lufs);
-            }
-            out_frame.unref();
-        }
-    }
-
-    Ok(Loudness {
-        integrated_lufs: last_lufs,
-        downmix_peak_db: downmix.finish()?,
-    })
+    meters
+        .into_iter()
+        .map(DecodingLoudnessMeter::finish)
+        .collect()
 }

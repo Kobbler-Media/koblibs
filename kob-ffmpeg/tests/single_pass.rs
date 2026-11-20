@@ -78,7 +78,10 @@ fn single_pass_smoke_all_branches() {
         "chromaprint suspicious"
     );
     assert!(
-        result.loudness.is_some(),
+        result
+            .track_loudness
+            .first()
+            .is_some_and(|t| t.loudness.integrated_lufs.is_some()),
         "loudness branch produced no value"
     );
     let peaks = result.audio_peaks.expect("audio_peaks output");
@@ -238,8 +241,8 @@ fn single_pass_silence_matches_standalone() {
 #[test]
 fn single_pass_lufs_matches_standalone() {
     let path = fixtures::basic_video();
-    let standalone = kob_ffmpeg::audio::measure_loudness(&path, None)
-        .expect("standalone")
+    let standalone = kob_ffmpeg::audio::measure_loudness(&path, None).expect("standalone")[0]
+        .loudness
         .integrated_lufs;
 
     let req = SinglePassRequest {
@@ -256,7 +259,7 @@ fn single_pass_lufs_matches_standalone() {
         fast_decode: true,
     };
     let result = run_single_pass(req, None).expect("run_single_pass");
-    let single_pass = result.loudness;
+    let single_pass = result.track_loudness[0].loudness.integrated_lufs;
 
     match (standalone, single_pass) {
         (Some(a), Some(b)) => assert!(
@@ -272,8 +275,8 @@ fn single_pass_lufs_matches_standalone() {
 fn single_pass_loudness_reports_downmix_peak_matching_standalone() {
     for (layout, amplitude) in [("stereo", 0.5), ("5.1(side)", 0.5), ("7.1", 0.25)] {
         let path = fixtures::in_phase_sine(layout, amplitude);
-        let standalone = kob_ffmpeg::audio::measure_loudness(&path, None)
-            .expect("standalone")
+        let standalone = kob_ffmpeg::audio::measure_loudness(&path, None).expect("standalone")[0]
+            .loudness
             .downmix_peak_db
             .expect("standalone peak");
         let mut req = SinglePassRequest::new(path);
@@ -288,7 +291,10 @@ fn single_pass_loudness_reports_downmix_peak_matching_standalone() {
             "{layout}: {:?}",
             result.per_branch_errors
         );
-        let peak = result.downmix_peak_db.expect("single-pass peak");
+        let peak = result.track_loudness[0]
+            .loudness
+            .downmix_peak_db
+            .expect("single-pass peak");
         assert!(
             (peak - standalone).abs() < 0.01,
             "{layout}: single_pass {peak} vs standalone {standalone}"
@@ -371,7 +377,10 @@ fn single_pass_handles_ac3_channel_change_under_multi_branch_load() {
     let _ = cp.raw;
     let _ = result.silence.expect("silence produced no result");
     assert!(
-        result.loudness.is_some(),
+        result
+            .track_loudness
+            .first()
+            .is_some_and(|t| t.loudness.integrated_lufs.is_some()),
         "loudness branch produced no value despite multi-frame audio"
     );
     let peaks = result.audio_peaks.expect("audio_peaks produced no result");
@@ -584,7 +593,7 @@ fn single_pass_real_episode_full_load() {
         "silence intervals:  {}",
         result.silence.as_ref().map(|v| v.len()).unwrap_or(0)
     );
-    eprintln!("loudness (LUFS):    {:?}", result.loudness);
+    eprintln!("loudness:           {:?}", result.track_loudness);
     eprintln!(
         "audio_peaks bytes:  {}",
         result
@@ -612,7 +621,13 @@ fn single_pass_real_episode_full_load() {
         !cp.raw.is_empty(),
         "real episode produced empty chromaprint"
     );
-    assert!(result.loudness.is_some(), "real episode produced no LUFS");
+    assert!(
+        result
+            .track_loudness
+            .first()
+            .is_some_and(|t| t.loudness.integrated_lufs.is_some()),
+        "real episode produced no LUFS"
+    );
     assert!(result.audio_peaks.unwrap().bytes.len() > 1_000);
 }
 
@@ -822,4 +837,51 @@ fn single_pass_unwindowed_branch_disables_seek() {
     req.vhash.as_mut().unwrap().windows.clear();
     let result = run_single_pass(req, None).expect("run");
     assert_eq!(result.seeked_to_secs, None);
+}
+
+#[test]
+fn loudness_is_measured_for_every_audio_track() {
+    let path = fixtures::dubbed_mkv();
+    let standalone = kob_ffmpeg::audio::measure_loudness(&path, None).expect("standalone");
+    let audio_only = {
+        let mut req = SinglePassRequest::new(path.clone());
+        req.loudness = true;
+        req.silence = Some(SilenceParams::default());
+        req
+    };
+    let with_video = {
+        let mut req = audio_only.clone();
+        req.trickplay = Some(TrickplayParams {
+            width: 160,
+            fps: 1.0,
+            jpeg_quality: 5,
+        });
+        req
+    };
+    let runs = [
+        ("standalone", standalone),
+        (
+            "single pass, audio only",
+            run_single_pass(audio_only, None)
+                .expect("audio only")
+                .track_loudness,
+        ),
+        (
+            "single pass, with video",
+            run_single_pass(with_video, None)
+                .expect("with video")
+                .track_loudness,
+        ),
+    ];
+    for (what, tracks) in runs {
+        let indices: Vec<u32> = tracks.iter().map(|t| t.stream_index).collect();
+        assert_eq!(indices, [1, 2], "{what}: {tracks:?}");
+        let (dub, original) = (&tracks[0].loudness, &tracks[1].loudness);
+        let lufs_gap = original.integrated_lufs.expect("original LUFS")
+            - dub.integrated_lufs.expect("dub LUFS");
+        let peak_gap = original.downmix_peak_db.expect("original peak")
+            - dub.downmix_peak_db.expect("dub peak");
+        assert!((lufs_gap - 20.0).abs() < 0.5, "{what}: LUFS gap {lufs_gap}");
+        assert!((peak_gap - 20.0).abs() < 0.5, "{what}: peak gap {peak_gap}");
+    }
 }
