@@ -123,6 +123,18 @@ pub struct VideoEncoderConfig {
     pub options: Vec<(String, String)>,
 }
 
+/// The `level` private option for an H.264 encoder, `None` for any other codec.
+// libx264 takes Annex A notation as a string; the hardware encoders take level_idc as an
+// int, whose named constants disagree between them ("6.0" for NVENC, "6" for VAAPI).
+pub(crate) fn h264_level_option(encoder: &str, level_idc: u32) -> Option<(String, String)> {
+    let value = match encoder {
+        "libx264" => format!("{}.{}", level_idc / 10, level_idc % 10),
+        e if e.starts_with("h264_") => level_idc.to_string(),
+        _ => return None,
+    };
+    Some(("level".to_string(), value))
+}
+
 /// The output frame rate for a stream's `r_frame_rate`, doubled when
 /// deinterlacing emits one frame per field. `None` when the stream has none.
 pub fn output_frame_rate(

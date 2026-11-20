@@ -88,6 +88,10 @@ pub struct HlsConfig {
     /// Encoder tuning (`zerolatency`, `film`, …). `zerolatency` disables the
     /// lookahead and frame threading that otherwise cost ~1s on a live path.
     pub tune: Option<String>,
+    /// H.264 level_idc the encode declares (41 is 4.1); other codecs ignore it.
+    /// libx264 and VAAPI declare it even when the picture size and rate exceed it,
+    /// where NVENC refuses to open.
+    pub h264_level: Option<u32>,
     /// Tone-maps HDR10, HLG and Dolby Vision sources to BT.709 SDR. Dolby Vision
     /// without a compatible base layer is reshaped regardless.
     pub tone_map_hdr: bool,
@@ -116,6 +120,7 @@ impl HlsConfig {
             deinterlace: crate::filter::graph::Deinterlace::None,
             preset: None,
             tune: None,
+            h264_level: None,
             tone_map_hdr: false,
         }
     }
@@ -128,6 +133,14 @@ impl HlsConfig {
         if let Some(ref t) = self.tune {
             opts.push(("tune".to_string(), t.clone()));
         }
+        opts.extend(
+            self.video_encoder
+                .as_deref()
+                .zip(self.h264_level)
+                .and_then(|(encoder, level)| {
+                    crate::codec::encoder::h264_level_option(encoder, level)
+                }),
+        );
         opts
     }
 
@@ -178,6 +191,12 @@ impl HlsConfig {
     #[must_use]
     pub fn tune(mut self, tune: &str) -> Self {
         self.tune = Some(tune.to_string());
+        self
+    }
+
+    #[must_use]
+    pub fn h264_level(mut self, level_idc: u32) -> Self {
+        self.h264_level = Some(level_idc);
         self
     }
 
@@ -1173,6 +1192,28 @@ mod encoder_options_test {
                 ("tune".to_string(), "zerolatency".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn h264_level_reaches_the_h264_encoder_only() {
+        let x264 = HlsConfig::new("/tmp/unused")
+            .video_encoder("libx264")
+            .h264_level(41);
+        assert_eq!(
+            x264.encoder_options(),
+            vec![("level".to_string(), "4.1".to_string())]
+        );
+        let nvenc = HlsConfig::new("/tmp/unused")
+            .video_encoder("h264_nvenc")
+            .h264_level(41);
+        assert_eq!(
+            nvenc.encoder_options(),
+            vec![("level".to_string(), "41".to_string())]
+        );
+        let hevc = HlsConfig::new("/tmp/unused")
+            .video_encoder("hevc_vaapi")
+            .h264_level(41);
+        assert!(hevc.encoder_options().is_empty());
     }
 
     #[test]

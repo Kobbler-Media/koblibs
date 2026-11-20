@@ -74,6 +74,10 @@ pub struct SessionConfig {
     pub preset: Option<String>,
     /// Encoder tuning (`zerolatency`, `film`, …).
     pub tune: Option<String>,
+    /// H.264 level_idc the encode declares (41 is 4.1); other codecs ignore it.
+    /// libx264 and VAAPI declare it even when the picture size and rate exceed it,
+    /// where NVENC refuses to open.
+    pub h264_level: Option<u32>,
     /// Runs an earlier session left in `output_dir`, from [`TranscodeSession::runs`].
     /// Their segments are served as they are, and `start_time` moves forward past
     /// whatever of them is contiguous from it, so only what was never produced is
@@ -118,6 +122,7 @@ impl SessionConfig {
             deinterlace: crate::filter::graph::Deinterlace::None,
             preset: None,
             tune: None,
+            h264_level: None,
             prior_runs: Vec::new(),
             tone_map_hdr: false,
         }
@@ -131,6 +136,14 @@ impl SessionConfig {
         if let Some(ref t) = self.tune {
             opts.push(("tune".to_string(), t.clone()));
         }
+        opts.extend(
+            self.video_encoder
+                .as_deref()
+                .zip(self.h264_level)
+                .and_then(|(encoder, level)| {
+                    crate::codec::encoder::h264_level_option(encoder, level)
+                }),
+        );
         opts
     }
 
@@ -192,6 +205,11 @@ impl SessionConfig {
     #[must_use]
     pub fn tune(mut self, tune: &str) -> Self {
         self.tune = Some(tune.to_string());
+        self
+    }
+    #[must_use]
+    pub fn h264_level(mut self, level_idc: u32) -> Self {
+        self.h264_level = Some(level_idc);
         self
     }
     #[must_use]
@@ -2124,6 +2142,61 @@ fn flush_all(
     }
     out.write_trailer()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod encoder_options_test {
+    use super::*;
+
+    fn level_options(encoder: &str, level: u32) -> Vec<(String, String)> {
+        SessionConfig::new("/tmp/unused", 1.0)
+            .video_encoder(encoder)
+            .h264_level(level)
+            .encoder_options()
+    }
+
+    #[test]
+    fn h264_level_is_spelled_the_way_each_h264_encoder_takes_it() {
+        let cases = [
+            ("libx264", 41, Some("4.1")),
+            ("libx264", 40, Some("4.0")),
+            ("h264_nvenc", 41, Some("41")),
+            ("h264_vaapi", 41, Some("41")),
+            ("h264_qsv", 41, Some("41")),
+            ("hevc_nvenc", 41, None),
+            ("libx265", 41, None),
+        ];
+        for (encoder, level, expected) in cases {
+            let expected: Vec<(String, String)> = expected
+                .map(|v| ("level".to_string(), v.to_string()))
+                .into_iter()
+                .collect();
+            assert_eq!(level_options(encoder, level), expected, "{encoder} {level}");
+        }
+    }
+
+    #[test]
+    fn h264_level_follows_preset_and_tune() {
+        let config = SessionConfig::new("/tmp/unused", 1.0)
+            .video_encoder("libx264")
+            .preset("veryfast")
+            .tune("zerolatency")
+            .h264_level(41);
+        assert_eq!(
+            config.encoder_options(),
+            vec![
+                ("preset".to_string(), "veryfast".to_string()),
+                ("tune".to_string(), "zerolatency".to_string()),
+                ("level".to_string(), "4.1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_level_without_a_video_encoder() {
+        let config = SessionConfig::new("/tmp/unused", 1.0).h264_level(41);
+        assert!(config.encoder_options().is_empty());
+    }
 }
 
 #[cfg(test)]
