@@ -153,6 +153,8 @@ pub enum StructuralRejectReason {
     /// A movie still new enough to be in cinemas, from a release with no
     /// source tag: in that window an unlabelled copy is a CAM/TS.
     UnsourcedNewMovie,
+    /// A book release tagged for another language than the one wanted.
+    LanguageMismatch,
 }
 
 impl StructuralRejectReason {
@@ -172,6 +174,7 @@ impl StructuralRejectReason {
                 | Self::YearMismatch
                 | Self::EventNotYetHeld
                 | Self::UnsourcedNewMovie
+                | Self::LanguageMismatch
         )
     }
 }
@@ -200,6 +203,7 @@ impl std::fmt::Display for StructuralRejectReason {
             Self::SessionMissing => write!(f, "session_missing"),
             Self::EventNotYetHeld => write!(f, "event_not_yet_held"),
             Self::UnsourcedNewMovie => write!(f, "unsourced_new_movie"),
+            Self::LanguageMismatch => write!(f, "language_mismatch"),
         }
     }
 }

@@ -174,6 +174,10 @@ pub enum MediaWant {
         /// book, not this one ("Dune Messiah" is not "Dune").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         other_titles: Option<Vec<String>>,
+        /// English name of the language wanted ("english"). A release tagged for
+        /// another language is another edition.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
     },
     Audiobook {
         title: String,
@@ -196,6 +200,10 @@ pub enum MediaWant {
         /// book, not this one ("Dune Messiah" is not "Dune").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         other_titles: Option<Vec<String>>,
+        /// English name of the language wanted ("english"). A release tagged for
+        /// another language is another edition.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
     },
     TvEpisode {
         show_name: String,
