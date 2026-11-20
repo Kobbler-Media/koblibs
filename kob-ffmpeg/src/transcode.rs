@@ -427,6 +427,18 @@ fn transcode_to_hls_inner(
             };
             let width = config.scale_width.unwrap_or(src_post_rot_w);
             let height = config.scale_height.unwrap_or(src_post_rot_h);
+            let out_rate = crate::codec::encoder::output_frame_rate(
+                stream.r_frame_rate(),
+                deint_filter.is_some(),
+            );
+            let fitted = crate::h264_level::output_geometry(
+                codec_name,
+                config.h264_level,
+                width,
+                height,
+                out_rate,
+            );
+            let (width, height) = (fitted.width, fitted.height);
 
             let pix_fmt = if config.hw_device.is_some() {
                 crate::types::PixelFormat::NV12
@@ -462,16 +474,13 @@ fn transcode_to_hls_inner(
                     } else {
                         fps
                     };
-                    (config.segment_duration * out_fps) as i32
+                    (config.segment_duration * out_fps / f64::from(fitted.frame_step)) as i32
                 }),
                 global_header: out_ctx.requires_global_header(),
                 quality: None,
                 hw_frames_ctx: enc_hw_frames,
                 sample_aspect_ratio: Some((src_sar.num, src_sar.den)),
-                frame_rate: crate::codec::encoder::output_frame_rate(
-                    stream.r_frame_rate(),
-                    deint_filter.is_some(),
-                ),
+                frame_rate: out_rate.map(|(num, den)| (num, den * fitted.frame_step as i32)),
                 color: if reshape {
                     crate::sdr::sdr_color()
                 } else {
@@ -519,6 +528,7 @@ fn transcode_to_hls_inner(
     let mut video_filter: Option<FilterGraph> = None;
     // Deferred HW scale filter for lazy creation
     let mut deferred_hw_scale: Option<(i32, i32, i32, i32, ffi::AVRational)> = None;
+    let mut frame_step = 1;
     let mut cpu_filter_plan: Option<CpuFilterPlan> = None;
     if let Some(dec) = video_decoder.as_ref() {
         // Re-derive rotation here (HW path keeps it None — same rule as
@@ -549,8 +559,18 @@ fn transcode_to_hls_inner(
         } else {
             (dec.width(), dec.height())
         };
-        let target_w = config.scale_width.unwrap_or(src_post_rot_w);
-        let target_h = config.scale_height.unwrap_or(src_post_rot_h);
+        let fitted = crate::h264_level::output_geometry(
+            config.video_encoder.as_deref().unwrap_or_default(),
+            config.h264_level,
+            config.scale_width.unwrap_or(src_post_rot_w),
+            config.scale_height.unwrap_or(src_post_rot_h),
+            crate::codec::encoder::output_frame_rate(
+                in_ctx.stream(video_idx.unwrap()).unwrap().r_frame_rate(),
+                deint_filter.is_some(),
+            ),
+        );
+        let (target_w, target_h) = (fitted.width, fitted.height);
+        frame_step = fitted.frame_step;
         let needs_scale = target_w != src_post_rot_w || target_h != src_post_rot_h;
 
         if zero_copy {
@@ -579,6 +599,7 @@ fn transcode_to_hls_inner(
             if let Some(d) = deint_filter {
                 filters.push(d.to_string());
             }
+            filters.extend(crate::h264_level::frame_step_filter(frame_step));
             let resize_at = filters.len();
             if let (Some(sub_idx), Some(path)) = (config.subtitle_burn_in, input_path) {
                 let input_path_str = path.to_str().ok_or_else(|| {
@@ -835,6 +856,8 @@ fn transcode_to_hls_inner(
                                 }
                                 _ => format!("scale={dst_w}:{dst_h}"),
                             };
+                            let filter_str =
+                                crate::h264_level::with_frame_step(filter_str, frame_step);
                             video_filter = Some(FilterGraph::new_video(&params, &filter_str)?);
                             unsafe {
                                 let mut p = dec_hw_frames;

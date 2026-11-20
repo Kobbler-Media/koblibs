@@ -23,6 +23,7 @@ static HEVC_INBAND_PARAMS: OnceLock<PathBuf> = OnceLock::new();
 static UNEVEN_GOP_VIDEO: OnceLock<PathBuf> = OnceLock::new();
 static HDR10_VIDEO: OnceLock<PathBuf> = OnceLock::new();
 static DUBBED_MKV: OnceLock<PathBuf> = OnceLock::new();
+static FULL_HD_60: OnceLock<PathBuf> = OnceLock::new();
 
 fn fixture_dir() -> &'static Path {
     FIXTURE_DIR
@@ -40,6 +41,29 @@ fn run_ffmpeg(args: &[&str], output: &Path) {
         .status()
         .expect("ffmpeg must be available");
     assert!(status.success(), "ffmpeg failed: {output:?}");
+}
+
+/// H.264 1920x1080 @ 60fps, 2 seconds: past level 4.1's macroblock rate.
+pub fn full_hd_60() -> PathBuf {
+    FULL_HD_60
+        .get_or_init(|| {
+            let path = fixture_dir().join("full_hd_60.mp4");
+            run_ffmpeg(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=duration=2:size=1920x1080:rate=60",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                ],
+                &path,
+            );
+            path
+        })
+        .clone()
 }
 
 /// H.264 320x240 @ 10fps + AAC audio, 2 seconds.
