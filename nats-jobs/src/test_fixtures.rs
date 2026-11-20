@@ -82,6 +82,7 @@ pub fn sample_want_request() -> WantRequest {
             series_position: Some("1".to_string()),
             release_date: None,
             alternate_titles: None,
+            other_titles: None,
         }),
         upgrade_allowed: None,
         manual: false,
@@ -183,6 +184,7 @@ pub fn sample_search_request() -> SearchRequest {
             series_position: None,
             release_date: None,
             alternate_titles: None,
+            other_titles: None,
         }),
     }
 }
@@ -581,6 +583,7 @@ mod tests {
             series_position: None,
             release_date: None,
             alternate_titles: None,
+            other_titles: None,
         };
         let json = serde_json::to_value(&want).unwrap();
         assert_eq!(json["kind"], "book");

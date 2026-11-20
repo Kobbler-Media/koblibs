@@ -170,6 +170,10 @@ pub enum MediaWant {
         release_date: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         alternate_titles: Option<Vec<String>>,
+        /// The author's other books. A release named for one of them is that
+        /// book, not this one ("Dune Messiah" is not "Dune").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        other_titles: Option<Vec<String>>,
     },
     Audiobook {
         title: String,
@@ -188,6 +192,10 @@ pub enum MediaWant {
         release_date: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         alternate_titles: Option<Vec<String>>,
+        /// The author's other books. A release named for one of them is that
+        /// book, not this one ("Dune Messiah" is not "Dune").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        other_titles: Option<Vec<String>>,
     },
     TvEpisode {
         show_name: String,
