@@ -8,6 +8,7 @@
 //! the app, the web reader and a Kobo can share one reading position.
 
 mod blocks;
+mod body_inset;
 mod build;
 mod decor;
 mod fixed_page;
@@ -38,7 +39,7 @@ use crate::Result;
 
 /// Revision of the pack format and of the builder's output. Bump it whenever
 /// a rebuilt pack would differ, so stored packs can be found and rebuilt.
-pub const READER_PACK_GENERATION: u32 = 5;
+pub const READER_PACK_GENERATION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReaderPack {

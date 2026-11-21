@@ -18,7 +18,9 @@ use super::model::{
 use super::notes::{NoteIndex, global, is_inline_role};
 use super::sidecar::Segment;
 use super::source::SourceDoc;
-use super::styles::{StyleRole, StyleTable, em_or_zero, forced_break, round};
+use super::styles::{
+    self, NORMAL_LINE_HEIGHT, StyleRole, StyleTable, em_or_zero, forced_break, round,
+};
 
 pub(crate) struct BookCx<'a> {
     pub chapters: &'a [Arc<Chapter>],
@@ -92,6 +94,8 @@ struct Saved {
     measures: usize,
     floats: usize,
     first_block: usize,
+    content_top: f32,
+    out_of_flow: bool,
 }
 
 struct OpenBox {
@@ -104,7 +108,6 @@ const IMAGE_TINY_EM: f32 = 2.0;
 /// The browser default for a list's marker gutter (40px), which boko's user
 /// agent sheet leaves out because its own exporters draw none.
 const LIST_INSET_EM: f32 = 2.5;
-const BLOCK_BREAK_EM: f32 = 1.0;
 const KEEP_TOGETHER_MAX: usize = 6;
 
 pub(crate) struct Flattener<'a> {
@@ -133,6 +136,7 @@ pub(crate) struct Flattener<'a> {
     measures: Vec<Measure>,
     floats: Vec<OpenFloat>,
     collapsing: bool,
+    out_of_flow: bool,
 }
 
 pub(crate) fn flatten_chapter(
@@ -185,6 +189,7 @@ impl<'a> Flattener<'a> {
             measures: Vec::new(),
             floats: Vec::new(),
             collapsing: false,
+            out_of_flow: false,
         }
     }
 
@@ -317,7 +322,7 @@ impl<'a> Flattener<'a> {
 
     fn enter(&mut self, id: NodeId) -> Saved {
         self.anchor_here(id);
-        let saved = Saved {
+        let mut saved = Saved {
             insets: self.insets,
             frames: self.frames.len(),
             lists: self.lists.len(),
@@ -325,11 +330,14 @@ impl<'a> Flattener<'a> {
             measures: self.measures.len(),
             floats: self.floats.len(),
             first_block: self.out.blocks.len(),
+            content_top: 0.0,
+            out_of_flow: self.out_of_flow,
         };
         let Some(s) = self.style(id) else {
             return saved;
         };
         let size = s.font_size_abs.0;
+        self.out_of_flow |= s.position.is_out_of_flow();
         let role = self.ch.node(id).map(|n| n.role);
         let list = matches!(role, Some(Role::OrderedList | Role::UnorderedList));
         let rule = role == Some(Role::Rule);
@@ -389,6 +397,7 @@ impl<'a> Flattener<'a> {
         } else {
             self.gap += em_or_zero(s.padding_top, size);
         }
+        saved.content_top = self.gap;
         let start = margin_start + em_or_zero(s.padding_left, size);
         self.insets.0 += border_start
             + if list && start == 0.0 {
@@ -418,6 +427,34 @@ impl<'a> Flattener<'a> {
         saved
     }
 
+    /// Empty lines are how many books set a title or dedication down the page:
+    /// each holds a line box, which margins on either side cannot collapse through.
+    fn blank_lines(&mut self, owner: NodeId, lines: usize) {
+        if self.out_of_flow {
+            return;
+        }
+        let line = self.style(owner).map_or(NORMAL_LINE_HEIGHT, |s| {
+            styles::line_height(s).unwrap_or(NORMAL_LINE_HEIGHT) * s.font_size_abs.0
+        });
+        self.gap = round(self.gap + line * lines as f32);
+        self.floor = self.gap;
+    }
+
+    /// An element with no text of its own still takes the room its `height`
+    /// asks for; a percentage of a parent as tall as its content is `auto`.
+    fn hold_height(&mut self, s: &ComputedStyle, content_top: f32) {
+        let fixed = |len| match len {
+            Length::Percent(_) => 0.0,
+            len => em_or_zero(len, s.font_size_abs.0),
+        };
+        let held = self.gap - content_top;
+        let height = fixed(s.height).max(fixed(s.min_height));
+        if height > held {
+            self.gap = round(self.gap + height - held);
+            self.floor = self.gap;
+        }
+    }
+
     fn collapse(&mut self, margin: f32) {
         self.gap = self.floor + (self.gap - self.floor).max(margin);
     }
@@ -425,6 +462,12 @@ impl<'a> Flattener<'a> {
     fn exit(&mut self, id: NodeId, saved: Saved) {
         if let Some(s) = self.style(id) {
             let size = s.font_size_abs.0;
+            if self.out.blocks.len() == saved.first_block
+                && self.mode != Mode::Cell
+                && !self.out_of_flow
+            {
+                self.hold_height(s, saved.content_top);
+            }
             let list = self
                 .ch
                 .node(id)
@@ -460,6 +503,7 @@ impl<'a> Flattener<'a> {
             self.marker = None;
         }
         self.insets = saved.insets;
+        self.out_of_flow = saved.out_of_flow;
         self.frames.truncate(saved.frames);
         self.lists.truncate(saved.lists);
         self.boxes.truncate(saved.boxes);
@@ -587,8 +631,9 @@ impl<'a> Flattener<'a> {
             self.inline(id, owner_style, &attrs, mode, &mut text, &mut images);
         }
         if text.is_blank() {
-            if text.spans.iter().any(|s| s.text.contains('\n')) {
-                self.collapse(BLOCK_BREAK_EM);
+            let lines = blank_line_count(&text);
+            if lines > 0 {
+                self.blank_lines(owner, lines);
             }
             let block = self.out.blocks.len() as u32;
             for (anchor, _) in text.anchors {
@@ -946,6 +991,15 @@ pub(crate) fn holds_blocks(ch: &Chapter) -> Vec<bool> {
         }
     }
     out
+}
+
+/// Each line break ends a line; what follows the last one is a line only if
+/// it holds a no-break space, the one blank that never collapses away.
+fn blank_line_count(text: &LeafText) -> usize {
+    let all: String = text.spans.iter().map(|s| s.text.as_str()).collect();
+    let mut lines = all.split('\n');
+    let tail = lines.next_back().is_some_and(|l| l.contains('\u{a0}'));
+    lines.count() + usize::from(tail)
 }
 
 fn alpha(mut n: u32) -> String {

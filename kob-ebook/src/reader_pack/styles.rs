@@ -12,7 +12,7 @@ use super::model::{Align, Baseline, Dropcap, Hyphens, TextStyle, Transform};
 /// The CSS default font size, which `px` lengths are measured against.
 pub(crate) const BASE_PX: f32 = 16.0;
 
-const NORMAL_LINE_HEIGHT: f32 = 1.2;
+pub(crate) const NORMAL_LINE_HEIGHT: f32 = 1.2;
 
 /// What a percentage of the containing block's width comes to, in em: a
 /// reader column is around thirty em wide, and the client has no box to
@@ -142,15 +142,7 @@ impl StyleTable {
             out.indent = em(s.text_indent, size)
                 .map(|v| round(v / size))
                 .filter(|v| *v != 0.0);
-            out.line_height = match s.line_height {
-                Length::Em(v) => Some(v),
-                Length::Px(v) => Some(v / (BASE_PX * size)),
-                Length::Rem(v) => Some(v / size),
-                Length::Percent(v) => Some(v / 100.0),
-                Length::Auto => None,
-            }
-            .map(round)
-            .filter(|v| *v > 0.0);
+            out.line_height = line_height(s).map(round).filter(|v| *v > 0.0);
             out.hyphens = match s.hyphens {
                 BokoHyphens::Auto => Some(Hyphens::Auto),
                 BokoHyphens::None => Some(Hyphens::None),
@@ -276,16 +268,22 @@ fn baseline(s: &ComputedStyle) -> Option<Baseline> {
     }
 }
 
+/// `line-height` as a multiple of the element's own font size; `None` is `normal`.
+pub(crate) fn line_height(s: &ComputedStyle) -> Option<f32> {
+    let size = s.font_size_abs.0;
+    match s.line_height {
+        Length::Em(v) => Some(v),
+        Length::Px(v) => Some(v / (BASE_PX * size)),
+        Length::Rem(v) => Some(v / size),
+        Length::Percent(v) => Some(v / 100.0),
+        Length::Auto => None,
+    }
+}
+
 /// A `vertical-align` length, in the span's own em; a percentage is of its line height.
 fn shift(s: &ComputedStyle) -> Option<f32> {
     let size = s.font_size_abs.0;
-    let line_height = match s.line_height {
-        Length::Em(v) => v,
-        Length::Px(v) => v / (BASE_PX * size),
-        Length::Rem(v) => v / size,
-        Length::Percent(v) => v / 100.0,
-        Length::Auto => NORMAL_LINE_HEIGHT,
-    };
+    let line_height = line_height(s).unwrap_or(NORMAL_LINE_HEIGHT);
     let em = match s.vertical_align_length {
         Length::Auto => return None,
         Length::Em(v) => v,

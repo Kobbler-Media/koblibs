@@ -20,7 +20,7 @@ use super::opf;
 use super::sidecar::{ChapterSidecar, push_step};
 use super::source;
 use super::styles::StyleTable;
-use super::{READER_PACK_GENERATION, ReaderPack};
+use super::{READER_PACK_GENERATION, ReaderPack, body_inset};
 use crate::kepub::{self, KepubContext};
 use crate::{EbookError, Result};
 
@@ -217,6 +217,9 @@ pub(crate) fn build(epub: &[u8]) -> Result<ReaderPack> {
         });
     }
 
+    let styles = styles.into_styles();
+    body_inset::normalize(&mut packs, &styles);
+
     let index_of: HashMap<u32, u32> = items
         .iter()
         .enumerate()
@@ -289,7 +292,7 @@ pub(crate) fn build(epub: &[u8]) -> Result<ReaderPack> {
         rtl: pkg.rtl,
         chapters: entries,
         toc: toc(book.toc(), &resolver),
-        styles: styles.into_styles(),
+        styles,
         fonts,
     };
     Ok(ReaderPack {

@@ -11,10 +11,11 @@ license = "AGPL-3.0-only"
 # packs locate text with (Chapter::text_cfi / resolve_cfi), case-insensitive
 # spine resolution, and the cascade reader packs need for book styling
 # (::first-letter dropcaps, vertical-align lengths, the browser's hr border,
-# background images), none of which upstream has.
+# background images), and CSS whitespace rules that keep no-break spaces and
+# empty fixed-height blocks, none of which upstream has.
 #
 # Drop the fork once upstream ships all of it.
-boko = { git = "https://github.com/tinyfiddler/boko", rev = "66d8bbc91610bf5b1305346f1b80ee92536f8cd4", default-features = false }
+boko = { git = "https://github.com/tinyfiddler/boko", rev = "8e49adef0cbcb4d2f5481af36b9dd41ecb7fa0e5", default-features = false }
 quick-xml = "0.42.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
