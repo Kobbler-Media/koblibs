@@ -41,8 +41,8 @@ pub use scoring::{
 };
 pub use search::{SearchRequest, SearchResponse, SearchResult};
 pub use stream::{
-    StreamAvailability, StreamFile, StreamGroup, StreamOption, StreamOutcomeReport, StreamPlayback,
-    StreamPreference, StreamPriority, StreamResolveRequest, StreamResolveResponse,
+    NzbRef, StreamAvailability, StreamFile, StreamGroup, StreamOption, StreamOutcomeReport,
+    StreamPlayback, StreamPreference, StreamPriority, StreamResolveRequest, StreamResolveResponse,
     StreamSearchRequest, StreamSearchResponse, StreamSourceType,
 };
 pub use want::{ExcludedRelease, WantRequest, WantResponse, WantStatus};

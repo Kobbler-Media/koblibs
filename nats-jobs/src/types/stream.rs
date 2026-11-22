@@ -37,7 +37,7 @@ pub struct StreamSearchRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamPreference {
-    pub info_hash: String,
+    pub release_key: String,
     #[serde(default)]
     pub file_id: Option<i32>,
     #[serde(default)]
@@ -79,6 +79,14 @@ pub enum StreamSourceType {
     Usenet,
 }
 
+/// Identifies an NZB by the indexer that listed it. Only kobload can turn it into a download
+/// URL, so indexer API keys never leave kobload.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NzbRef {
+    pub indexer_id: String,
+    pub guid: String,
+}
+
 /// A file within a streamable torrent/NZB.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamFile {
@@ -101,12 +109,12 @@ pub struct StreamOption {
     pub size: i64,
     /// Indexer that provided this release.
     pub indexer: String,
-    /// Torrent info hash (None for usenet).
+    /// The release's identity: a torrent's info hash, or `nzb-<sha256>` for an imported NZB.
+    /// `None` for an NZB not yet imported.
     #[serde(default)]
-    pub info_hash: Option<String>,
-    /// NZB download URL (Some for usenet via TorBox).
-    #[serde(default)]
-    pub nzb_url: Option<String>,
+    pub release_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nzb_ref: Option<NzbRef>,
     /// Magnet URL for the torrent.
     #[serde(default)]
     pub magnet_url: Option<String>,
@@ -168,7 +176,7 @@ pub struct StreamOutcomeReport {
     /// Falls back to the first enabled provider when absent.
     #[serde(default)]
     pub debrid_provider_id: Option<Uuid>,
-    pub info_hash: String,
+    pub release_key: String,
     #[serde(default)]
     pub file_id: Option<i32>,
     pub ok: bool,
@@ -185,15 +193,13 @@ pub struct StreamOutcomeReport {
 pub struct StreamResolveRequest {
     /// Which debrid provider to use.
     pub debrid_provider_id: Uuid,
-    /// Torrent info hash (for torrent sources).
     #[serde(default)]
-    pub info_hash: Option<String>,
+    pub release_key: Option<String>,
     /// Magnet URL (for torrent sources).
     #[serde(default)]
     pub magnet_url: Option<String>,
-    /// NZB URL (for usenet sources via TorBox).
-    #[serde(default)]
-    pub nzb_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nzb_ref: Option<NzbRef>,
     /// Specific file to stream (for multi-file torrents).
     #[serde(default)]
     pub file_id: Option<i32>,
@@ -238,6 +244,12 @@ pub struct StreamResolveResponse {
     /// Provider-side torrent/download ID (useful for status polling when uncached).
     #[serde(default)]
     pub torrent_id: Option<String>,
+    /// The release's identity once known; an NZB only gets one when it is imported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_key: Option<String>,
+    /// A second URL to the same bytes for background cache-ahead, served below playback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_url: Option<String>,
 }
 
 fn default_cached() -> bool {
@@ -281,6 +293,34 @@ mod tests {
             assert_eq!(serde_json::to_string(&value).unwrap(), json);
         }
         assert!(option.audio_languages.is_empty());
+    }
+
+    #[test]
+    fn usenet_options_carry_an_nzb_ref_and_never_a_url() {
+        let option: crate::StreamOption = serde_json::from_value(serde_json::json!({
+            "id": "x", "release_title": "t", "size": 1, "indexer": "i", "total_score": 0.0,
+            "match_score": 0.0, "quality_score": 0.0, "debrid_provider": "usenet",
+            "debrid_provider_id": Uuid::nil(), "cached": true, "source_type": "usenet",
+            "nzb_ref": { "indexer_id": "7", "guid": "g" }
+        }))
+        .unwrap();
+        assert_eq!(
+            option.nzb_ref,
+            Some(crate::NzbRef {
+                indexer_id: "7".into(),
+                guid: "g".into()
+            })
+        );
+        assert_eq!(option.release_key, None);
+        let json = serde_json::to_string(&option).unwrap();
+        assert!(!json.contains("nzb_url") && !json.contains("info_hash"));
+        let resolved: StreamResolveResponse = serde_json::from_value(serde_json::json!({
+            "stream_url": "u", "filename": "f", "filesize": 1,
+            "release_key": "nzb-ab", "cache_url": "c"
+        }))
+        .unwrap();
+        assert_eq!(resolved.release_key.as_deref(), Some("nzb-ab"));
+        assert_eq!(resolved.cache_url.as_deref(), Some("c"));
     }
 
     #[test]
