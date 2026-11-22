@@ -13,6 +13,7 @@ pub struct Providers {
     accounts: Accounts,
     shape: Shape,
     built: Mutex<Vec<String>>,
+    applying: Mutex<()>,
 }
 
 impl Providers {
@@ -27,10 +28,16 @@ impl Providers {
             accounts,
             shape,
             built: Mutex::new(built),
+            applying: Mutex::new(()),
         })
     }
 
     pub fn reconfigure(&self, servers: Vec<ServerConfig>) -> Result<(), Error> {
+        let _applying = self.applying.lock().unwrap_or_else(PoisonError::into_inner);
+        self.apply(servers)
+    }
+
+    fn apply(&self, servers: Vec<ServerConfig>) -> Result<(), Error> {
         let providers = self.accounts.build(&servers, &self.shape)?;
         let built = providers.iter().map(|p| p.key.clone()).collect();
         self.client.replace(providers);
@@ -40,6 +47,7 @@ impl Providers {
     }
 
     pub fn refresh(&self) -> Result<(), Error> {
+        let _applying = self.applying.lock().unwrap_or_else(PoisonError::into_inner);
         let servers = self
             .servers
             .read()
@@ -58,7 +66,7 @@ impl Providers {
             ?usable,
             "providers expired or used up their quota; rebuilding"
         );
-        self.reconfigure(servers)
+        self.apply(servers)
     }
 
     pub fn retains(&self, posted: Option<i64>) -> bool {

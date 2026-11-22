@@ -1,0 +1,223 @@
+use std::ffi::OsString;
+use std::io;
+use std::path::Path;
+use std::process::{ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, Command};
+
+use crate::jobs::failure::Failure;
+use crate::unpack::scan::Family;
+use crate::unpack::tree;
+
+const TAIL: usize = 400;
+const KEEP: usize = 64 << 10;
+const TICK: Duration = Duration::from_millis(100);
+const WRONG_PASSWORD: [&str; 8] = [
+    "incorrect password",
+    "the specified password is incorrect",
+    "enter password",
+    "error: wrong password",
+    "can not open encrypted archive",
+    "data error in encrypted file",
+    "crc failed in the encrypted file",
+    "checksum error in the encrypted file",
+];
+const NO_SPACE: [&str; 3] = ["no space left", "disk full", "not enough space"];
+const PROGRESS: [&str; 5] = ["extracting", "creating", "inflating", "- ", "path ="];
+
+pub enum Attempt {
+    Extracted,
+    WrongPassword(String),
+    Failed(Failure),
+}
+
+pub async fn extract(
+    unrar: &Path,
+    sevenzip: &Path,
+    family: Family,
+    archive: &Path,
+    into: &Path,
+    password: Option<&str>,
+    stall: Duration,
+) -> Attempt {
+    let mut missing = Vec::new();
+    if family == Family::Rar {
+        let mut target = into.as_os_str().to_owned();
+        target.push("/");
+        let secret = if password.is_some() { "-p" } else { "-p-" };
+        let args = [
+            OsString::from("x"),
+            "-o+".into(),
+            "-y".into(),
+            secret.into(),
+            "--".into(),
+            archive.into(),
+            target,
+        ];
+        match run(unrar, &args, password, into, stall).await {
+            Err(Run::Spawn(e)) if e.kind() == io::ErrorKind::NotFound => missing.push(unrar),
+            result => return judge(unrar, archive, result),
+        }
+    }
+    let mut out = OsString::from("-o");
+    out.push(into);
+    let mut args = vec![OsString::from("x"), "-y".into(), out];
+    if password.is_none() {
+        args.push("-p".into());
+    }
+    args.extend(["--".into(), archive.into()]);
+    match run(sevenzip, &args, password, into, stall).await {
+        Err(Run::Spawn(e)) if e.kind() == io::ErrorKind::NotFound => {
+            missing.push(sevenzip);
+            Attempt::Failed(Failure::Infrastructure(format!(
+                "cannot unpack {}: {} not found",
+                archive.display(),
+                missing
+                    .iter()
+                    .map(|t| t.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            )))
+        }
+        result => judge(sevenzip, archive, result),
+    }
+}
+
+enum Run {
+    Spawn(io::Error),
+    Io(io::Error),
+    Stalled(Duration),
+}
+
+struct Finished {
+    status: ExitStatus,
+    said: Vec<u8>,
+}
+
+async fn run(
+    program: &Path,
+    args: &[OsString],
+    password: Option<&str>,
+    into: &Path,
+    stall: Duration,
+) -> Result<Finished, Run> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(if password.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(Run::Spawn)?;
+    if let (Some(mut stdin), Some(password)) = (child.stdin.take(), password) {
+        let line = format!("{password}\n");
+        let _ = stdin.write_all(line.as_bytes()).await;
+    }
+    watch(&mut child, into, stall).await
+}
+
+async fn watch(child: &mut Child, into: &Path, stall: Duration) -> Result<Finished, Run> {
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let (mut out_buf, mut err_buf) = ([0u8; 4096], [0u8; 4096]);
+    let (mut out_open, mut err_open) = (true, true);
+    let mut said = Vec::new();
+    let mut last = Instant::now();
+    let mut size = tree::size(into);
+    loop {
+        tokio::select! {
+            read = stdout.read(&mut out_buf), if out_open => match read.map_err(Run::Io)? {
+                0 => out_open = false,
+                n => { keep(&mut said, &out_buf[..n]); last = Instant::now(); }
+            },
+            read = stderr.read(&mut err_buf), if err_open => match read.map_err(Run::Io)? {
+                0 => err_open = false,
+                n => { keep(&mut said, &err_buf[..n]); last = Instant::now(); }
+            },
+            status = child.wait(), if !out_open && !err_open => {
+                return Ok(Finished { status: status.map_err(Run::Io)?, said });
+            }
+            () = tokio::time::sleep(TICK) => {
+                let now = tree::size(into);
+                if now != size {
+                    size = now;
+                    last = Instant::now();
+                }
+                if last.elapsed() >= stall {
+                    let _ = child.kill().await;
+                    return Err(Run::Stalled(stall));
+                }
+            }
+        }
+    }
+}
+
+fn keep(said: &mut Vec<u8>, data: &[u8]) {
+    said.extend_from_slice(data);
+    if said.len() > KEEP {
+        said.drain(..said.len() - KEEP);
+    }
+}
+
+fn judge(program: &Path, archive: &Path, result: Result<Finished, Run>) -> Attempt {
+    let name = archive.file_name().map_or_else(
+        || archive.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let finished = match result {
+        Ok(finished) => finished,
+        Err(Run::Spawn(e) | Run::Io(e)) => {
+            return Attempt::Failed(Failure::io(&format!("running {}", program.display()), e));
+        }
+        Err(Run::Stalled(after)) => {
+            return Attempt::Failed(Failure::Infrastructure(format!(
+                "{} stalled unpacking {name}: no output or progress for {after:?}",
+                program.display()
+            )));
+        }
+    };
+    let said = String::from_utf8_lossy(&finished.said).into_owned();
+    let lower = said.to_lowercase();
+    let lines = || {
+        lower
+            .lines()
+            .map(str::trim)
+            .filter(|l| !PROGRESS.iter().any(|p| l.starts_with(p)))
+    };
+    if finished.status.success() {
+        return Attempt::Extracted;
+    }
+    if lines().any(|l| NO_SPACE.iter().any(|p| l.contains(p))) {
+        return Attempt::Failed(Failure::Infrastructure(format!(
+            "{} ran out of disk space unpacking {name}",
+            program.display()
+        )));
+    }
+    if lines().any(|l| {
+        WRONG_PASSWORD.iter().any(|p| l.starts_with(p))
+            || l.ends_with("wrong password?")
+            || l.ends_with("wrong password.")
+    }) {
+        return Attempt::WrongPassword(name);
+    }
+    let tail: String = said
+        .trim()
+        .chars()
+        .rev()
+        .take(TAIL)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    Attempt::Failed(Failure::Content(format!(
+        "{} could not unpack {name} ({}): {tail}",
+        program.display(),
+        finished.status
+    )))
+}

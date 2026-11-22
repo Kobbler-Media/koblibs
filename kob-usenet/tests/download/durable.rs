@@ -4,12 +4,19 @@ use crate::nzb;
 use crate::post::{ARTICLE, Posted, video};
 use crate::support::{Rig, assert_file, completed, finish, listing};
 
+const MAP_HEADER: usize = 16;
+
 pub fn marked_done(rig: &Rig) -> usize {
     listing(rig.data.path())
         .iter()
         .filter(|path| path.ends_with("map-0"))
         .map(|path| std::fs::read(rig.data.path().join(path)).unwrap())
-        .map(|map| map.iter().filter(|&&mark| mark == 1).count())
+        .map(|map| {
+            map[MAP_HEADER.min(map.len())..]
+                .iter()
+                .filter(|&&mark| mark == 1)
+                .count()
+        })
         .sum()
 }
 

@@ -58,6 +58,20 @@ impl Rig {
         Engine::new(self.config()).await.unwrap()
     }
 
+    pub async fn engine_with(&self, change: impl FnOnce(&mut EngineConfig)) -> Engine {
+        let mut config = self.config();
+        change(&mut config);
+        Engine::new(config).await.unwrap()
+    }
+
+    pub fn record(&self, name: &str) -> PathBuf {
+        let found = listing(self.data.path())
+            .into_iter()
+            .find(|p| p.starts_with("jobs/") && p.ends_with(&format!("/{name}")))
+            .unwrap_or_else(|| panic!("no job {name} in {:?}", listing(self.data.path())));
+        self.data.path().join(found)
+    }
+
     fn server(&self) -> ServerConfig {
         ServerConfig {
             id: "a".to_owned(),
@@ -182,15 +196,49 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
     }
 }
 
-pub fn extractor_on_path() -> bool {
-    let found = ["unrar", "7z"].iter().any(|tool| {
-        std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(tool).is_file()))
-    });
-    if !found {
-        eprintln!("skipped: neither unrar nor 7z is on PATH");
+pub fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+pub fn sevenzip(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("7z")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+fn on_path(tool: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(tool).is_file()))
+}
+
+fn tools_on_path(tools: &[&str]) -> bool {
+    if std::env::var("KOB_USENET_REQUIRE_TOOLS").is_ok_and(|v| v == "1") {
+        for tool in ["unrar", "7z"] {
+            assert!(on_path(tool), "{tool} is required on PATH");
+        }
     }
-    found
+    let missing: Vec<&str> = tools.iter().copied().filter(|t| !on_path(t)).collect();
+    if !missing.is_empty() {
+        eprintln!("skipped: {missing:?} not on PATH");
+    }
+    missing.is_empty()
+}
+
+pub fn extractor_on_path() -> bool {
+    tools_on_path(&["7z"])
+}
+
+// 7-Zip refuses the CRCs of the synthetic split RAR5 volumes these tests build; production
+// unpacks RAR with unrar, so tests of multi-volume RAR unpacking need it.
+pub fn unrar_on_path() -> bool {
+    tools_on_path(&["unrar"])
 }
 
 pub fn crc_of(dir: &Path, name: &str) -> (usize, u32) {

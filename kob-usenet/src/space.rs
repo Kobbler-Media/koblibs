@@ -2,9 +2,6 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-
-const POLL: Duration = Duration::from_millis(500);
 
 pub trait FreeSpace: Send + Sync {
     fn available(&self, path: &Path) -> io::Result<u64>;
@@ -38,24 +35,38 @@ impl SpaceGate {
         self.paused.load(Ordering::Relaxed)
     }
 
-    pub async fn wait(&self, path: &Path) {
-        loop {
-            match self.source.available(path) {
-                Ok(free) if free < self.floor => {
-                    if !self.paused.swap(true, Ordering::Relaxed) {
-                        tracing::warn!(free, floor = self.floor, path = %path.display(), "pausing downloads: low disk space");
-                    }
-                    tokio::time::sleep(POLL).await;
-                }
-                Ok(_) => break,
-                Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "cannot read free space");
-                    break;
-                }
+    pub fn free(&self, path: &Path) -> Option<u64> {
+        match self.source.available(path) {
+            Ok(free) => Some(free),
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "cannot read free space");
+                None
             }
         }
-        if self.paused.swap(false, Ordering::Relaxed) {
-            tracing::info!("resuming downloads: disk space returned");
+    }
+
+    pub fn can_reserve(&self, path: &Path, size: u64) -> bool {
+        self.free(path)
+            .is_some_and(|free| free.checked_sub(size).is_some_and(|left| left > self.floor))
+    }
+
+    pub fn has_room(&self, path: &Path, need: u64) -> bool {
+        self.free(path)
+            .is_none_or(|free| free >= need.saturating_add(self.floor))
+    }
+
+    pub fn admits(&self, path: &Path, credit: u64) -> bool {
+        let Some(free) = self.free(path) else {
+            return true;
+        };
+        let admitted = free.saturating_add(credit) >= self.floor;
+        if admitted {
+            if self.paused.swap(false, Ordering::Relaxed) {
+                tracing::info!("resuming downloads: disk space returned");
+            }
+        } else if !self.paused.swap(true, Ordering::Relaxed) {
+            tracing::warn!(free, floor = self.floor, path = %path.display(), "pausing downloads: low disk space");
         }
+        admitted
     }
 }

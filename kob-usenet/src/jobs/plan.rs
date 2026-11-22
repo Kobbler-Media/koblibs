@@ -4,7 +4,7 @@ use crate::ImportMode;
 use crate::jobs::failure::Failure;
 use crate::jobs::fetch::Fetcher;
 use crate::jobs::store::{Plan, Planned};
-use crate::repair::recovery;
+use crate::repair::recovery::Par2s;
 use crate::vendor::queue::import::{
     self, Error as ImportError, Imported, NameSource, Progress, Rules,
 };
@@ -17,23 +17,39 @@ pub enum Next {
     Fail(Failure),
 }
 
-pub async fn direct(fetcher: &Fetcher, nzb: &Nzb, name: &str, password: Option<&str>) -> Next {
+pub async fn direct(
+    fetcher: &Fetcher,
+    nzb: &Nzb,
+    par2: &Par2s,
+    name: &str,
+    passwords: &[String],
+) -> Next {
     let rules = Rules {
         check_percent: 0,
         concurrency: ImportMode::Download.concurrency(),
         ..Rules::default()
     };
-    let imported = import::import(
-        &fetcher.client,
-        nzb,
-        name,
-        "",
-        &rules,
-        password,
-        Arc::new(Progress::default()),
-        None,
-    )
-    .await;
+    let mut tried = 0;
+    let imported = loop {
+        let password = passwords.get(tried).map(String::as_str);
+        let imported = import::import(
+            &fetcher.client,
+            nzb,
+            name,
+            "",
+            &rules,
+            password,
+            Arc::new(Progress::default()),
+            None,
+        )
+        .await;
+        tried += 1;
+        match &imported {
+            Err(ImportError::Password(_)) if tried < passwords.len() => {}
+            _ => break imported,
+        }
+    };
+    let password = passwords.last().map(String::as_str);
     match imported {
         Ok(Imported::Files { outputs, .. }) if outputs.iter().any(|o| o.meta.encrypted()) => {
             Next::Raw
@@ -59,7 +75,7 @@ pub async fn direct(fetcher: &Fetcher, nzb: &Nzb, name: &str, password: Option<&
             tracing::info!(%reason, "downloading whole volumes to unpack them");
             Next::Raw
         }
-        Err(ImportError::Missing(reason)) if has_par2(nzb) => {
+        Err(ImportError::Missing(reason)) if !par2.is_empty() => {
             tracing::info!(%reason, "downloading whole volumes to repair them");
             Next::Raw
         }
@@ -75,8 +91,4 @@ pub fn password_failure(password: Option<&str>, reason: &str) -> String {
         ),
         Some(_) => format!("Wrong archive password: {reason}"),
     }
-}
-
-pub fn has_par2(nzb: &Nzb) -> bool {
-    recovery::par2_files(nzb).next().is_some()
 }

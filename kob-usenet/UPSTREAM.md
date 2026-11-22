@@ -33,7 +33,7 @@ which drives upstream's database-backed queue service.
 | # | Patch | Source |
 |---|---|---|
 | 1 | Per-operation lanes | SuperFork `0156be60` (lift B) |
-| 2 | `BodyExpectation` geometry checks on BODY | SuperFork `5216d7b2`, `7082ab26` nntp parts (lift D) |
+| 2 | `BodyExpectation` geometry checks on BODY | SuperFork nntp parts only (lift D): `BodyExpectation`, `Tag::expected`, `body_checked` and the check in `run()` come from `5216d7b2`; `body_checked_in_lane` from `7082ab26`. Patch 1's lanes do not use it, so it applies after them |
 | 3 | Corrupt copy stays inconclusive after a provider failure | SuperFork `dcb832f1` test only; upstream already had the logic (lift C) |
 | 4 | Foreground demand, spare-capacity warming, strict warming reads, waiting playback in load | SuperFork `95a9d85a` `e05d42c6` `f7120c54` `d853830e` `7641c95a` + minimal prerequisites from `8284cbb7` `b2724e71` `b2d799bf` (lift A+G) |
 | 5 | Hard stream-first bound | ours: `Lane::STREAM`, background reserve and depth 2 while playback is active |

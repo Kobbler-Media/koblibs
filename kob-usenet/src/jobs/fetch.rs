@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::vendor::nntp::{Body, BodyExpectation, Client, Error, Lane, Workload};
 
+pub const MESSAGE_ID: &str = "message-id";
 const ATTEMPTS: u32 = 4;
 const BACKOFF: Duration = Duration::from_millis(500);
 
@@ -27,7 +28,7 @@ pub fn classify(result: Result<Body, Error>) -> Result<Outcome, Error> {
             Error::CrcMismatch { .. }
             | Error::Yenc(_)
             | Error::TooLarge
-            | Error::InvalidArgument(_),
+            | Error::InvalidArgument(MESSAGE_ID),
         ) => Ok(Outcome::Corrupt),
         Err(error) => Err(error),
     }
@@ -66,6 +67,15 @@ impl Fetcher {
         retry(|| self.once(id, self.lane, BodyExpectation::NONE)).await
     }
 
+    pub async fn first(&self, id: &str, expected: BodyExpectation) -> Result<Outcome, Error> {
+        match retry(|| self.once(id, self.lane, expected)).await? {
+            // An NZB listing more or fewer segments than the post's total has no copy that
+            // matches, as in the import; such a part 1 is taken as listed.
+            Outcome::Missing => self.body(id).await,
+            outcome => Ok(outcome),
+        }
+    }
+
     pub async fn stat(&self, id: &str) -> Result<bool, Error> {
         retry(|| async {
             match self
@@ -74,7 +84,7 @@ impl Fetcher {
                 .await
             {
                 Ok(()) => Ok(true),
-                Err(Error::NotFound | Error::InvalidArgument(_)) => Ok(false),
+                Err(Error::NotFound | Error::InvalidArgument(MESSAGE_ID)) => Ok(false),
                 Err(error) => Err(error),
             }
         })

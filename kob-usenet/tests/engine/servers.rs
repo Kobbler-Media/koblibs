@@ -107,3 +107,27 @@ async fn a_server_whose_retention_the_post_outlived_is_never_asked() {
     assert_eq!(short.body_commands(), 0);
     assert!(long.body_commands() > 0);
 }
+
+#[tokio::test]
+async fn credentials_no_server_could_accept_are_refused_when_providers_are_built() {
+    let fixture = Fixture::season();
+    let nntp = LoopbackServer::start(fixture.articles()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut spaced = server("a", &nntp, 0);
+    spaced.username = "bad user".into();
+    let mut broken = server("a", &nntp, 0);
+    broken.password = "pass\r\nQUIT".into();
+    for bad in [spaced, broken] {
+        let built = kob_usenet::Engine::new(kob_usenet::EngineConfig::new(
+            dir.path().to_path_buf(),
+            vec![bad.clone()],
+        ))
+        .await;
+        assert!(matches!(built, Err(Error::Server { .. })), "{bad:?}");
+        let engine = engine(dir.path(), vec![server("a", &nntp, 0)]).await;
+        assert!(matches!(
+            engine.reconfigure(vec![bad.clone()]),
+            Err(Error::Server { .. })
+        ));
+    }
+}

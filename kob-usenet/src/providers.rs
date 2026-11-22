@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -23,7 +24,13 @@ struct Built {
     server: ServerConfig,
     shape: (usize, usize, Duration),
     pool: Pool,
-    account: Arc<Semaphore>,
+    account: Account,
+}
+
+#[derive(Clone)]
+struct Account {
+    permits: Arc<Semaphore>,
+    owed: Arc<AtomicUsize>,
 }
 
 pub struct Shape {
@@ -75,9 +82,16 @@ impl Accounts {
 
     pub fn build(&self, servers: &[ServerConfig], shape: &Shape) -> Result<Vec<Provider>, Error> {
         let usable = self.usable(servers);
-        let total: usize = usable.iter().map(|s| s.connections).sum();
-        self.downloads.resize((total * shape.pipeline_depth).max(1));
+        for server in &usable {
+            validate(server)?;
+        }
         let first = usable.iter().map(|s| s.priority).min();
+        let total: usize = usable
+            .iter()
+            .filter(|s| Some(s.priority) == first)
+            .map(|s| s.connections)
+            .sum();
+        self.downloads.resize((total * shape.pipeline_depth).max(1));
         let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
         let providers = usable
             .iter()
@@ -115,9 +129,12 @@ impl Accounts {
             }
             Some(built) => {
                 resize(&built.account, built.server.connections, server.connections);
-                Arc::clone(&built.account)
+                built.account.clone()
             }
-            None => Arc::new(Semaphore::new(server.connections)),
+            None => Account {
+                permits: Arc::new(Semaphore::new(server.connections)),
+                owed: Arc::default(),
+            },
         };
         let fail = |source| Error::Server {
             server: server.id.clone(),
@@ -144,7 +161,7 @@ impl Accounts {
             Arc::clone(&self.downloads),
         )
         .map_err(fail)?
-        .with_account(Arc::clone(&account));
+        .with_account(Arc::clone(&account.permits));
         let pool = match server.retention_days {
             Some(days) => pool.with_retention(Duration::from_secs(u64::from(days) * DAY)),
             None => pool,
@@ -174,15 +191,44 @@ fn same_connection(old: &ServerConfig, new: &ServerConfig) -> bool {
     normalized(old) == normalized(new)
 }
 
-fn resize(account: &Arc<Semaphore>, from: usize, to: usize) {
+fn validate(server: &ServerConfig) -> Result<(), Error> {
+    let username = &server.username;
+    let bad_username = !username.is_empty() && !username.bytes().all(|b| b.is_ascii_graphic());
+    let bad_password = server.password.bytes().any(|b| b == b'\r' || b == b'\n');
+    if bad_username || bad_password {
+        return Err(Error::Server {
+            server: server.id.clone(),
+            source: crate::vendor::nntp::Error::InvalidArgument("credentials"),
+        });
+    }
+    Ok(())
+}
+
+fn resize(account: &Account, from: usize, to: usize) {
     if to > from {
-        account.add_permits(to - from);
-    } else if from > to {
-        let account = Arc::clone(account);
-        let drop = u32::try_from(from - to).unwrap_or(u32::MAX);
+        let raise = to - from;
+        let cancelled = account
+            .owed
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |owed| {
+                Some(owed - owed.min(raise))
+            })
+            .map_or(0, |owed| owed.min(raise));
+        account.permits.add_permits(raise - cancelled);
+    } else if from > to && account.owed.fetch_add(from - to, Ordering::AcqRel) == 0 {
+        let account = account.clone();
         tokio::spawn(async move {
-            if let Ok(permits) = account.acquire_many_owned(drop).await {
-                permits.forget();
+            while account.owed.load(Ordering::Acquire) > 0 {
+                let Ok(permit) = account.permits.acquire().await else {
+                    return;
+                };
+                let paid = account
+                    .owed
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |owed| {
+                        owed.checked_sub(1)
+                    });
+                if paid.is_ok() {
+                    permit.forget();
+                }
             }
         });
     }

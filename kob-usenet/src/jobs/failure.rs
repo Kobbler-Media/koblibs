@@ -1,3 +1,4 @@
+use crate::jobs::fetch::MESSAGE_ID;
 use crate::vendor::nntp::Error;
 
 pub enum Failure {
@@ -26,13 +27,13 @@ impl Failure {
     }
 }
 
-const fn content(error: &Error) -> bool {
+fn content(error: &Error) -> bool {
     matches!(
         error,
         Error::NotFound
             | Error::CrcMismatch { .. }
             | Error::Yenc(_)
             | Error::TooLarge
-            | Error::InvalidArgument(_)
+            | Error::InvalidArgument(MESSAGE_ID)
     )
 }

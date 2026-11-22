@@ -48,7 +48,9 @@ async fn an_outage_mid_download_requeues_the_job_and_it_resumes_from_its_bitmap(
     let spec = rig.spec("Show", nzb::of(&[&post]), None);
     let id = spec.id.clone();
     let done_at_outage = {
-        let engine = rig.engine().await;
+        let engine = rig
+            .engine_with(|c| c.download.straggler_after = Duration::from_secs(60))
+            .await;
         engine.add_job(spec).await.unwrap();
         arrived.await.unwrap();
         loop {

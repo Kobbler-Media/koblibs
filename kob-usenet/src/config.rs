@@ -114,6 +114,7 @@ pub struct DownloadConfig {
     pub unrar: PathBuf,
     pub sevenzip: PathBuf,
     pub repair_memory_bytes: usize,
+    pub unpack_stall: Duration,
     pub straggler_after: Duration,
     pub retry_after: Duration,
     pub retry_max: Duration,
@@ -128,7 +129,8 @@ impl Default for DownloadConfig {
             free_space: Arc::new(Statvfs),
             unrar: PathBuf::from("unrar"),
             sevenzip: PathBuf::from("7z"),
-            repair_memory_bytes: 1 << 30,
+            repair_memory_bytes: 256 << 20,
+            unpack_stall: Duration::from_mins(10),
             straggler_after: Duration::from_secs(2),
             retry_after: Duration::from_mins(1),
             retry_max: Duration::from_mins(30),
@@ -145,6 +147,7 @@ impl fmt::Debug for DownloadConfig {
             .field("unrar", &self.unrar)
             .field("sevenzip", &self.sevenzip)
             .field("repair_memory_bytes", &self.repair_memory_bytes)
+            .field("unpack_stall", &self.unpack_stall)
             .field("straggler_after", &self.straggler_after)
             .field("retry_after", &self.retry_after)
             .field("retry_max", &self.retry_max)

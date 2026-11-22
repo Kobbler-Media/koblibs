@@ -7,6 +7,8 @@ use crate::post::Posted;
 
 // `7z a -mx0 -ptest` of `film()`: AES data, plain headers, so no password check at import.
 const FILM_7Z: &[u8] = include_bytes!("../fixtures/Film.2026.7z");
+// `rar a -m0 -ptest` of `film()` and a one-line `Film.2026.en.srt`: AES data, plain headers.
+const FILM_RAR: &[u8] = include_bytes!("../fixtures/Film.2026.rar");
 const AES_RAR4: &[u8] = include_bytes!("../vendor/fixtures/archive/aes-4.rar");
 
 fn film() -> Vec<u8> {
@@ -84,4 +86,17 @@ async fn an_encrypted_member_whose_password_cannot_be_checked_is_not_streamed() 
             "{password}: {release:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn an_encrypted_non_media_output_is_left_out_of_a_stream_release() {
+    let (rig, release) = import(FILM_RAR, "Film.2026.rar", "test").await;
+    let release = release.unwrap();
+    let names: Vec<&str> = release
+        .outputs
+        .iter()
+        .map(|o| o.path.rsplit('/').next().unwrap())
+        .collect();
+    assert_eq!(names, ["Film.2026.mkv"]);
+    served(&rig.engine, &release, "Film.2026.mkv", &film()).await;
 }

@@ -86,8 +86,11 @@ jobs:
         working-directory: kob-usenet
     steps:
       - uses: actions/checkout@v7
-      - name: System build deps (cmake + C++ for rapidyenc)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake g++
+      - name: System build deps (cmake + C++ for rapidyenc, unrar + 7-Zip for extraction tests)
+        run: |
+          sudo add-apt-repository -y multiverse
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake g++ unrar 7zip
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99"
@@ -99,7 +102,9 @@ jobs:
             kob-usenet/fuzz -> target
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo test --no-fail-fast
+        env:
+          KOB_USENET_REQUIRE_TOOLS: "1"
       - name: fuzz targets build
         working-directory: kob-usenet/fuzz
         run: cargo fmt --all -- --check && cargo check

@@ -13,6 +13,7 @@ struct Described<'a> {
 }
 
 pub struct Set {
+    slice: usize,
     id: [u8; 16],
     critical: Vec<u8>,
     inputs: Vec<Vec<u8>>,
@@ -24,6 +25,10 @@ pub fn index(files: &[(&str, &[u8])]) -> Vec<u8> {
 
 impl Set {
     pub fn new(files: &[(&str, &[u8])]) -> Self {
+        Self::sliced(files, SLICE)
+    }
+
+    pub fn sliced(files: &[(&str, &[u8])], slice: usize) -> Self {
         let mut described: Vec<Described<'_>> = files
             .iter()
             .map(|&(name, data)| {
@@ -46,9 +51,9 @@ impl Set {
                 ]
                 .concat();
                 let checksums = data
-                    .chunks(SLICE)
-                    .flat_map(|slice| {
-                        let s = Slice::checksum(SLICE as u64, slice).unwrap();
+                    .chunks(slice)
+                    .flat_map(|piece| {
+                        let s = Slice::checksum(slice as u64, piece).unwrap();
                         [s.md5.as_slice(), &s.crc32.to_le_bytes()].concat()
                     })
                     .collect::<Vec<u8>>();
@@ -63,7 +68,7 @@ impl Set {
         described.sort_by_key(|d| d.id);
         let ids: Vec<u8> = described.iter().flat_map(|d| d.id).collect();
         let main = [
-            (SLICE as u64).to_le_bytes().as_slice(),
+            (slice as u64).to_le_bytes().as_slice(),
             &u32::try_from(described.len()).unwrap().to_le_bytes(),
             &ids,
         ]
@@ -76,14 +81,15 @@ impl Set {
         }
         let inputs = described
             .iter()
-            .flat_map(|d| d.data.chunks(SLICE))
-            .map(|slice| {
-                let mut padded = slice.to_vec();
-                padded.resize(SLICE, 0);
+            .flat_map(|d| d.data.chunks(slice))
+            .map(|piece| {
+                let mut padded = piece.to_vec();
+                padded.resize(slice, 0);
                 padded
             })
             .collect();
         Self {
+            slice,
             id,
             critical,
             inputs,
@@ -109,7 +115,7 @@ impl Set {
     }
 
     fn recovery(&self, exponent: u32) -> Vec<u8> {
-        let mut row = vec![0u16; SLICE / 2];
+        let mut row = vec![0u16; self.slice / 2];
         for (input, data) in self.inputs.iter().enumerate() {
             let factor = GF.pow(GF.constants[input], exponent);
             for (word, pair) in row.iter_mut().zip(data.chunks(2)) {

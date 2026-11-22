@@ -3,6 +3,7 @@
 mod clean;
 mod compressed;
 mod durable;
+mod firsts;
 mod hedge;
 mod hopeless;
 mod nested;
@@ -21,8 +22,12 @@ mod post;
 #[allow(dead_code)]
 #[path = "../common/rar.rs"]
 mod rar;
+mod recovery;
 mod remove;
 mod repair;
 mod restart;
+mod resume;
 mod space;
+mod staging;
 mod support;
+mod unpack;

@@ -19,6 +19,7 @@ pub const DRAIN: Duration = Duration::from_millis(500);
 pub struct Loaded {
     pub fixture: Fixture,
     pub nntp: LoopbackServer,
+    backup: Option<LoopbackServer>,
     library: Vec<u8>,
     _dir: tempfile::TempDir,
     dest: tempfile::TempDir,
@@ -47,10 +48,33 @@ impl Loaded {
         Self {
             fixture,
             nntp,
+            backup: None,
             library,
             _dir: tempfile::tempdir().unwrap(),
             dest: tempfile::tempdir().unwrap(),
         }
+    }
+
+    pub async fn with_backup(mut self) -> Self {
+        let mut articles = self.fixture.articles();
+        articles.extend(post("lib", "Library.2026.mkv", &self.library, ARTICLE));
+        self.backup = Some(LoopbackServer::start(articles).await.unwrap());
+        self
+    }
+
+    pub fn backup_bodies(&self) -> usize {
+        self.backup
+            .as_ref()
+            .map_or(0, LoopbackServer::body_commands)
+    }
+
+    fn servers(&self, connections: usize) -> Vec<ServerConfig> {
+        let mut servers = vec![self.server(connections)];
+        servers.extend(self.backup.as_ref().map(|backup| ServerConfig {
+            connections: 32,
+            ..server("backup", backup, 99)
+        }));
+        servers
     }
 
     pub fn server(&self, connections: usize) -> ServerConfig {
@@ -65,14 +89,12 @@ impl Loaded {
     }
 
     pub async fn engine_with(&self, connections: usize) -> Engine {
-        engine(self._dir.path(), vec![self.server(connections)]).await
+        engine(self._dir.path(), self.servers(connections)).await
     }
 
     pub async fn engine_reading_ahead(&self, connections: usize, read_ahead: u64) -> Engine {
-        let mut config = EngineConfig::new(
-            self._dir.path().to_path_buf(),
-            vec![self.server(connections)],
-        );
+        let mut config =
+            EngineConfig::new(self._dir.path().to_path_buf(), self.servers(connections));
         config.read_ahead_bytes = read_ahead;
         Engine::new(config).await.unwrap()
     }
@@ -96,6 +118,23 @@ impl Loaded {
     }
 
     pub async fn start_download(&self, engine: &Engine) {
+        self.start_downloads(engine, 1).await;
+    }
+
+    pub async fn start_downloads(&self, engine: &Engine, count: usize) {
+        for n in 1..count {
+            engine
+                .add_job(JobSpec {
+                    id: format!("library-{n}"),
+                    name: format!("Library.2026.{n}"),
+                    category: "movies".into(),
+                    nzb: self.library_nzb(),
+                    password: None,
+                    dest_dir: self.dest.path().to_path_buf(),
+                })
+                .await
+                .unwrap();
+        }
         engine
             .add_job(JobSpec {
                 id: "library".into(),

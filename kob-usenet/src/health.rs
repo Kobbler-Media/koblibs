@@ -21,12 +21,15 @@ pub async fn sample(
     client: &Arc<Client>,
     layout: &Layout,
     percent: u8,
+    output: Option<usize>,
 ) -> Result<HealthSample, Error> {
     let mut seen = HashSet::new();
     let ids: Vec<String> = layout
         .outputs
         .iter()
-        .flat_map(|(_, meta)| ids(meta))
+        .enumerate()
+        .filter(|(i, _)| output.is_none_or(|o| o == *i))
+        .flat_map(|(_, (_, meta))| ids(meta))
         .filter(|id| !id.is_empty() && seen.insert(*id))
         .map(str::to_owned)
         .collect();

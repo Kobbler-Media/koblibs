@@ -1,5 +1,6 @@
 mod check;
 pub(crate) mod recovery;
+mod spool;
 
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
@@ -10,9 +11,11 @@ use std::path::{Path, PathBuf};
 
 use crate::jobs::fetch::Fetcher;
 use crate::vendor::nntp;
-use crate::vendor::par2::{self, Id, Reader, Repair};
+use crate::vendor::par2::{self, Id, Reader, Recovery, Repair};
 use crate::vendor::queue::nzb::Nzb;
 pub use check::{damaged_slices, proof_damage};
+use recovery::Par2s;
+pub use spool::Spool;
 
 const DEPENDENT_ROWS: usize = 3;
 
@@ -34,6 +37,14 @@ pub enum RepairError {
     Dependent,
     #[error("PAR2 repair failed: {0}")]
     Failed(String),
+    #[error(
+        "repairing {need} slices needs {required} bytes of memory, over the {limit} byte budget"
+    )]
+    Memory {
+        need: usize,
+        required: usize,
+        limit: usize,
+    },
     #[error("PAR2 repair: {0}")]
     Io(#[from] io::Error),
     #[error("providers unavailable: {0}")]
@@ -44,6 +55,11 @@ impl From<par2::Error> for RepairError {
     fn from(error: par2::Error) -> Self {
         match error {
             par2::Error::InsufficientRecovery => Self::Dependent,
+            par2::Error::Memory { required, limit } => Self::Memory {
+                need: 0,
+                required,
+                limit,
+            },
             other => Self::Failed(other.to_string()),
         }
     }
@@ -60,41 +76,72 @@ struct Source {
 pub async fn repair(
     fetcher: &Fetcher,
     nzb: &Nzb,
+    par2: &Par2s,
     files: &[OnDisk],
     staging: &Path,
     absent_ok: bool,
     memory: usize,
 ) -> Result<usize, RepairError> {
-    let mut reader = recovery::index(fetcher, nzb)
+    let mut collected = par2
+        .index(fetcher, nzb, Spool::on_disk(staging)?)
         .await?
         .ok_or(RepairError::NoPar2)?;
-    let (set, slice_size, sources) = sources(&reader, files, staging, absent_ok)?;
+    let (set, slice_size, sources) =
+        sources(collected.spool().critical(), files, staging, absent_ok)?;
     let (missing, sources) = blocking(move || missing_slices(slice_size, sources)).await??;
     if missing.is_empty() {
         return Ok(0);
     }
-    let volumes = recovery::volumes(nzb, slice_size);
+    let loaded = missing.len().saturating_mul(slice_size + spool::HEADER + 4);
+    if loaded > memory / 2 {
+        return Err(RepairError::Memory {
+            need: missing.len(),
+            required: loaded.saturating_mul(2),
+            limit: memory,
+        });
+    }
+    let volumes = par2.volumes(nzb, slice_size);
     let mut need = missing.len();
     loop {
-        let have = recovery::fetch(fetcher, &mut reader, &volumes, set, slice_size, need).await?;
+        let have = collected
+            .fetch(fetcher, &volumes, set, slice_size, need)
+            .await?;
         if have < need {
             return Err(RepairError::Insufficient {
                 need: missing.len(),
                 have,
             });
         }
+        let packets = collected.spool().load(set, slice_size, need)?;
+        let workspace = memory.saturating_sub(loaded);
         let (back, solved) = {
             let (missing, sources) = (missing.clone(), sources.clone());
             blocking(move || {
-                let solved = solve(&reader, set, &missing, &sources, memory);
-                (reader, solved)
+                let solved = solve(
+                    collected.spool().critical(),
+                    set,
+                    &packets,
+                    &missing,
+                    &sources,
+                    workspace,
+                );
+                (collected, solved)
             })
             .await?
         };
-        reader = back;
+        collected = back;
         match solved {
             Err(RepairError::Dependent) if need < missing.len() + DEPENDENT_ROWS => {
                 need += 1;
+            }
+            Err(RepairError::Memory {
+                required, limit, ..
+            }) => {
+                return Err(RepairError::Memory {
+                    need: missing.len(),
+                    required,
+                    limit,
+                });
             }
             Err(error) => return Err(error),
             Ok(()) => return Ok(missing.len()),
@@ -173,11 +220,16 @@ fn missing_slices(
 fn solve(
     reader: &Reader,
     set: Id,
+    packets: &[Vec<u8>],
     missing: &[usize],
     sources: &[Source],
     memory: usize,
 ) -> Result<(), RepairError> {
     let plan = reader.repair_set(set)?;
+    let recovery = packets
+        .iter()
+        .map(|p| Recovery::read(p, set, plan.slice_size()))
+        .collect::<Result<Vec<_>, _>>()?;
     let inputs = plan
         .inputs()
         .ok_or_else(|| RepairError::Failed("slice checksums are incomplete".to_owned()))?;
@@ -185,7 +237,7 @@ fn solve(
         plan.slice_size(),
         inputs,
         missing,
-        plan.recovery(),
+        &recovery,
         memory,
         || false,
     )?;

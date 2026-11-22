@@ -1,3 +1,4 @@
+mod admission;
 mod locks;
 mod maintenance;
 mod providers;
@@ -5,7 +6,6 @@ mod providers;
 use std::sync::Arc;
 
 use quick_cache::sync::Cache;
-use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::config::{EngineConfig, ServerConfig};
@@ -17,20 +17,20 @@ use crate::reader::OutputReader;
 use crate::release::{OutputInfo, Release, ReleaseKey};
 use crate::store::{Layout, Store};
 use crate::vendor::nntp::ProviderStats;
-use crate::vendor::queue::import::{Imported, Progress, Rules, import};
+use crate::vendor::queue::import::{Error as ImportError, Imported, Progress, Rules, import};
 use crate::vendor::queue::nzb;
 use crate::{Error, ImportMode, Purpose, verify};
+use admission::Admission;
 use locks::KeyedLocks;
 use providers::Providers;
 
 const LAYOUTS: usize = 512;
-const IMPORTS: usize = 4;
 
 pub struct Engine {
     providers: Arc<Providers>,
     flights: Flights,
     layouts: Cache<ReleaseKey, Arc<Layout>>,
-    imports: Semaphore,
+    imports: Admission,
     importing: KeyedLocks,
     maintenance: JoinHandle<()>,
     jobs: Jobs,
@@ -67,7 +67,7 @@ impl Engine {
                 config.read_budget_bytes,
             ),
             layouts: Cache::new(LAYOUTS),
-            imports: Semaphore::new(IMPORTS),
+            imports: Admission::default(),
             importing: KeyedLocks::default(),
             maintenance,
             jobs,
@@ -128,7 +128,7 @@ impl Engine {
         };
         let password = password.or_else(|| parsed.meta("password").next());
         let imported = {
-            let _slot = self.imports.acquire().await;
+            let _slot = self.imports.enter(mode).await;
             import(
                 &self.providers.client,
                 &parsed,
@@ -150,13 +150,32 @@ impl Engine {
             .map(|o| (o.path.join("/"), o.meta))
             .collect();
         outputs.sort_by(|a, b| a.0.cmp(&b.0));
-        let layout = Layout { posted, outputs };
-        for (path, meta) in layout.outputs.iter().filter(|(_, m)| m.encrypted()) {
+        let mut kept = Vec::with_capacity(outputs.len());
+        let mut dropped = None;
+        for (path, meta) in outputs {
+            if !meta.encrypted() {
+                kept.push((path, meta));
+                continue;
+            }
             let reader = self
                 .flights
-                .reader(&self.providers.client, meta, Purpose::Cache)?;
-            verify::decrypted(path, reader, meta.size()).await?;
+                .reader(&self.providers.client, &meta, Purpose::Cache)?;
+            match verify::decrypted(&path, reader, meta.size()).await {
+                Ok(()) => kept.push((path, meta)),
+                Err(Error::Import(ImportError::Unsupported(reason))) => {
+                    tracing::info!(%path, "dropping an encrypted non-media output from a stream release");
+                    dropped = Some(reason);
+                }
+                Err(error) => return Err(error),
+            }
         }
+        if let (true, Some(reason)) = (kept.is_empty(), dropped) {
+            return Err(Error::Import(ImportError::Unsupported(reason)));
+        }
+        let layout = Layout {
+            posted,
+            outputs: kept,
+        };
         store.put_layout(&key, &layout)?;
         let release = describe(&key, &layout);
         self.layouts.insert(key, Arc::new(layout));
@@ -196,11 +215,20 @@ impl Engine {
         &self,
         key: &ReleaseKey,
         percent: u8,
+        output: Option<usize>,
     ) -> Result<HealthSample, Error> {
         let layout = self
             .layout(key)?
             .ok_or_else(|| Error::UnknownRelease(key.clone()))?;
-        health::sample(&self.providers.client, &layout, percent).await
+        if let Some(index) = output
+            && index >= layout.outputs.len()
+        {
+            return Err(Error::UnknownOutput {
+                key: key.clone(),
+                index,
+            });
+        }
+        health::sample(&self.providers.client, &layout, percent, output).await
     }
 
     pub async fn add_job(&self, spec: JobSpec) -> Result<JobStatus, Error> {
@@ -237,6 +265,7 @@ impl Engine {
 
     fn layout(&self, key: &ReleaseKey) -> Result<Option<Arc<Layout>>, Error> {
         if let Some(layout) = self.layouts.get(key) {
+            self.providers.store.used_layout(key);
             return Ok(Some(layout));
         }
         let Some(layout) = self.providers.store.layout(key)?.map(Arc::new) else {

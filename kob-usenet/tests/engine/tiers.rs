@@ -72,13 +72,15 @@ async fn a_primary_that_is_down_or_stalled_never_spends_the_backup() {
             import(&engine, &fixture.standard_nzb(), None).await
         };
         let primary = match scenario {
-            Primary::Stalled => {
-                LoopbackServer::start_stalling(fixture.articles(), 0, Duration::from_secs(10)).await
-            }
             Primary::Lacks => LoopbackServer::start(fixture.without(&lacked)).await,
             _ => LoopbackServer::start(fixture.articles()).await,
         }
         .unwrap();
+        if scenario == Primary::Stalled {
+            for article in fixture.articles() {
+                primary.stall_article(&article.message_id, usize::MAX, Duration::from_secs(10));
+            }
+        }
         if matches!(scenario, Primary::Refused | Primary::ReconfiguredToRefused) {
             primary.refuse().await;
         }

@@ -3,13 +3,14 @@ use crate::vendor::nntp::Workload;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportMode {
     Stream,
+    Prewarm,
     Download,
 }
 
 impl ImportMode {
     pub(crate) const fn check_percent(self) -> u8 {
         match self {
-            Self::Stream => 0,
+            Self::Stream | Self::Prewarm => 0,
             Self::Download => 5,
         }
     }
@@ -17,6 +18,7 @@ impl ImportMode {
     pub(crate) const fn workload(self) -> Workload {
         match self {
             Self::Stream => Workload::Cache,
+            Self::Prewarm => Workload::Warm,
             Self::Download => Workload::Queue,
         }
     }
@@ -24,7 +26,7 @@ impl ImportMode {
     pub(crate) const fn concurrency(self) -> usize {
         match self {
             Self::Stream => 48,
-            Self::Download => 16,
+            Self::Prewarm | Self::Download => 16,
         }
     }
 }

@@ -127,6 +127,10 @@ impl Store {
         }
     }
 
+    pub fn used_layout(&self, key: &ReleaseKey) {
+        files::touch(&self.layout_path(key));
+    }
+
     pub fn put_layout(&self, key: &ReleaseKey, layout: &Layout) -> Result<(), Error> {
         let outputs = layout
             .outputs

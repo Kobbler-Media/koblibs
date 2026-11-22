@@ -42,6 +42,7 @@ async fn the_nzb_password_then_the_job_password_unlock_the_archive_for_the_exter
         (Some("test"), None),
         (None, Some("test")),
         (Some("test"), Some("wrong")),
+        (Some("wrong"), Some("test")),
     ] {
         let rar = posted(FILES_ONLY);
         let rig = Rig::new(rar.articles.clone()).await;

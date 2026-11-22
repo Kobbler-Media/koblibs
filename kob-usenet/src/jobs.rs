@@ -1,9 +1,11 @@
-mod failure;
+pub(crate) mod failure;
 pub(crate) mod fetch;
+mod finish;
 mod plan;
 mod probe;
 mod raw;
 mod run;
+mod settle;
 mod store;
 
 use std::collections::HashMap;
@@ -168,19 +170,17 @@ impl Jobs {
     }
 
     pub fn add(&self, spec: JobSpec) -> Result<JobStatus, Error> {
-        let seq = {
-            let status = self
-                .shared
-                .status
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if status.contains_key(&spec.id) {
-                return Err(Error::DuplicateJob(spec.id));
-            }
-            status.values().map(|(seq, _)| seq + 1).max().unwrap_or(0)
-        };
+        let mut status = self
+            .shared
+            .status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if status.contains_key(&spec.id) {
+            return Err(Error::DuplicateJob(spec.id));
+        }
+        let seq = status.values().map(|(seq, _)| seq + 1).max().unwrap_or(0);
         let stored = StoredSpec::new(seq, &spec);
-        let status = JobStatus {
+        let created = JobStatus {
             id: spec.id.clone(),
             name: spec.name.clone(),
             category: spec.category.clone(),
@@ -193,14 +193,11 @@ impl Jobs {
             failure: None,
             path: stored.staging(),
         };
-        self.shared.store.create(&stored, &spec.nzb, &status)?;
-        self.shared
-            .status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(spec.id, (seq, status.clone()));
+        self.shared.store.create(&stored, &spec.nzb, &created)?;
+        status.insert(spec.id, (seq, created.clone()));
+        drop(status);
         self.spawn(stored);
-        Ok(status)
+        Ok(created)
     }
 
     pub fn list(&self) -> Vec<JobStatus> {
@@ -239,11 +236,9 @@ impl Jobs {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(id);
-        if delete_files {
-            remove_dir(&spec.staging())?;
-            if status.state == JobState::Completed {
-                remove_dir(&status.path)?;
-            }
+        remove_dir(&spec.staging())?;
+        if delete_files && status.state == JobState::Completed {
+            remove_dir(&status.path)?;
         }
         Ok(())
     }
@@ -255,29 +250,40 @@ impl Jobs {
     fn spawn(&self, spec: StoredSpec) {
         let shared = Arc::clone(&self.shared);
         let id = spec.id.clone();
-        let task = tokio::spawn(async move {
-            let mut wait = shared.config.retry_after;
-            for attempt in 1.. {
-                let Ok(slot) = Arc::clone(&shared.slots).acquire_owned().await else {
-                    return;
-                };
-                let last_try = attempt >= shared.config.retry_attempts.max(1);
-                if matches!(
-                    run::run(&shared, &spec, last_try).await,
-                    run::Ended::Finished
-                ) {
-                    return;
-                }
-                drop(slot);
-                tokio::time::sleep(wait).await;
-                wait = (wait * 2).min(shared.config.retry_max);
-            }
-        });
-        self.shared
+        let mut tasks = self
+            .shared
             .tasks
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, task);
+            .unwrap_or_else(PoisonError::into_inner);
+        let task = tokio::spawn(async move {
+            work(&shared, &spec).await;
+            let mut tasks = shared.tasks.lock().unwrap_or_else(PoisonError::into_inner);
+            if tasks
+                .get(&spec.id)
+                .is_some_and(|t| t.id() == tokio::task::id())
+            {
+                tasks.remove(&spec.id);
+            }
+        });
+        tasks.insert(id, task);
+    }
+}
+
+async fn work(shared: &Shared, spec: &StoredSpec) {
+    {
+        let mut wait = shared.config.retry_after;
+        for attempt in 1.. {
+            let Ok(slot) = Arc::clone(&shared.slots).acquire_owned().await else {
+                return;
+            };
+            let last_try = attempt >= shared.config.retry_attempts.max(1);
+            if matches!(run::run(shared, spec, last_try).await, run::Ended::Finished) {
+                return;
+            }
+            drop(slot);
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(shared.config.retry_max);
+        }
     }
 }
 

@@ -7,6 +7,7 @@ mod import;
 mod jobs;
 mod range;
 mod reconfigure;
+mod records;
 mod release_key;
 mod restart;
 mod servers;

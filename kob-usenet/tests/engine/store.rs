@@ -141,6 +141,31 @@ async fn the_release_cache_keeps_the_newest_layouts_within_its_cap() {
 }
 
 #[tokio::test]
+async fn a_layout_in_use_is_never_evicted_from_the_release_cache() {
+    let fixture = Fixture::season();
+    let nntp = LoopbackServer::start(fixture.articles()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path(), vec![server("a", &nntp, 0)]);
+    config.release_cache_bytes = 1;
+    config.maintenance_interval = Duration::from_secs(3600);
+    let engine = Engine::new(config.clone()).await.unwrap();
+    let active = import(&engine, &fixture.nzb(&[0], quoted, POSTED), None).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let idle = import(&engine, &fixture.nzb(&[1], quoted, POSTED), None).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    engine
+        .open(&active.key, 0, kob_usenet::Purpose::Play)
+        .unwrap();
+    drop(engine);
+
+    config.maintenance_interval = Duration::from_millis(50);
+    let _sweeping = Engine::new(config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(release_file(dir.path(), &active.key).exists());
+    assert!(!release_file(dir.path(), &idle.key).exists());
+}
+
+#[tokio::test]
 async fn warm_connections_are_kept_on_the_first_level_only() {
     let fixture = Fixture::season();
     let primary = LoopbackServer::start(fixture.articles()).await.unwrap();

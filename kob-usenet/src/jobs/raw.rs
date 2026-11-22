@@ -5,8 +5,10 @@ use futures_util::{StreamExt, stream};
 use crate::jobs::failure::Failure;
 use crate::jobs::fetch::{Fetcher, Outcome};
 use crate::jobs::store::{Plan, Planned};
-use crate::repair::recovery;
+use crate::repair::Spool;
+use crate::repair::recovery::Par2s;
 use crate::vendor::core::{FileMeta, NzbFile, Par2Proof, Segment, Segments};
+use crate::vendor::nntp::BodyExpectation;
 use crate::vendor::par2::{self, hash_16k};
 use crate::vendor::queue::names::{self, Kind};
 use crate::vendor::queue::nzb::{File, Nzb};
@@ -18,19 +20,33 @@ struct Geometry {
     size: u64,
 }
 
-pub async fn raw(fetcher: &Fetcher, nzb: &Nzb) -> Result<Plan, Failure> {
-    let index = recovery::index(fetcher, nzb)
+pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Failure> {
+    let index = par2
+        .index(fetcher, nzb, Spool::default())
         .await
         .map_err(|e| Failure::providers(&e))?;
-    let described = index.map(|r| r.index());
+    let described = index.map(|r| r.spool().critical().index());
     let slice_size = described.as_ref().map_or(0, |i| i.slice_size);
     let described: Vec<&par2::File> = described.iter().flat_map(|i| &i.files).collect();
     let data: Vec<&File> = nzb
         .files
         .iter()
-        .filter(|f| names::classify(f.name()) != Kind::Par2)
+        .enumerate()
+        .filter(|&(i, f)| !par2.contains(i) && names::classify(f.name()) != Kind::Par2)
+        .map(|(_, f)| f)
         .collect();
-    let firsts = bodies(fetcher, data.iter().map(|f| f.segments[0].id.clone())).await?;
+    let firsts = bodies(
+        fetcher,
+        data.iter().map(|f| {
+            let expected = BodyExpectation {
+                part: Some(1),
+                total: u32::try_from(f.segments.len()).ok(),
+                ..BodyExpectation::at(Some(0))
+            };
+            (f.segments[0].id.clone(), Some(expected))
+        }),
+    )
+    .await?;
     let mut claimed = HashSet::new();
     let mut found: Vec<Option<(Geometry, Option<&par2::File>)>> = Vec::new();
     for (file, first) in data.iter().zip(&firsts) {
@@ -58,7 +74,7 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb) -> Result<Plan, Failure> {
         data.iter()
             .zip(&firsts)
             .filter(|(f, first)| first.is_none() && f.segments.len() > 1)
-            .map(|(f, _)| f.segments[1].id.clone()),
+            .map(|(f, _)| (f.segments[1].id.clone(), None)),
     )
     .await?;
     let mut seconds = seconds.into_iter();
@@ -108,12 +124,17 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb) -> Result<Plan, Failure> {
 
 async fn bodies(
     fetcher: &Fetcher,
-    ids: impl Iterator<Item = String>,
+    ids: impl Iterator<Item = (String, Option<BodyExpectation>)>,
 ) -> Result<Vec<Option<crate::vendor::nntp::Body>>, Failure> {
     let requests: Vec<_> = ids
-        .map(|id| {
+        .map(|(id, expected)| {
             let fetcher = fetcher.clone();
-            async move { fetcher.body(&id).await }
+            async move {
+                match expected {
+                    Some(expected) => fetcher.first(&id, expected).await,
+                    None => fetcher.body(&id).await,
+                }
+            }
         })
         .collect();
     let answers: Vec<_> = stream::iter(requests).buffered(FIRSTS).collect().await;

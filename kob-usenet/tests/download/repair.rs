@@ -13,11 +13,21 @@ pub struct Protected {
 
 impl Protected {
     pub fn new(files: Vec<Posted>, set_name: &str, volumes: &[(u32, u32)]) -> Self {
-        let set = Set::new(
+        Self::sliced(files, set_name, volumes, par2::SLICE)
+    }
+
+    pub fn sliced(
+        files: Vec<Posted>,
+        set_name: &str,
+        volumes: &[(u32, u32)],
+        slice: usize,
+    ) -> Self {
+        let set = Set::sliced(
             &files
                 .iter()
                 .map(|f| (f.name.as_str(), f.data.as_slice()))
                 .collect::<Vec<_>>(),
+            slice,
         );
         let index = Posted::new("idx", &format!("{set_name}.par2"), set.index());
         let volumes = volumes

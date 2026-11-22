@@ -12,8 +12,9 @@ use crate::store::{sweep_tmp, write_atomic};
 use crate::vendor::core::{FileMeta, blob};
 use crate::vendor::queue::names;
 
-const PLAN_VERSION: u16 = 1;
+const RECORD_VERSION: u16 = 1;
 const STAGING: &str = ".incomplete";
+const QUARANTINE: &str = ".quarantine";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StoredSpec {
@@ -43,8 +44,19 @@ impl StoredSpec {
     }
 
     pub fn staging(&self) -> PathBuf {
-        self.dest_dir.join(STAGING).join(&self.folder)
+        let id = &hex(&Sha256::digest(self.id.as_bytes()))[..12];
+        self.dest_dir
+            .join(STAGING)
+            .join(format!("{}.{id}", self.folder))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Phase {
+    Downloading,
+    Downloaded,
+    Unpacking { extracted: Vec<String> },
+    Moving(PathBuf),
 }
 
 #[derive(Clone, Debug)]
@@ -64,7 +76,6 @@ pub struct Plan {
 
 #[derive(Serialize, Deserialize)]
 struct StoredPlan {
-    version: u16,
     raw: bool,
     probed: bool,
     outputs: Vec<(String, Vec<u8>, Option<u32>, bool)>,
@@ -97,7 +108,7 @@ impl JobStore {
         let mut jobs = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let dir = entry?.path();
-            if !dir.is_dir() {
+            if !dir.is_dir() || dir.file_name().is_some_and(|n| n == QUARANTINE) {
                 continue;
             }
             sweep_tmp(&dir)?;
@@ -106,9 +117,24 @@ impl JobStore {
                 tracing::warn!(dir = %dir.display(), "skipping an incomplete job record");
                 continue;
             };
-            jobs.push((decode(&spec)?, decode(&status)?));
+            match (decode(&spec), decode(&status)) {
+                (Ok(spec), Ok(status)) => jobs.push((spec, status)),
+                (Err(error), _) | (_, Err(error)) => self.quarantine(&dir, &error)?,
+            }
         }
         Ok(jobs)
+    }
+
+    fn quarantine(&self, dir: &Path, error: &Error) -> io::Result<()> {
+        let aside = self.root.join(QUARANTINE);
+        fs::create_dir_all(&aside)?;
+        let to = aside.join(dir.file_name().unwrap_or_default());
+        if to.exists() {
+            fs::remove_dir_all(&to)?;
+        }
+        fs::rename(dir, &to)?;
+        tracing::error!(%error, record = %to.display(), "moved an unreadable job record aside");
+        Ok(())
     }
 
     pub fn spec(&self, id: &str) -> Result<StoredSpec, Error> {
@@ -137,12 +163,6 @@ impl JobStore {
             Err(e) => return Err(e.into()),
         };
         let stored: StoredPlan = decode(&bytes)?;
-        if stored.version != PLAN_VERSION {
-            return Err(Error::Stored(format!(
-                "job plan version {}",
-                stored.version
-            )));
-        }
         let outputs = stored
             .outputs
             .into_iter()
@@ -178,12 +198,23 @@ impl JobStore {
             .collect::<Result<_, blob::Error>>()
             .map_err(|e| Error::Stored(e.to_string()))?;
         let stored = StoredPlan {
-            version: PLAN_VERSION,
             raw: plan.raw,
             probed: plan.probed,
             outputs,
         };
         Ok(write_atomic(&self.dir(id).join("plan"), &encode(&stored)?)?)
+    }
+
+    pub fn phase(&self, id: &str) -> Result<Phase, Error> {
+        match fs::read(self.dir(id).join("phase")) {
+            Ok(bytes) => decode(&bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Phase::Downloading),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn put_phase(&self, id: &str, phase: &Phase) -> Result<(), Error> {
+        Ok(write_atomic(&self.dir(id).join("phase"), &encode(phase)?)?)
     }
 
     pub fn map(&self, id: &str, output: usize) -> PathBuf {
@@ -210,9 +241,14 @@ impl JobStore {
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
-    postcard::to_stdvec(value).map_err(|e| Error::Stored(e.to_string()))
+    postcard::to_stdvec(&(RECORD_VERSION, value)).map_err(|e| Error::Stored(e.to_string()))
 }
 
 fn decode<T: for<'a> Deserialize<'a>>(bytes: &[u8]) -> Result<T, Error> {
-    postcard::from_bytes(bytes).map_err(|e| Error::Stored(e.to_string()))
+    let (version, rest): (u16, _) =
+        postcard::take_from_bytes(bytes).map_err(|e| Error::Stored(e.to_string()))?;
+    if version != RECORD_VERSION {
+        return Err(Error::Stored(format!("job record version {version}")));
+    }
+    postcard::from_bytes(rest).map_err(|e| Error::Stored(e.to_string()))
 }

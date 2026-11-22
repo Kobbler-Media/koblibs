@@ -6,7 +6,7 @@ use crate::post::{ARTICLE, Posted, noise, video};
 use crate::repair::Protected;
 use crate::support::{Rig, assert_file, completed, crc_of, extractor_on_path, finish, listing};
 
-fn hash(name: &str) -> String {
+pub fn hash(name: &str) -> String {
     format!("{:032x}", u128::from_be_bytes(Md5::digest(name).into()))
 }
 
