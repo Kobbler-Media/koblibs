@@ -211,6 +211,15 @@ pub struct StreamResolveRequest {
     pub release_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
+    /// The episode being played, so a pack resolves to that episode's file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode: Option<StreamEpisode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamEpisode {
+    pub season: i32,
+    pub episode: i32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +259,9 @@ pub struct StreamResolveResponse {
     /// A second URL to the same bytes for background cache-ahead, served below playback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_url: Option<String>,
+    /// The file within the release that was resolved, when the release holds several.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<i32>,
 }
 
 fn default_cached() -> bool {
@@ -321,6 +333,18 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.release_key.as_deref(), Some("nzb-ab"));
         assert_eq!(resolved.cache_url.as_deref(), Some("c"));
+        assert_eq!(resolved.file_id, None);
+        let request: StreamResolveRequest = serde_json::from_value(serde_json::json!({
+            "debrid_provider_id": Uuid::nil(), "episode": { "season": 1, "episode": 5 }
+        }))
+        .unwrap();
+        assert_eq!(
+            request.episode,
+            Some(crate::StreamEpisode {
+                season: 1,
+                episode: 5
+            })
+        );
     }
 
     #[test]
