@@ -20,8 +20,10 @@
 //! Metadata versions: 1 = no encryption; 2 = adds [`MultipartFile::crypt`]; 3 = v2 layout
 //! whose segments may have an empty id (an article the NZB never listed), so older readers
 //! refuse it instead of asking providers for ""; 4 = (v2 metadata, recovery-set IDs), with
-//! one optional ID per source file/volume. Writers emit the lowest version that holds
-//! the data, so files without newer features stay readable by older readers.
+//! one optional ID per source file/volume; 5 = (v4, posted sizes), with one
+//! [`Segments::posted_size`](crate::vendor::core::Segments::posted_size) per source file/volume. Writers
+//! emit the lowest version that holds the data, so files without newer features stay
+//! readable by older readers.
 
 use serde::{Deserialize, Serialize};
 use std::io::Read as _;
@@ -31,7 +33,7 @@ use crate::vendor::core::{FileMeta, FilePart, MultipartFile, NzbFile};
 const MAGIC: &[u8; 3] = b"IDB";
 const HEADER_LEN: usize = 6;
 /// Current metadata layout.
-pub const META_VERSION: u16 = 4;
+pub const META_VERSION: u16 = 5;
 /// Current NZB layout.
 pub const NZB_VERSION: u16 = 1;
 const ZSTD_LEVEL: i32 = 3;
@@ -59,6 +61,8 @@ pub enum Error {
     Payload(#[from] postcard::Error),
     #[error("metadata recovery-set IDs do not match its proofs")]
     RecoverySets,
+    #[error("metadata posted sizes do not match its files")]
+    PostedSizes,
     #[error("decompressed blob exceeds its {0}-byte allowance")]
     Limit(usize),
 }
@@ -123,6 +127,13 @@ pub fn encode_meta(meta: &FileMeta) -> Result<Vec<u8>, Error> {
             .map(|p| p.proof.as_ref().and_then(|p| p.set_id))
             .collect(),
     };
+    let posted: Vec<_> = match meta {
+        FileMeta::Nzb(file) => vec![file.segments.posted_size],
+        FileMeta::Multipart(file) => file.parts.iter().map(|p| p.segments.posted_size).collect(),
+    };
+    if posted.iter().any(Option::is_some) {
+        return encode(Kind::Meta, 5, &postcard::to_stdvec(&(meta, sets, posted))?);
+    }
     if sets.iter().any(Option::is_some) {
         return encode(Kind::Meta, 4, &postcard::to_stdvec(&(meta, sets))?);
     }
@@ -160,19 +171,24 @@ pub fn decode_meta_limited(bytes: &[u8], limit: usize) -> Result<FileMeta, Error
         4 => {
             let (mut meta, sets): (FileMeta, Vec<Option<[u8; 16]>>) =
                 postcard::from_bytes(&payload)?;
-            let proofs: Vec<_> = match &mut meta {
-                FileMeta::Nzb(file) => vec![&mut file.proof],
-                FileMeta::Multipart(file) => file.parts.iter_mut().map(|p| &mut p.proof).collect(),
-            };
-            if proofs.len() != sets.len() {
-                return Err(Error::RecoverySets);
-            }
-            for (proof, set) in proofs.into_iter().zip(sets) {
-                match proof {
-                    Some(proof) => proof.set_id = set,
-                    None if set.is_some() => return Err(Error::RecoverySets),
-                    None => {}
+            apply_sets(&mut meta, sets)?;
+            Ok(meta)
+        }
+        5 => {
+            let (mut meta, sets, posted): (FileMeta, Vec<Option<[u8; 16]>>, Vec<Option<u64>>) =
+                postcard::from_bytes(&payload)?;
+            apply_sets(&mut meta, sets)?;
+            let segments: Vec<_> = match &mut meta {
+                FileMeta::Nzb(file) => vec![&mut file.segments],
+                FileMeta::Multipart(file) => {
+                    file.parts.iter_mut().map(|p| &mut p.segments).collect()
                 }
+            };
+            if segments.len() != posted.len() {
+                return Err(Error::PostedSizes);
+            }
+            for (segments, posted) in segments.into_iter().zip(posted) {
+                segments.posted_size = posted;
             }
             Ok(meta)
         }
@@ -181,6 +197,24 @@ pub fn decode_meta_limited(bytes: &[u8], limit: usize) -> Result<FileMeta, Error
             version,
         }),
     }
+}
+
+fn apply_sets(meta: &mut FileMeta, sets: Vec<Option<[u8; 16]>>) -> Result<(), Error> {
+    let proofs: Vec<_> = match meta {
+        FileMeta::Nzb(file) => vec![&mut file.proof],
+        FileMeta::Multipart(file) => file.parts.iter_mut().map(|p| &mut p.proof).collect(),
+    };
+    if proofs.len() != sets.len() {
+        return Err(Error::RecoverySets);
+    }
+    for (proof, set) in proofs.into_iter().zip(sets) {
+        match proof {
+            Some(proof) => proof.set_id = set,
+            None if set.is_some() => return Err(Error::RecoverySets),
+            None => {}
+        }
+    }
+    Ok(())
 }
 
 pub fn encode_nzb(xml: &[u8]) -> Result<Vec<u8>, Error> {
@@ -244,6 +278,7 @@ mod tests {
             sizes_trusted: true,
             missing: vec![2],
             corrupt: vec![],
+            posted_size: None,
         }
     }
 
@@ -403,6 +438,50 @@ mod tests {
         let bytes = encode_meta(&gap).expect("encodes");
         assert_eq!(&bytes[..6], b"IDB\x01\x03\x00", "placeholders need v3");
         assert_eq!(decode_meta(&bytes).expect("decodes"), gap);
+    }
+
+    #[test]
+    fn a_posted_size_survives_only_in_version_5() {
+        let plain = FileMeta::Nzb(NzbFile {
+            segments: segments(2),
+            proof: None,
+        });
+        assert_eq!(
+            Blob::parse(&encode_meta(&plain).unwrap()).unwrap().version,
+            1
+        );
+        let mut lying = segments(2);
+        lying.posted_size = Some(1_000_000);
+        let metas = [
+            FileMeta::Nzb(NzbFile {
+                segments: lying.clone(),
+                proof: None,
+            }),
+            FileMeta::Multipart(MultipartFile {
+                parts: vec![
+                    FilePart {
+                        segments: segments(1),
+                        offset: 0,
+                        data: ByteRange { start: 0, end: 10 },
+                        split_after: true,
+                        proof: None,
+                    },
+                    FilePart {
+                        segments: lying,
+                        offset: 0,
+                        data: ByteRange { start: 0, end: 10 },
+                        split_after: false,
+                        proof: None,
+                    },
+                ],
+                crypt: None,
+            }),
+        ];
+        for meta in metas {
+            let bytes = encode_meta(&meta).unwrap();
+            assert_eq!(Blob::parse(&bytes).unwrap().version, 5);
+            assert_eq!(decode_meta(&bytes).unwrap(), meta);
+        }
     }
 
     #[test]

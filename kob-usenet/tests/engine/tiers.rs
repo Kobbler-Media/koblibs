@@ -1,8 +1,10 @@
-use kob_usenet::Purpose;
+use std::time::Duration;
+
 use kob_usenet::vendor::testkit::LoopbackServer;
+use kob_usenet::{Engine, EngineConfig, Purpose};
 use tokio::io::AsyncReadExt;
 
-use crate::support::{Fixture, engine, import, server};
+use crate::support::{Fixture, engine, import, output, server};
 
 #[tokio::test]
 async fn the_backup_tier_serves_only_articles_the_primary_lacks() {
@@ -40,5 +42,73 @@ async fn the_backup_tier_serves_only_articles_the_primary_lacks() {
             .find(|s| s.key == "backup")
             .unwrap();
         assert_eq!(rescued.priority, 99);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Primary {
+    Refused,
+    Stalled,
+    ReconfiguredToRefused,
+    Lacks,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_primary_that_is_down_or_stalled_never_spends_the_backup() {
+    let fixture = Fixture::season();
+    let name = "Show.S01E01.mkv";
+    let lacked = fixture.files[1].articles[3].message_id.clone();
+    for (scenario, served) in [
+        (Primary::Refused, false),
+        (Primary::Stalled, false),
+        (Primary::ReconfiguredToRefused, false),
+        (Primary::Lacks, true),
+    ] {
+        let healthy = LoopbackServer::start(fixture.articles()).await.unwrap();
+        let backup = LoopbackServer::start(fixture.articles()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let release = {
+            let engine = engine(dir.path(), vec![server("primary", &healthy, 0)]).await;
+            import(&engine, &fixture.standard_nzb(), None).await
+        };
+        let primary = match scenario {
+            Primary::Stalled => {
+                LoopbackServer::start_stalling(fixture.articles(), 0, Duration::from_secs(10)).await
+            }
+            Primary::Lacks => LoopbackServer::start(fixture.without(&lacked)).await,
+            _ => LoopbackServer::start(fixture.articles()).await,
+        }
+        .unwrap();
+        if matches!(scenario, Primary::Refused | Primary::ReconfiguredToRefused) {
+            primary.refuse().await;
+        }
+        let servers = vec![
+            server("primary", &primary, 0),
+            server("backup", &backup, 99),
+        ];
+        let mut config = EngineConfig::new(dir.path().to_path_buf(), servers.clone());
+        config.provider_timeout = Duration::from_millis(500);
+        if scenario == Primary::ReconfiguredToRefused {
+            config.servers = vec![server("primary", &healthy, 0)];
+        }
+        let engine = Engine::new(config).await.unwrap();
+        if scenario == Primary::ReconfiguredToRefused {
+            engine.reconfigure(servers).unwrap();
+        }
+        let mut all = Vec::new();
+        let read = tokio::time::timeout(
+            Duration::from_secs(20),
+            engine
+                .open(&release.key, output(&release, name), Purpose::Play)
+                .unwrap()
+                .read_to_end(&mut all),
+        )
+        .await
+        .expect("read ended");
+        assert_eq!(read.is_ok(), served, "{scenario:?}: {read:?}");
+        if served {
+            assert!(all == fixture.data(name), "{scenario:?}");
+        }
+        assert_eq!(backup.body_commands(), usize::from(served), "{scenario:?}");
     }
 }

@@ -22,9 +22,10 @@ use map::{Mark, SegmentMap};
 use pieces::Piece;
 
 const TICK: Duration = Duration::from_millis(50);
-const FAILURES: u32 = 5;
-const BACKOFF: Duration = Duration::from_secs(1);
+const FAILURES: u32 = 3;
+const BACKOFF: Duration = Duration::from_millis(500);
 const SYNC_EVERY: Duration = Duration::from_secs(5);
+const SYNC_QUIET: Duration = Duration::from_secs(1);
 
 pub struct Target<'a> {
     pub file: PathBuf,
@@ -109,6 +110,8 @@ impl Writer<'_> {
         let mut inflight = FuturesUnordered::new();
         let (mut latency, mut answered) = (Duration::ZERO, 0u32);
         let mut synced = Instant::now();
+        let mut written = Vec::new();
+        let mut last_written = Instant::now();
         let attempt = |key: (usize, usize), lane: Lane, outputs: &[Output], delay: Duration| {
             let output = &outputs[key.0];
             let piece = output.pieces[key.1].clone();
@@ -145,9 +148,9 @@ impl Writer<'_> {
                     match landed {
                         Landed::Written => {
                             flying.remove(&key);
-                            let output = &mut outputs[key.0];
-                            output.map.set(key.1, Mark::Done)?;
-                            tally.bytes_done += output.pieces[key.1].len();
+                            written.push(key);
+                            last_written = Instant::now();
+                            tally.bytes_done += outputs[key.0].pieces[key.1].len();
                             tally.segments_done += 1;
                             latency += took;
                             answered += 1;
@@ -161,6 +164,7 @@ impl Writer<'_> {
                         Landed::Failed(error) => {
                             flight.failures += 1;
                             if flight.failures >= FAILURES {
+                                commit(&mut outputs, &mut written)?;
                                 return Err(WriteError::Providers(error));
                             }
                             flight.pending = 1;
@@ -185,12 +189,13 @@ impl Writer<'_> {
                     }
                 }
             }
-            if synced.elapsed() > SYNC_EVERY {
-                sync(&outputs)?;
+            let quiet = !written.is_empty() && last_written.elapsed() > SYNC_QUIET;
+            if quiet || synced.elapsed() > SYNC_EVERY {
+                commit(&mut outputs, &mut written)?;
                 synced = Instant::now();
             }
         }
-        sync(&outputs)?;
+        commit(&mut outputs, &mut written)?;
         Ok(outputs.iter().map(damaged).collect())
     }
 }
@@ -243,9 +248,14 @@ fn open(target: &Target<'_>) -> io::Result<Output> {
     })
 }
 
-fn sync(outputs: &[Output]) -> io::Result<()> {
-    for output in outputs {
+fn commit(outputs: &mut [Output], landed: &mut Vec<(usize, usize)>) -> io::Result<()> {
+    for output in outputs.iter() {
         output.file.sync_data()?;
+    }
+    for (o, p) in landed.drain(..) {
+        outputs[o].map.set(p, Mark::Done)?;
+    }
+    for output in outputs.iter() {
         output.map.sync()?;
     }
     Ok(())

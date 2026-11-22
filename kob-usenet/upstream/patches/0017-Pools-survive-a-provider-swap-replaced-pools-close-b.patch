@@ -1,0 +1,313 @@
+From fc4e1255154ea67e82963d38e1aac755ab5b9c43 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 01:50:17 +1100
+Subject: [PATCH] Pools survive a provider swap; replaced pools close before
+ successors connect
+
+Pool clones are handles to one pool, so Client::replace can keep unchanged pools.
+A pool left out is retired: idle connections close at once, busy ones once their
+requests are answered, and it takes no new requests. Pools of one account share
+a connection semaphore (Pool::with_account), so a successor opens connections
+only as its predecessor closes them. Downloads::resize changes the shared slot
+count in place, so requests on old and new pools share one limit.
+---
+ crates/nntp/src/client.rs    | 22 ++++++++---
+ crates/nntp/src/downloads.rs | 53 ++++++++++++++++++++++++-
+ crates/nntp/src/pool.rs      | 77 +++++++++++++++++++++++++++++++-----
+ 3 files changed, 135 insertions(+), 17 deletions(-)
+
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index 634ebadc..64640bf0 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -158,9 +158,11 @@ impl Client {
+         client
+     }
+ 
+-    /// Switches every new request to `providers`, with fresh circuit breakers.
++    /// Switches every new request to `providers`, with fresh circuit breakers. A pool
++    /// that is not among them any more is retired: requests already on it finish, then
++    /// its connections close. Pass a [`Pool`] clone to keep it.
+     pub fn replace(&self, providers: impl IntoIterator<Item = Provider>) {
+-        let next = {
++        let next: Arc<[Entry]> = {
+             let mut known = self.known.lock().unwrap_or_else(PoisonError::into_inner);
+             providers
+                 .into_iter()
+@@ -187,10 +189,18 @@ impl Client {
+                 })
+                 .collect()
+         };
+-        *self
+-            .providers
+-            .write()
+-            .unwrap_or_else(PoisonError::into_inner) = next;
++        let old = std::mem::replace(
++            &mut *self
++                .providers
++                .write()
++                .unwrap_or_else(PoisonError::into_inner),
++            Arc::clone(&next),
++        );
++        for entry in old.iter() {
++            if !next.iter().any(|e| e.provider.pool.same(&entry.provider.pool)) {
++                entry.provider.pool.retire();
++            }
++        }
+     }
+ 
+     /// Sets the [`BodySink`]; only the first call takes effect.
+diff --git a/crates/nntp/src/downloads.rs b/crates/nntp/src/downloads.rs
+index 6545bb6d..064b35e6 100644
+--- a/crates/nntp/src/downloads.rs
++++ b/crates/nntp/src/downloads.rs
+@@ -24,6 +24,8 @@ struct Lanes {
+     background: VecDeque<Waiter>,
+     /// Slots each reader's admitted playback requests hold.
+     held: HashMap<u64, usize>,
++    /// Slots held beyond a lowered total; released slots pay this off first.
++    owed: usize,
+ }
+ 
+ impl Lanes {
+@@ -83,10 +85,31 @@ impl Downloads {
+                 urgent: VecDeque::new(),
+                 background: VecDeque::new(),
+                 held: HashMap::new(),
++                owed: 0,
+             }),
+         })
+     }
+ 
++    /// Changes the number of slots; requests holding slots keep them, and a lowered
++    /// total takes effect as they finish.
++    pub fn resize(self: &Arc<Self>, permits: usize) {
++        let added = {
++            let mut lanes = self.lock();
++            let added = permits.saturating_sub(lanes.total);
++            let removed = lanes.total.saturating_sub(permits);
++            lanes.total = permits;
++            let repaid = added.min(lanes.owed);
++            lanes.owed -= repaid;
++            let taken = removed.min(lanes.free);
++            lanes.free -= taken;
++            lanes.owed += removed - taken;
++            added - repaid
++        };
++        if added > 0 {
++            Arc::clone(self).release(added, 0);
++        }
++    }
++
+     /// Slots nobody holds.
+     #[must_use]
+     pub fn available_permits(&self) -> usize {
+@@ -159,7 +182,9 @@ impl Downloads {
+         loop {
+             let mut guard = self.lock();
+             let lanes = &mut *guard;
+-            lanes.free += returned.0;
++            let repaid = returned.0.min(lanes.owed);
++            lanes.owed -= repaid;
++            lanes.free += returned.0 - repaid;
+             lanes.unhold(returned.1, returned.0);
+             for lane in [&mut lanes.urgent, &mut lanes.background] {
+                 while lane.front().is_some_and(|(_, _, w)| w.is_closed()) {
+@@ -197,6 +222,32 @@ impl Downloads {
+ mod tests {
+     use super::*;
+ 
++    #[tokio::test]
++    async fn a_resize_keeps_held_slots_and_lowers_the_total_as_they_finish() {
++        let downloads = Downloads::new(2);
++        let a = downloads.acquire(false, 1).await;
++        let b = downloads.acquire(false, 1).await;
++        downloads.resize(1);
++        assert_eq!(downloads.available_permits(), 0);
++        drop(a);
++        assert_eq!(downloads.available_permits(), 0);
++        drop(b);
++        assert_eq!(downloads.available_permits(), 1);
++        let waiting = tokio::spawn({
++            let downloads = Arc::clone(&downloads);
++            let held = downloads.acquire(false, 1).await;
++            async move {
++                let next = downloads.acquire(false, 1).await;
++                drop(held);
++                next.is_some()
++            }
++        });
++        tokio::task::yield_now().await;
++        downloads.resize(3);
++        assert!(waiting.await.unwrap());
++        assert_eq!(downloads.available_permits(), 3);
++    }
++
+     #[tokio::test]
+     async fn streams_overtake_waiting_background_requests() {
+         let downloads = Downloads::new(1);
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index 57decbbd..952b0761 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -7,7 +7,7 @@ use std::task::Poll;
+ use std::time::{Duration, Instant};
+ 
+ use infinidysk_core::trace::{Outcome, Probe, Reason, Step};
+-use tokio::sync::{Notify, mpsc, oneshot};
++use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+ use tokio::time::timeout;
+ 
+ use crate::article::Body;
+@@ -66,7 +66,8 @@ pub struct PoolConfig {
+ 
+ /// Connections to one provider. Each connection is owned by its own task, which
+ /// pipelines requests and reads every reply to completion, so a caller that stops
+-/// waiting never desynchronises the connection.
++/// waiting never desynchronises the connection. Clones are handles to the same pool.
++#[derive(Clone)]
+ pub struct Pool {
+     endpoint: Endpoint,
+     config: PoolConfig,
+@@ -89,6 +90,9 @@ pub struct Pool {
+     weight_large: bool,
+     /// How long the provider keeps articles; `None` for as long as anyone.
+     retention: Option<Duration>,
++    /// One permit per open connection, shared by every pool on the same account, so a
++    /// pool replacing another opens connections only as the old one closes them.
++    account: Arc<Semaphore>,
+ }
+ 
+ /// Articles this large are never pipelined under `weight-large`.
+@@ -111,6 +115,8 @@ struct State {
+     streams: usize,
+     /// Background work stays bounded until then.
+     stream_until: Option<Instant>,
++    /// Replaced: takes no new requests and closes each connection once it drains.
++    retired: bool,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -354,9 +360,36 @@ impl Pool {
+             stream_wait: STREAM_WAIT,
+             weight_large: false,
+             retention: None,
++            account: Arc::new(Semaphore::new(config.max_connections)),
+         })
+     }
+ 
++    /// Shares the account's connection limit with other pools on it: `account` holds one
++    /// permit per connection the account allows.
++    #[must_use]
++    pub fn with_account(mut self, account: Arc<Semaphore>) -> Self {
++        self.account = account;
++        self
++    }
++
++    /// Whether `other` is a handle to this same pool.
++    #[must_use]
++    pub fn same(&self, other: &Self) -> bool {
++        Arc::ptr_eq(&self.state, &other.state)
++    }
++
++    /// Stops taking requests: idle connections close now, busy ones once their requests
++    /// are answered, which frees their account permits for the pool replacing this one.
++    pub fn retire(&self) {
++        let workers = {
++            let mut state = self.lock();
++            state.retired = true;
++            std::mem::take(&mut state.workers)
++        };
++        drop(workers);
++        self.changed.notify_waiters();
++    }
++
+     pub(crate) fn set_stats(&mut self, stats: Arc<Stats>) {
+         self.stats = stats;
+     }
+@@ -414,7 +447,8 @@ impl Pool {
+             let mut state = self.lock();
+             state.workers.retain(|w| !w.tx.is_closed());
+             let open = state.workers.len() + state.connecting;
+-            let backoff = open == 0
++            let backoff = state.retired
++                || open == 0
+                 && state
+                     .failed_at
+                     .is_some_and(|at| at.elapsed() < CONNECT_BACKOFF);
+@@ -692,6 +726,9 @@ impl Pool {
+             changed.as_mut().enable();
+             let (reserved, live, held) = {
+                 let mut state = self.lock();
++                if state.retired {
++                    return Err(Failure::Request(Error::Unavailable));
++                }
+                 state.workers.retain(|w| !w.tx.is_closed());
+                 let open = state.workers.len() + state.connecting;
+                 let limit = self.limit(&state);
+@@ -842,10 +879,25 @@ impl Pool {
+         let usage = endpoint.usage().cloned();
+         let live = Arc::clone(&self.live);
+         let stats = Arc::clone(&self.stats);
++        let account = Arc::clone(&self.account);
+         async move {
+             let started = Instant::now();
+             let limit = tokio::time::Instant::now() + endpoint.timeout();
+             let until = until.map_or(limit, |until| until.min(limit));
++            let Ok(Ok(permit)) = tokio::time::timeout_at(until, account.acquire_owned()).await
++            else {
++                let others = connecting
++                    .lock()
++                    .workers
++                    .iter()
++                    .any(|w| !w.tx.is_closed());
++                drop(connecting);
++                return if others {
++                    Ok(None)
++                } else {
++                    Err(Failure::Request(Error::Unavailable))
++                };
++            };
+             let conn = match Connection::connect_staged_until(&endpoint, until).await {
+                 Ok(conn) => conn,
+                 Err((stage, error)) => {
+@@ -949,6 +1001,7 @@ impl Pool {
+                 Live::acquire(&live),
+                 usage,
+                 endpoint.host().to_owned(),
++                permit,
+             ));
+             let mut state = connecting.lock();
+             if let Some(backoff) = state.backoff.take() {
+@@ -962,13 +1015,16 @@ impl Pool {
+             state.failed_at = None;
+             state.connect_error = None;
+             state.connected = true;
+-            state.workers.push(Worker {
+-                lane: AtomicU64::new(lane.map_or(0, |lane| lane.0)),
+-                tx: tx.clone(),
+-                load,
+-                task: task.abort_handle(),
+-                link,
+-            });
++            // Retired meanwhile: it serves the request that opened it, then closes.
++            if !state.retired {
++                state.workers.push(Worker {
++                    lane: AtomicU64::new(lane.map_or(0, |lane| lane.0)),
++                    tx: tx.clone(),
++                    load,
++                    task: task.abort_handle(),
++                    link,
++                });
++            }
+             // A throttle set while these connects were pending must not hold below them.
+             let open = state.workers.iter().filter(|w| !w.tx.is_closed()).count();
+             if state.throttle.is_some() && open > state.limit(config.max_connections) {
+@@ -1095,6 +1151,7 @@ async fn run(
+     mut live: Live,
+     usage: Option<Arc<Usage>>,
+     host: String,
++    _account: OwnedSemaphorePermit,
+ ) {
+     let mut in_flight = VecDeque::with_capacity(config.pipeline_depth);
+     loop {

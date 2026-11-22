@@ -1,0 +1,68 @@
+From 327cbc3d935c18135ba9f388b150cf600a0c7148 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 08:03:02 +1100
+Subject: [PATCH] Warn when an import takes a part 1 no provider serves as
+ listed; idle-relative seek gate
+
+Patch 0008's fallback takes any first article when no provider serves one with
+the listed part and total. That keeps NZBs whose segment count disagrees with
+the post working, but it can also take another file's part 1, so it now warns.
+The stream-first loopback test gates seek p99 against an idle read measured in
+the same run instead of a fixed 700 ms.
+---
+ crates/nntp/tests/stream_first.rs | 10 ++++++++--
+ crates/queue/src/import.rs        | 13 ++++++++++++-
+ 2 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/crates/nntp/tests/stream_first.rs b/crates/nntp/tests/stream_first.rs
+index 33389244..7c96790c 100644
+--- a/crates/nntp/tests/stream_first.rs
++++ b/crates/nntp/tests/stream_first.rs
+@@ -147,6 +147,11 @@ async fn seek_under_load(fixture: &Fixture, seeks: usize) -> Vec<Duration> {
+ #[tokio::test]
+ async fn playback_reads_are_not_queued_behind_a_saturating_download() {
+     let fixture = fixture().await;
++    let id = &fixture.corpus.articles[0].message_id;
++    fixture.client.body(id, Workload::Stream, None).await.unwrap();
++    let started = Instant::now();
++    fixture.client.body(id, Workload::Stream, None).await.unwrap();
++    let idle = started.elapsed();
+     let load = QueueLoad::start(&fixture);
+     let (alone, ()) = load
+         .throughput(tokio::time::sleep(Duration::from_secs(2)))
+@@ -163,8 +168,9 @@ async fn playback_reads_are_not_queued_behind_a_saturating_download() {
+          {shared:.1} MB/s while seeking",
+         reads.len()
+     );
+-    // One read on an idle connection takes ~0.3 s; behind four queued articles, ~0.9 s.
+-    assert!(p99 < Duration::from_millis(700), "p99 {p99:?}");
++    // Relative to a read on an idle connection (~0.3 s), so a slow runner does not fail
++    // it: behind four queued articles a read takes about three of those.
++    assert!(p99 < idle * 5 / 2, "p99 {p99:?}, idle read {idle:?}");
+     assert!(shared > alone * 0.8, "{shared:.1} of {alone:.1} MB/s");
+ }
+ 
+diff --git a/crates/queue/src/import.rs b/crates/queue/src/import.rs
+index 3f214874..1f37a5d1 100644
+--- a/crates/queue/src/import.rs
++++ b/crates/queue/src/import.rs
+@@ -506,7 +506,18 @@ async fn plan(
+             match fetch_expecting(&job, &id, first).await? {
+                 Fetched::Body(body) => Ok(Some(body)),
+                 Fetched::Missing => Ok(None),
+-                Fetched::Corrupt => fetch(&job, &id, Some(0)).await,
++                Fetched::Corrupt => {
++                    let any = fetch(&job, &id, Some(0)).await?;
++                    if let Some(body) = &any {
++                        tracing::warn!(
++                            message_id = %id,
++                            part = ?body.part,
++                            total = ?body.total,
++                            "no provider serves this file's part 1 as listed; using the copy found"
++                        );
++                    }
++                    Ok(any)
++                }
+             }
+         }
+     }))

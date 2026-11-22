@@ -1,0 +1,576 @@
+From 3cfa0e92f86359bb99e87691956bb9d1d77e6ae0 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 02:00:13 +1100
+Subject: [PATCH] Cache workload above downloads; imports and warming choose
+ their workload
+
+Workload::Cache is stream-side background work (a client caching a stream ahead,
+imports for a stream). Downloads serve background waiters by rank: Cache, Queue,
+Warm, Health. A Cache request runs in its reader's own lane, and while one waits
+for a connection, lower-ranked work takes none, so connections drain to it
+instead of pipelining downloads forever. Rules::workload sets an import's
+workload (Queue by default). Reader::with_warming warms archive members and
+encrypted files on the Warm workload, not Health. A retired pool's connections
+log out and wait for the provider to close before freeing their account permit.
+---
+ crates/nntp/src/client.rs     | 14 +++++-
+ crates/nntp/src/connection.rs | 18 +++++++
+ crates/nntp/src/downloads.rs  | 91 +++++++++++++++++++++++++----------
+ crates/nntp/src/pool.rs       | 43 +++++++++++++----
+ crates/nntp/src/stats.rs      | 27 ++++++++++-
+ crates/queue/src/import.rs    | 15 ++++--
+ crates/vfs/src/reader.rs      |  7 +++
+ 7 files changed, 172 insertions(+), 43 deletions(-)
+
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index 64640bf0..386bc9e9 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -24,6 +24,12 @@ impl Lane {
+     /// Every playback request without a lane of its own: playback pipelines only behind
+     /// playback.
+     pub(crate) const STREAM: Self = Self(u64::MAX);
++
++    /// One stream reader's own lane. Reader ids count up from zero and [`Lane::default`]
++    /// ids from one, so counting down from just below [`Lane::STREAM`] keeps them apart.
++    pub(crate) const fn reader(id: u64) -> Self {
++        Self(u64::MAX - 1 - id)
++    }
+ }
+ impl Default for Lane {
+     fn default() -> Self {
+@@ -686,8 +692,12 @@ impl Client {
+         message_id: &str,
+         mut base: Tag,
+     ) -> Result<Option<Body>, Error> {
+-        if base.workload == Workload::Warm {
+-            base.lane = Some(self.warm_lane);
++        match base.workload {
++            Workload::Warm => base.lane = Some(self.warm_lane),
++            Workload::Cache if base.lane.is_none() => {
++                base.lane = base.probe.as_ref().map(|probe| Lane::reader(probe.reader));
++            }
++            _ => {}
+         }
+         if message_id.is_empty() {
+             return Err(Error::NotFound);
+diff --git a/crates/nntp/src/connection.rs b/crates/nntp/src/connection.rs
+index 89bb59fb..f5c88cdd 100644
+--- a/crates/nntp/src/connection.rs
++++ b/crates/nntp/src/connection.rs
+@@ -589,6 +589,24 @@ impl Connection {
+         }
+     }
+ 
++    /// Logs out and waits for the provider to close, so it no longer counts this
++    /// connection against the account's limit. Best effort, within the timeout.
++    pub async fn quit(&mut self) {
++        if self.pending > 0 {
++            return;
++        }
++        self.write_buf.extend_from_slice(b"QUIT\r\n");
++        if self.flush().await.is_err() {
++            return;
++        }
++        let _ = timeout(self.timeout, async {
++            let _ = self.read_status().await;
++            let mut rest = [0; 64];
++            while matches!(self.stream.read(&mut rest).await, Ok(n) if n > 0) {}
++        })
++        .await;
++    }
++
+     /// Sends all queued commands in one write.
+     pub async fn flush(&mut self) -> Result<(), Error> {
+         if self.write_buf.is_empty() {
+diff --git a/crates/nntp/src/downloads.rs b/crates/nntp/src/downloads.rs
+index 064b35e6..6d765a67 100644
+--- a/crates/nntp/src/downloads.rs
++++ b/crates/nntp/src/downloads.rs
+@@ -3,9 +3,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+ 
+ use tokio::sync::oneshot;
+ 
++use crate::stats::{RANKS, Workload};
++
+ /// Request slots shared by every provider pool. A freed slot goes to a waiting playback
+ /// request before any background (import, health) request, so imports never make a
+-/// stream wait behind them; requests already admitted run to completion. Among playback
++/// stream wait behind them; requests already admitted run to completion. Background
++/// waiters are served by [`Workload::rank`], each rank in order. Among playback
+ /// waiters it goes to the reader holding the fewest slots, oldest first, so one stream's
+ /// deep read-ahead cannot queue another stream's reads behind it.
+ #[derive(Debug)]
+@@ -21,7 +24,7 @@ struct Lanes {
+     total: usize,
+     free: usize,
+     urgent: VecDeque<Waiter>,
+-    background: VecDeque<Waiter>,
++    background: [VecDeque<Waiter>; RANKS],
+     /// Slots each reader's admitted playback requests hold.
+     held: HashMap<u64, usize>,
+     /// Slots held beyond a lowered total; released slots pay this off first.
+@@ -44,6 +47,14 @@ impl Lanes {
+         }
+     }
+ 
++    /// Whether a `workload` request must queue behind waiters ahead of it.
++    fn queued(&self, workload: Workload) -> bool {
++        !self.urgent.is_empty()
++            || workload
++                .rank()
++                .is_some_and(|rank| self.background[..=rank].iter().any(|l| !l.is_empty()))
++    }
++
+     /// The playback waiter to admit next: the oldest of the reader holding fewest slots.
+     fn next_urgent(&self) -> Option<usize> {
+         self.urgent
+@@ -83,7 +94,7 @@ impl Downloads {
+                 total: permits,
+                 free: permits,
+                 urgent: VecDeque::new(),
+-                background: VecDeque::new(),
++                background: Default::default(),
+                 held: HashMap::new(),
+                 owed: 0,
+             }),
+@@ -122,17 +133,16 @@ impl Downloads {
+         lanes
+             .urgent
+             .iter()
+-            .chain(&lanes.background)
++            .chain(lanes.background.iter().flatten())
+             .any(|(_, _, tx)| !tx.is_closed())
+     }
+ 
+     /// Whether [`Self::acquire`] would admit this request right now. A snapshot, not a
+     /// reservation.
+-    pub(crate) fn can_acquire(&self, urgent: bool, weight: usize) -> bool {
++    pub(crate) fn can_acquire(&self, workload: Workload, weight: usize) -> bool {
+         let lanes = self.lock();
+         let weight = weight.clamp(1, lanes.total.max(1));
+-        let queued = !lanes.urgent.is_empty() || (!urgent && !lanes.background.is_empty());
+-        !queued && lanes.free >= weight
++        !lanes.queued(workload) && lanes.free >= weight
+     }
+ 
+     /// Waits for `weight` slots (capped at the total); `urgent` waiters are served
+@@ -140,32 +150,35 @@ impl Downloads {
+     /// Cancel-safe: slots granted to a waiter that left are handed on.
+     #[cfg(test)]
+     pub(crate) async fn acquire(self: &Arc<Self>, urgent: bool, weight: usize) -> Option<Permit> {
+-        self.acquire_for(urgent, weight, 0).await
++        let workload = if urgent {
++            Workload::Stream
++        } else {
++            Workload::Queue
++        };
++        self.acquire_for(workload, weight, 0).await
+     }
+ 
+     /// [`acquire`](Self::acquire) for playback `reader` (`0`: none), which shares the
+     /// playback slots fairly with other readers.
+     pub(crate) async fn acquire_for(
+         self: &Arc<Self>,
+-        urgent: bool,
++        workload: Workload,
+         weight: usize,
+         reader: u64,
+     ) -> Option<Permit> {
+-        let reader = if urgent { reader } else { 0 };
++        let reader = if workload.rank().is_none() { reader } else { 0 };
+         let rx = {
+             let mut lanes = self.lock();
+             let weight = weight.clamp(1, lanes.total.max(1));
+-            let queued = !lanes.urgent.is_empty() || (!urgent && !lanes.background.is_empty());
+-            if !queued && lanes.free >= weight {
++            if !lanes.queued(workload) && lanes.free >= weight {
+                 lanes.free -= weight;
+                 lanes.hold(reader, weight);
+                 return Some(Permit(Some(Arc::clone(self)), weight, reader));
+             }
+             let (tx, rx) = oneshot::channel();
+-            let lane = if urgent {
+-                &mut lanes.urgent
+-            } else {
+-                &mut lanes.background
++            let lane = match workload.rank() {
++                None => &mut lanes.urgent,
++                Some(rank) => &mut lanes.background[rank],
+             };
+             // Amortised sweep of waiters that gave up.
+             if lane.len() >= 64 && lane.len().is_power_of_two() {
+@@ -186,14 +199,17 @@ impl Downloads {
+             lanes.owed -= repaid;
+             lanes.free += returned.0 - repaid;
+             lanes.unhold(returned.1, returned.0);
+-            for lane in [&mut lanes.urgent, &mut lanes.background] {
++            for lane in std::iter::once(&mut lanes.urgent).chain(&mut lanes.background) {
+                 while lane.front().is_some_and(|(_, _, w)| w.is_closed()) {
+                     lane.pop_front();
+                 }
+             }
+             let (lane, at) = match lanes.next_urgent() {
+                 Some(at) => (&mut lanes.urgent, at),
+-                None => (&mut lanes.background, 0),
++                None => match lanes.background.iter_mut().find(|lane| !lane.is_empty()) {
++                    Some(lane) => (lane, 0),
++                    None => return,
++                },
+             };
+             match lane.get(at) {
+                 Some(&(next, _, _)) if next <= lanes.free => lanes.free -= next,
+@@ -222,6 +238,31 @@ impl Downloads {
+ mod tests {
+     use super::*;
+ 
++    #[tokio::test]
++    async fn background_waiters_are_served_by_rank() {
++        let downloads = Downloads::new(1);
++        let held = downloads.acquire(false, 1).await;
++        let order = Arc::new(Mutex::new(Vec::new()));
++        let mut waiters = Vec::new();
++        for workload in [Workload::Health, Workload::Warm, Workload::Queue, Workload::Cache] {
++            let (downloads, order) = (Arc::clone(&downloads), Arc::clone(&order));
++            waiters.push(tokio::spawn(async move {
++                let permit = downloads.acquire_for(workload, 1, 0).await;
++                order.lock().unwrap().push(workload);
++                drop(permit);
++            }));
++            tokio::task::yield_now().await;
++        }
++        drop(held);
++        for waiter in waiters {
++            waiter.await.unwrap();
++        }
++        assert_eq!(
++            *order.lock().unwrap(),
++            [Workload::Cache, Workload::Queue, Workload::Warm, Workload::Health]
++        );
++    }
++
+     #[tokio::test]
+     async fn a_resize_keeps_held_slots_and_lowers_the_total_as_they_finish() {
+         let downloads = Downloads::new(2);
+@@ -282,11 +323,11 @@ mod tests {
+     #[tokio::test]
+     async fn a_freed_slot_goes_to_the_stream_holding_fewest() {
+         let downloads = Downloads::new(2);
+-        let first = downloads.acquire_for(true, 1, 1).await.unwrap();
+-        let _second = downloads.acquire_for(true, 1, 1).await.unwrap();
++        let first = downloads.acquire_for(Workload::Stream, 1, 1).await.unwrap();
++        let _second = downloads.acquire_for(Workload::Stream, 1, 1).await.unwrap();
+         let waiter = |reader| {
+             let d = Arc::clone(&downloads);
+-            tokio::spawn(async move { d.acquire_for(true, 1, reader).await })
++            tokio::spawn(async move { d.acquire_for(Workload::Stream, 1, reader).await })
+         };
+         let deep = waiter(1);
+         tokio::task::yield_now().await;
+@@ -308,8 +349,8 @@ mod tests {
+     async fn a_heavy_waiter_is_not_overtaken_by_lighter_ones() {
+         let downloads = Downloads::new(4);
+         let held = downloads.acquire(true, 2).await;
+-        assert!(downloads.can_acquire(true, 1));
+-        assert!(!downloads.can_acquire(true, 4));
++        assert!(downloads.can_acquire(Workload::Stream, 1));
++        assert!(!downloads.can_acquire(Workload::Stream, 4));
+         let heavy = tokio::spawn({
+             let d = Arc::clone(&downloads);
+             async move { d.acquire(true, 9).await }
+@@ -325,7 +366,7 @@ mod tests {
+             "free slots wait for the older heavy request"
+         );
+         assert!(
+-            !downloads.can_acquire(true, 1),
++            !downloads.can_acquire(Workload::Stream, 1),
+             "an older heavy waiter goes first"
+         );
+ 
+@@ -339,6 +380,6 @@ mod tests {
+         drop(heavy);
+         drop(light.await.unwrap());
+         assert_eq!(downloads.available_permits(), 4, "no slot leaked");
+-        assert!(downloads.can_acquire(true, 9));
++        assert!(downloads.can_acquire(Workload::Stream, 9));
+     }
+ }
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index 952b0761..d321a680 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -79,6 +79,9 @@ pub struct Pool {
+     stream_waiting: Arc<AtomicUsize>,
+     /// Playback requests holding a download slot and waiting for a connection.
+     stream_parked: Arc<AtomicUsize>,
++    /// [`Workload::Cache`] requests holding a download slot and waiting for a
++    /// connection; lower-ranked background work takes none meanwhile.
++    cache_parked: Arc<AtomicUsize>,
+     /// Connection tasks running.
+     live: Arc<AtomicUsize>,
+     state: Arc<Mutex<State>>,
+@@ -353,6 +356,7 @@ impl Pool {
+             warm_busy: Arc::default(),
+             stream_waiting: Arc::default(),
+             stream_parked: Arc::default(),
++            cache_parked: Arc::default(),
+             live: Arc::default(),
+             state: Arc::default(),
+             changed: Arc::default(),
+@@ -513,7 +517,10 @@ impl Pool {
+     /// Whether a playback hedge of `size` bytes would get a permit and an idle or new
+     /// connection right now. A snapshot, not a reservation.
+     pub(crate) fn can_hedge(&self, size: u32) -> bool {
+-        if !self.downloads.can_acquire(true, self.weight(Some(size))) {
++        if !self
++            .downloads
++            .can_acquire(Workload::Stream, self.weight(Some(size)))
++        {
+             return false;
+         }
+         let state = self.lock();
+@@ -631,7 +638,7 @@ impl Pool {
+             let admitted = tokio::time::Instant::now();
+             let deadline = stream.then(|| admitted + budget);
+             let acquire = self.downloads.acquire_for(
+-                stream,
++                tag.workload,
+                 self.weight(tag.probe.as_ref().map(|probe| probe.size)),
+                 tag.probe.as_ref().map_or(0, |probe| probe.reader),
+             );
+@@ -643,9 +650,13 @@ impl Pool {
+             }
+             .ok_or(Failure::Request(Error::Closed))?;
+             tag.step(Step::Permitted { provider });
+-            let parked = stream.then(|| Load::acquire(&self.stream_parked));
++            let parked = match tag.workload {
++                Workload::Stream => Some(Load::acquire(&self.stream_parked)),
++                Workload::Cache => Some(Load::watched(&self.cache_parked, &self.changed)),
++                _ => None,
++            };
+             let (tx, load, ahead, connection) =
+-                self.worker(stream, tag.fresh, deadline, lane).await?;
++                self.worker(tag.workload, tag.fresh, deadline, lane).await?;
+             drop(parked);
+             // Withdrawn while it waited: someone else asks for the article instead.
+             if tag
+@@ -709,11 +720,13 @@ impl Pool {
+     /// cold connect it started itself runs on, so a hung provider is blamed for it.
+     async fn worker(
+         &self,
+-        stream: bool,
++        workload: Workload,
+         fresh: bool,
+         deadline: Option<tokio::time::Instant>,
+         lane: Option<Lane>,
+     ) -> Result<(mpsc::Sender<Request>, Load, usize, u32), Failure> {
++        let stream = workload == Workload::Stream;
++        let outranked = workload.rank().is_some_and(|rank| rank > 0);
+         let (mut impatient, mut first) = (false, true);
+         loop {
+             // A spent budget still takes a connection that is free right away.
+@@ -758,8 +771,12 @@ impl Pool {
+                 // Over its share, background work lets connections drain for playback.
+                 let starved = bounded && self.stream_parked.load(Ordering::Relaxed) > 0
+                     || share.is_some_and(|(busy, room)| busy > room);
++                // Below cache work, background work lets connections drain for a waiting
++                // cache request, which never pipelines behind it.
++                let yielding = outranked && self.cache_parked.load(Ordering::Relaxed) > 0;
+                 let capped = starved || share.is_some_and(|(busy, room)| busy >= room);
+-                let spare = open < limit && !hold_headroom && !capped && held.is_none();
++                let spare =
++                    open < limit && !hold_headroom && !capped && !yielding && held.is_none();
+                 let live = !state.workers.is_empty();
+                 let best = state
+                     .workers
+@@ -770,6 +787,7 @@ impl Pool {
+                             || (load == 0 && !capped)
+                             || (!starved && load < STREAM_BACKGROUND_DEPTH && background(worker))
+                     })
++                    .filter(|_| !yielding)
+                     .filter(|worker| !hold_headroom || worker.load.load(Ordering::Relaxed) > 0)
+                     .filter(|worker| {
+                         lane.is_none_or(|lane| {
+@@ -1159,7 +1177,12 @@ async fn run(
+             conn.link().set(Phase::Idle);
+             match timeout(config.idle_timeout, rx.recv()).await {
+                 Ok(Some(request)) => enqueue(&mut conn, &mut in_flight, request),
+-                Ok(None) => return,
++                // Retired or dropped: the account permit stays held until the provider
++                // has let the connection go.
++                Ok(None) => {
++                    conn.quit().await;
++                    return;
++                }
+                 Err(_)
+                     if live.retire(if usage.as_ref().is_some_and(|u| u.exhausted()) {
+                         0
+@@ -1331,17 +1354,17 @@ mod tests {
+         let pool = Pool::new(endpoint, config, Downloads::new(4)).unwrap();
+         let deadline = Some(tokio::time::Instant::now());
+         assert!(matches!(
+-            pool.worker(true, false, deadline, None).await,
++            pool.worker(Workload::Stream, false, deadline, None).await,
+             Err(Failure::Request(Error::Unavailable))
+         ));
+         assert_eq!(server.peak_connections(), 0);
+         assert_eq!(pool.lock().connecting, 0);
+ 
+-        let Ok((_, load, _, connection)) = pool.worker(true, false, None, None).await else {
++        let Ok((_, load, _, connection)) = pool.worker(Workload::Stream, false, None, None).await else {
+             panic!("a connection opens before admission expires");
+         };
+         drop(load);
+-        let Ok((_, load, _, reused)) = pool.worker(true, false, deadline, None).await else {
++        let Ok((_, load, _, reused)) = pool.worker(Workload::Stream, false, deadline, None).await else {
+             panic!("an idle connection is reusable after admission expires");
+         };
+         assert_eq!(reused, connection);
+diff --git a/crates/nntp/src/stats.rs b/crates/nntp/src/stats.rs
+index 835876fd..5171cc17 100644
+--- a/crates/nntp/src/stats.rs
++++ b/crates/nntp/src/stats.rs
+@@ -16,10 +16,19 @@ pub enum Workload {
+     Queue,
+     Health,
+     Warm,
++    /// Stream-side background work: a client caching a stream ahead of playback, and
++    /// imports for streams. Below playback, above downloads.
++    Cache,
+ }
+ 
+ impl Workload {
+-    pub const ALL: [Self; 4] = [Self::Stream, Self::Queue, Self::Health, Self::Warm];
++    pub const ALL: [Self; 5] = [
++        Self::Stream,
++        Self::Queue,
++        Self::Health,
++        Self::Warm,
++        Self::Cache,
++    ];
+ 
+     #[must_use]
+     pub const fn label(self) -> &'static str {
+@@ -28,10 +37,26 @@ impl Workload {
+             Self::Queue => "queue",
+             Self::Health => "health",
+             Self::Warm => "warm",
++            Self::Cache => "cache",
++        }
++    }
++
++    /// Order among background workloads, first served first; `None` for playback.
++    #[must_use]
++    pub const fn rank(self) -> Option<usize> {
++        match self {
++            Self::Stream => None,
++            Self::Cache => Some(0),
++            Self::Queue => Some(1),
++            Self::Warm => Some(2),
++            Self::Health => Some(3),
+         }
+     }
+ }
+ 
++/// Background ranks; see [`Workload::rank`].
++pub(crate) const RANKS: usize = 4;
++
+ /// Latency buckets: bucket `i` counts requests under `2^i` microseconds; the last also
+ /// takes everything slower (about 8.4 s and up).
+ pub const LATENCY_BUCKETS: usize = 24;
+diff --git a/crates/queue/src/import.rs b/crates/queue/src/import.rs
+index 258148a7..3f214874 100644
+--- a/crates/queue/src/import.rs
++++ b/crates/queue/src/import.rs
+@@ -194,6 +194,8 @@ pub struct Rules {
+     pub owners: HashMap<String, Vec<media::Kind>>,
+     /// Requests in flight per import, across all its steps.
+     pub concurrency: usize,
++    /// Whom the import's requests are for: a stream waiting on it ranks above downloads.
++    pub workload: Workload,
+ }
+ 
+ impl Default for Rules {
+@@ -203,6 +205,7 @@ impl Default for Rules {
+             blocklist: Vec::new(),
+             owners: HashMap::new(),
+             concurrency: CONCURRENCY,
++            workload: Workload::Queue,
+         }
+     }
+ }
+@@ -327,6 +330,7 @@ struct Job {
+     client: Arc<Client>,
+     /// Its requests pipeline only behind each other, never behind another job's.
+     lane: Lane,
++    workload: Workload,
+     requests: Semaphore,
+     /// The permits of `requests`.
+     concurrency: usize,
+@@ -395,7 +399,7 @@ impl Articles for Job {
+             self.progress.request();
+             let found = self
+                 .client
+-                .stat_in_lane(id, self.lane, Workload::Queue, Some(&probe), self.posted)
++                .stat_in_lane(id, self.lane, self.workload, Some(&probe), self.posted)
+                 .await;
+             self.progress.answer();
+             self.done(&probe);
+@@ -416,7 +420,7 @@ impl Articles for Job {
+                 .body_in_lane(
+                     id,
+                     self.lane,
+-                    Workload::Queue,
++                    self.workload,
+                     Some(&probe),
+                     BodyExpectation {
+                         posted: self.posted,
+@@ -449,6 +453,7 @@ fn job(
+     Arc::new(Job {
+         client: Arc::clone(client),
+         lane: Lane::default(),
++        workload: rules.workload,
+         requests: Semaphore::new(concurrency),
+         concurrency,
+         posted,
+@@ -888,11 +893,11 @@ async fn fetch_expecting(job: &Job, id: &str, expected: BodyExpectation) -> Resu
+     job.progress.request();
+     let body = if job.inspected() {
+         job.client
+-            .body_unremembered(id, job.lane, Workload::Queue, Some(&probe), expected)
++            .body_unremembered(id, job.lane, job.workload, Some(&probe), expected)
+             .await
+     } else {
+         job.client
+-            .body_in_lane(id, job.lane, Workload::Queue, Some(&probe), expected)
++            .body_in_lane(id, job.lane, job.workload, Some(&probe), expected)
+             .await
+     };
+     job.progress.answer();
+@@ -922,7 +927,7 @@ async fn stat(job: &Job, id: &str) -> Result<bool, Error> {
+         job.progress.request();
+         let found = job
+             .client
+-            .stat_in_lane(id, job.lane, Workload::Queue, Some(&probe), job.posted)
++            .stat_in_lane(id, job.lane, job.workload, Some(&probe), job.posted)
+             .await;
+         job.progress.answer();
+         match found {
+diff --git a/crates/vfs/src/reader.rs b/crates/vfs/src/reader.rs
+index a9cef2b9..fe5c958b 100644
+--- a/crates/vfs/src/reader.rs
++++ b/crates/vfs/src/reader.rs
+@@ -188,6 +188,13 @@ impl Reader {
+         self.map_segments(|r| r.with_watch(watch))
+     }
+ 
++    /// Strict background warming on spare capacity, whatever the container; see
++    /// [`SegmentReader::with_warming`].
++    #[must_use]
++    pub fn with_warming(self) -> Self {
++        self.map_segments(SegmentReader::with_warming)
++    }
++
+     /// Fails reads instead of serving bytes that are not exactly as posted.
+     #[must_use]
+     pub(crate) fn into_strict(self) -> Self {

@@ -16,10 +16,19 @@ pub enum Workload {
     Queue,
     Health,
     Warm,
+    /// Stream-side background work: a client caching a stream ahead of playback, and
+    /// imports for streams. Below playback, above downloads.
+    Cache,
 }
 
 impl Workload {
-    pub const ALL: [Self; 4] = [Self::Stream, Self::Queue, Self::Health, Self::Warm];
+    pub const ALL: [Self; 5] = [
+        Self::Stream,
+        Self::Queue,
+        Self::Health,
+        Self::Warm,
+        Self::Cache,
+    ];
 
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -28,9 +37,25 @@ impl Workload {
             Self::Queue => "queue",
             Self::Health => "health",
             Self::Warm => "warm",
+            Self::Cache => "cache",
+        }
+    }
+
+    /// Order among background workloads, first served first; `None` for playback.
+    #[must_use]
+    pub const fn rank(self) -> Option<usize> {
+        match self {
+            Self::Stream => None,
+            Self::Cache => Some(0),
+            Self::Queue => Some(1),
+            Self::Warm => Some(2),
+            Self::Health => Some(3),
         }
     }
 }
+
+/// Background ranks; see [`Workload::rank`].
+pub(crate) const RANKS: usize = 4;
 
 /// Latency buckets: bucket `i` counts requests under `2^i` microseconds; the last also
 /// takes everything slower (about 8.4 s and up).

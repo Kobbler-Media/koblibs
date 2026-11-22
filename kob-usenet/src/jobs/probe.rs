@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use futures_util::{StreamExt, stream};
 
+use crate::jobs::failure::Failure;
 use crate::jobs::fetch::Fetcher;
 use crate::jobs::store::Plan;
 use crate::repair::recovery;
@@ -13,7 +14,7 @@ const SAMPLE_PERCENT: usize = 2;
 const SAMPLE_MAX: usize = 1000;
 const CONCURRENCY: usize = 16;
 
-pub async fn hopeless(fetcher: &Fetcher, nzb: &Nzb, plan: &Plan) -> Option<String> {
+pub async fn hopeless(fetcher: &Fetcher, nzb: &Nzb, plan: &Plan) -> Result<(), Failure> {
     let mut seen = HashSet::new();
     let segments: Vec<(&str, u32)> = plan
         .outputs
@@ -22,7 +23,7 @@ pub async fn hopeless(fetcher: &Fetcher, nzb: &Nzb, plan: &Plan) -> Option<Strin
         .filter(|(id, _)| !id.is_empty() && seen.insert(*id))
         .collect();
     if segments.is_empty() {
-        return None;
+        return Ok(());
     }
     let total = segments.len();
     let wanted = if total <= ALL_BELOW {
@@ -44,9 +45,12 @@ pub async fn hopeless(fetcher: &Fetcher, nzb: &Nzb, plan: &Plan) -> Option<Strin
         .buffer_unordered(CONCURRENCY)
         .collect()
         .await;
+    if let Some(Err(error)) = answers.iter().find(|a| a.is_err()) {
+        return Err(Failure::providers(error));
+    }
     let missing = answers.iter().filter(|a| matches!(a, Ok(false))).count();
     if missing == 0 {
-        return None;
+        return Ok(());
     }
     let slice_size = plan.outputs.iter().find_map(|o| slice_size(&o.meta));
     let recovery_blocks =
@@ -64,13 +68,14 @@ pub async fn hopeless(fetcher: &Fetcher, nzb: &Nzb, plan: &Plan) -> Option<Strin
         Some(need) => need > recovery_blocks,
         None => false,
     };
-    verdict.then(|| {
-        format!(
-            "The job is hopeless: {missing} of {wanted} sampled articles are missing (about {} PAR2 blocks) \
+    if !verdict {
+        return Ok(());
+    }
+    Err(Failure::Content(format!(
+        "The job is hopeless: {missing} of {wanted} sampled articles are missing (about {} PAR2 blocks) \
              but only {recovery_blocks} recovery blocks are posted.",
-            need.map_or_else(|| "unknown".to_owned(), |n| n.to_string())
-        )
-    })
+        need.map_or_else(|| "unknown".to_owned(), |n| n.to_string())
+    )))
 }
 
 fn segments(meta: &FileMeta) -> Vec<(&str, u32)> {

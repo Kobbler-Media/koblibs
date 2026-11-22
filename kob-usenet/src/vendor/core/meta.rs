@@ -88,12 +88,22 @@ pub struct Segments {
     pub missing: Vec<u32>,
     /// Ascending indices that decoded corrupt on every provider.
     pub corrupt: Vec<u32>,
+    /// The `=ybegin size=` every article carries, when it is not the decoded size (a
+    /// poster that wrote a wrong size). Blob version 5 stores it.
+    #[serde(skip)]
+    pub posted_size: Option<u64>,
 }
 
 impl Segments {
     #[must_use]
     pub fn size(&self) -> u64 {
         self.items.iter().map(|s| u64::from(s.size)).sum()
+    }
+
+    /// The `=ybegin size=` the articles carry.
+    #[must_use]
+    pub fn posted_size(&self) -> u64 {
+        self.posted_size.unwrap_or_else(|| self.size())
     }
 }
 

@@ -13,9 +13,9 @@ pub struct Flights {
 }
 
 impl Flights {
-    pub fn new(read_ahead: u64, budget: usize) -> Self {
+    pub fn new(read_ahead: u64, cache: u64, budget: usize) -> Self {
         Self {
-            cache: Arc::new(Cache::new(true, read_ahead)),
+            cache: Arc::new(Cache::new(true, cache)),
             budget: Budget::new(budget),
             read_ahead,
         }
@@ -36,12 +36,9 @@ impl Flights {
             None,
             None,
         )?;
-        Ok(match (purpose, reader) {
-            (Purpose::Warm, Reader::Segments(segments)) => {
-                Reader::Segments(segments.with_warming())
-            }
-            (Purpose::Warm, other) => other.into_strict(),
-            (purpose, reader) => reader.with_workload(purpose.workload()).strict(true),
+        Ok(match purpose {
+            Purpose::Warm => reader.with_warming(),
+            purpose => reader.with_workload(purpose.workload()).strict(true),
         })
     }
 }

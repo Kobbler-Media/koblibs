@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::Error;
 use crate::jobs::{JobSpec, JobStatus};
 use crate::release::hex;
-use crate::store::write_atomic;
+use crate::store::{sweep_tmp, write_atomic};
 use crate::vendor::core::{FileMeta, blob};
 use crate::vendor::queue::names;
 
@@ -97,6 +97,10 @@ impl JobStore {
         let mut jobs = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let dir = entry?.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            sweep_tmp(&dir)?;
             let read = |name: &str| fs::read(dir.join(name));
             let (Ok(spec), Ok(status)) = (read("spec"), read("status")) else {
                 tracing::warn!(dir = %dir.display(), "skipping an incomplete job record");
@@ -113,6 +117,10 @@ impl JobStore {
 
     pub fn nzb(&self, id: &str) -> io::Result<Vec<u8>> {
         fs::read(self.dir(id).join("nzb"))
+    }
+
+    pub fn put_nzb(&self, id: &str, nzb: &[u8]) -> io::Result<()> {
+        write_atomic(&self.dir(id).join("nzb"), nzb)
     }
 
     pub fn put_status(&self, status: &JobStatus) -> Result<(), Error> {

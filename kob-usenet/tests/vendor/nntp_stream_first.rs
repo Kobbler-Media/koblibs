@@ -149,6 +149,19 @@ async fn seek_under_load(fixture: &Fixture, seeks: usize) -> Vec<Duration> {
 #[tokio::test]
 async fn playback_reads_are_not_queued_behind_a_saturating_download() {
     let fixture = fixture().await;
+    let id = &fixture.corpus.articles[0].message_id;
+    fixture
+        .client
+        .body(id, Workload::Stream, None)
+        .await
+        .unwrap();
+    let started = Instant::now();
+    fixture
+        .client
+        .body(id, Workload::Stream, None)
+        .await
+        .unwrap();
+    let idle = started.elapsed();
     let load = QueueLoad::start(&fixture);
     let (alone, ()) = load
         .throughput(tokio::time::sleep(Duration::from_secs(2)))
@@ -165,8 +178,9 @@ async fn playback_reads_are_not_queued_behind_a_saturating_download() {
          {shared:.1} MB/s while seeking",
         reads.len()
     );
-    // One read on an idle connection takes ~0.3 s; behind four queued articles, ~0.9 s.
-    assert!(p99 < Duration::from_millis(700), "p99 {p99:?}");
+    // Relative to a read on an idle connection (~0.3 s), so a slow runner does not fail
+    // it: behind four queued articles a read takes about three of those.
+    assert!(p99 < idle * 5 / 2, "p99 {p99:?}, idle read {idle:?}");
     assert!(shared > alone * 0.8, "{shared:.1} of {alone:.1} MB/s");
 }
 

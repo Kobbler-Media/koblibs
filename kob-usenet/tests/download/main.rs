@@ -2,12 +2,15 @@
 
 mod clean;
 mod compressed;
+mod durable;
 mod hedge;
 mod hopeless;
+mod nested;
 #[allow(dead_code)]
 #[path = "../common/nzb.rs"]
 mod nzb;
 mod obfuscated;
+mod outage;
 #[allow(dead_code)]
 #[path = "../common/par2.rs"]
 mod par2;

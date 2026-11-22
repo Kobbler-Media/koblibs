@@ -3,9 +3,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::oneshot;
 
+use crate::vendor::nntp::stats::{RANKS, Workload};
+
 /// Request slots shared by every provider pool. A freed slot goes to a waiting playback
 /// request before any background (import, health) request, so imports never make a
-/// stream wait behind them; requests already admitted run to completion. Among playback
+/// stream wait behind them; requests already admitted run to completion. Background
+/// waiters are served by [`Workload::rank`], each rank in order. Among playback
 /// waiters it goes to the reader holding the fewest slots, oldest first, so one stream's
 /// deep read-ahead cannot queue another stream's reads behind it.
 #[derive(Debug)]
@@ -21,9 +24,11 @@ struct Lanes {
     total: usize,
     free: usize,
     urgent: VecDeque<Waiter>,
-    background: VecDeque<Waiter>,
+    background: [VecDeque<Waiter>; RANKS],
     /// Slots each reader's admitted playback requests hold.
     held: HashMap<u64, usize>,
+    /// Slots held beyond a lowered total; released slots pay this off first.
+    owed: usize,
 }
 
 impl Lanes {
@@ -40,6 +45,14 @@ impl Lanes {
                 self.held.remove(&reader);
             }
         }
+    }
+
+    /// Whether a `workload` request must queue behind waiters ahead of it.
+    fn queued(&self, workload: Workload) -> bool {
+        !self.urgent.is_empty()
+            || workload
+                .rank()
+                .is_some_and(|rank| self.background[..=rank].iter().any(|l| !l.is_empty()))
     }
 
     /// The playback waiter to admit next: the oldest of the reader holding fewest slots.
@@ -81,10 +94,31 @@ impl Downloads {
                 total: permits,
                 free: permits,
                 urgent: VecDeque::new(),
-                background: VecDeque::new(),
+                background: Default::default(),
                 held: HashMap::new(),
+                owed: 0,
             }),
         })
+    }
+
+    /// Changes the number of slots; requests holding slots keep them, and a lowered
+    /// total takes effect as they finish.
+    pub fn resize(self: &Arc<Self>, permits: usize) {
+        let added = {
+            let mut lanes = self.lock();
+            let added = permits.saturating_sub(lanes.total);
+            let removed = lanes.total.saturating_sub(permits);
+            lanes.total = permits;
+            let repaid = added.min(lanes.owed);
+            lanes.owed -= repaid;
+            let taken = removed.min(lanes.free);
+            lanes.free -= taken;
+            lanes.owed += removed - taken;
+            added - repaid
+        };
+        if added > 0 {
+            Arc::clone(self).release(added, 0);
+        }
     }
 
     /// Slots nobody holds.
@@ -99,17 +133,16 @@ impl Downloads {
         lanes
             .urgent
             .iter()
-            .chain(&lanes.background)
+            .chain(lanes.background.iter().flatten())
             .any(|(_, _, tx)| !tx.is_closed())
     }
 
     /// Whether [`Self::acquire`] would admit this request right now. A snapshot, not a
     /// reservation.
-    pub(crate) fn can_acquire(&self, urgent: bool, weight: usize) -> bool {
+    pub(crate) fn can_acquire(&self, workload: Workload, weight: usize) -> bool {
         let lanes = self.lock();
         let weight = weight.clamp(1, lanes.total.max(1));
-        let queued = !lanes.urgent.is_empty() || (!urgent && !lanes.background.is_empty());
-        !queued && lanes.free >= weight
+        !lanes.queued(workload) && lanes.free >= weight
     }
 
     /// Waits for `weight` slots (capped at the total); `urgent` waiters are served
@@ -117,32 +150,35 @@ impl Downloads {
     /// Cancel-safe: slots granted to a waiter that left are handed on.
     #[cfg(test)]
     pub(crate) async fn acquire(self: &Arc<Self>, urgent: bool, weight: usize) -> Option<Permit> {
-        self.acquire_for(urgent, weight, 0).await
+        let workload = if urgent {
+            Workload::Stream
+        } else {
+            Workload::Queue
+        };
+        self.acquire_for(workload, weight, 0).await
     }
 
     /// [`acquire`](Self::acquire) for playback `reader` (`0`: none), which shares the
     /// playback slots fairly with other readers.
     pub(crate) async fn acquire_for(
         self: &Arc<Self>,
-        urgent: bool,
+        workload: Workload,
         weight: usize,
         reader: u64,
     ) -> Option<Permit> {
-        let reader = if urgent { reader } else { 0 };
+        let reader = if workload.rank().is_none() { reader } else { 0 };
         let rx = {
             let mut lanes = self.lock();
             let weight = weight.clamp(1, lanes.total.max(1));
-            let queued = !lanes.urgent.is_empty() || (!urgent && !lanes.background.is_empty());
-            if !queued && lanes.free >= weight {
+            if !lanes.queued(workload) && lanes.free >= weight {
                 lanes.free -= weight;
                 lanes.hold(reader, weight);
                 return Some(Permit(Some(Arc::clone(self)), weight, reader));
             }
             let (tx, rx) = oneshot::channel();
-            let lane = if urgent {
-                &mut lanes.urgent
-            } else {
-                &mut lanes.background
+            let lane = match workload.rank() {
+                None => &mut lanes.urgent,
+                Some(rank) => &mut lanes.background[rank],
             };
             // Amortised sweep of waiters that gave up.
             if lane.len() >= 64 && lane.len().is_power_of_two() {
@@ -159,16 +195,21 @@ impl Downloads {
         loop {
             let mut guard = self.lock();
             let lanes = &mut *guard;
-            lanes.free += returned.0;
+            let repaid = returned.0.min(lanes.owed);
+            lanes.owed -= repaid;
+            lanes.free += returned.0 - repaid;
             lanes.unhold(returned.1, returned.0);
-            for lane in [&mut lanes.urgent, &mut lanes.background] {
+            for lane in std::iter::once(&mut lanes.urgent).chain(&mut lanes.background) {
                 while lane.front().is_some_and(|(_, _, w)| w.is_closed()) {
                     lane.pop_front();
                 }
             }
             let (lane, at) = match lanes.next_urgent() {
                 Some(at) => (&mut lanes.urgent, at),
-                None => (&mut lanes.background, 0),
+                None => match lanes.background.iter_mut().find(|lane| !lane.is_empty()) {
+                    Some(lane) => (lane, 0),
+                    None => return,
+                },
             };
             match lane.get(at) {
                 Some(&(next, _, _)) if next <= lanes.free => lanes.free -= next,
@@ -196,6 +237,67 @@ impl Downloads {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn background_waiters_are_served_by_rank() {
+        let downloads = Downloads::new(1);
+        let held = downloads.acquire(false, 1).await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut waiters = Vec::new();
+        for workload in [
+            Workload::Health,
+            Workload::Warm,
+            Workload::Queue,
+            Workload::Cache,
+        ] {
+            let (downloads, order) = (Arc::clone(&downloads), Arc::clone(&order));
+            waiters.push(tokio::spawn(async move {
+                let permit = downloads.acquire_for(workload, 1, 0).await;
+                order.lock().unwrap().push(workload);
+                drop(permit);
+            }));
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        for waiter in waiters {
+            waiter.await.unwrap();
+        }
+        assert_eq!(
+            *order.lock().unwrap(),
+            [
+                Workload::Cache,
+                Workload::Queue,
+                Workload::Warm,
+                Workload::Health
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resize_keeps_held_slots_and_lowers_the_total_as_they_finish() {
+        let downloads = Downloads::new(2);
+        let a = downloads.acquire(false, 1).await;
+        let b = downloads.acquire(false, 1).await;
+        downloads.resize(1);
+        assert_eq!(downloads.available_permits(), 0);
+        drop(a);
+        assert_eq!(downloads.available_permits(), 0);
+        drop(b);
+        assert_eq!(downloads.available_permits(), 1);
+        let waiting = tokio::spawn({
+            let downloads = Arc::clone(&downloads);
+            let held = downloads.acquire(false, 1).await;
+            async move {
+                let next = downloads.acquire(false, 1).await;
+                drop(held);
+                next.is_some()
+            }
+        });
+        tokio::task::yield_now().await;
+        downloads.resize(3);
+        assert!(waiting.await.unwrap());
+        assert_eq!(downloads.available_permits(), 3);
+    }
 
     #[tokio::test]
     async fn streams_overtake_waiting_background_requests() {
@@ -231,11 +333,11 @@ mod tests {
     #[tokio::test]
     async fn a_freed_slot_goes_to_the_stream_holding_fewest() {
         let downloads = Downloads::new(2);
-        let first = downloads.acquire_for(true, 1, 1).await.unwrap();
-        let _second = downloads.acquire_for(true, 1, 1).await.unwrap();
+        let first = downloads.acquire_for(Workload::Stream, 1, 1).await.unwrap();
+        let _second = downloads.acquire_for(Workload::Stream, 1, 1).await.unwrap();
         let waiter = |reader| {
             let d = Arc::clone(&downloads);
-            tokio::spawn(async move { d.acquire_for(true, 1, reader).await })
+            tokio::spawn(async move { d.acquire_for(Workload::Stream, 1, reader).await })
         };
         let deep = waiter(1);
         tokio::task::yield_now().await;
@@ -257,8 +359,8 @@ mod tests {
     async fn a_heavy_waiter_is_not_overtaken_by_lighter_ones() {
         let downloads = Downloads::new(4);
         let held = downloads.acquire(true, 2).await;
-        assert!(downloads.can_acquire(true, 1));
-        assert!(!downloads.can_acquire(true, 4));
+        assert!(downloads.can_acquire(Workload::Stream, 1));
+        assert!(!downloads.can_acquire(Workload::Stream, 4));
         let heavy = tokio::spawn({
             let d = Arc::clone(&downloads);
             async move { d.acquire(true, 9).await }
@@ -274,7 +376,7 @@ mod tests {
             "free slots wait for the older heavy request"
         );
         assert!(
-            !downloads.can_acquire(true, 1),
+            !downloads.can_acquire(Workload::Stream, 1),
             "an older heavy waiter goes first"
         );
 
@@ -288,6 +390,6 @@ mod tests {
         drop(heavy);
         drop(light.await.unwrap());
         assert_eq!(downloads.available_permits(), 4, "no slot leaked");
-        assert!(downloads.can_acquire(true, 9));
+        assert!(downloads.can_acquire(Workload::Stream, 9));
     }
 }

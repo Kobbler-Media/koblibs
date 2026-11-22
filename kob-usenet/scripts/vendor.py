@@ -2,8 +2,7 @@ import os, re, shutil, sys
 from pathlib import Path
 
 UP = Path(sys.argv[1])
-SF = Path(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] != "-" else None
-DST = Path(sys.argv[3])
+DST = Path(sys.argv[2])
 src_root = UP / "crates"
 
 MODS = {
@@ -30,6 +29,12 @@ CRATE_MAP = {
 TEST_MAP = {k: v.replace("crate::", "kob_usenet::") for k, v in CRATE_MAP.items()}
 
 
+def replaced(text, old, new, count=-1):
+    if old not in text:
+        sys.exit(f"vendor.py: upstream text changed, expected to find {old!r}")
+    return text.replace(old, new, count)
+
+
 def rewrite(text, mod, crate_map):
     text = re.sub(r"(?<![\w$])crate::", f"crate::vendor::{mod}::", text) if mod else text
     text = re.sub(r"\$crate::", f"$crate::vendor::{mod}::", text) if mod else text
@@ -49,9 +54,9 @@ def copy_tree(src, dst, mod):
         out.parent.mkdir(parents=True, exist_ok=True)
         t = p.read_text()
         if mod == "nntp" and rel == Path("patch/tests.rs"):
-            t = t.replace('"patch::tests::crash_child"', '"vendor::nntp::patch::tests::crash_child"')
+            t = replaced(t, '"patch::tests::crash_child"', '"vendor::nntp::patch::tests::crash_child"')
         if mod == "nntp" and rel == Path("lib.rs"):
-            t = t.replace("pub mod catalog;\n", "")
+            t = replaced(t, "pub mod catalog;\n", "")
         out.write_text(rewrite(t, mod, CRATE_MAP))
 
 
@@ -74,7 +79,7 @@ for f in ["nzb.rs", "names.rs", "import.rs", "import/inspect.rs"]:
 v = vendor / "vfs"
 v.mkdir()
 v_reader = (src_root / "vfs/src/reader.rs").read_text()
-(v / "reader.rs").write_text(rewrite(v_reader, "vfs", CRATE_MAP).replace("    pub(crate) fn new(", "    pub fn new(", 1))
+(v / "reader.rs").write_text(replaced(rewrite(v_reader, "vfs", CRATE_MAP), "    pub(crate) fn new(", "    pub fn new(", 1))
 (v / "mod.rs").write_text("""pub mod reader;
 
 pub use reader::Reader;

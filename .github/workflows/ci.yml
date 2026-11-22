@@ -94,7 +94,19 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: kob-usenet -> target
+          workspaces: |
+            kob-usenet -> target
+            kob-usenet/fuzz -> target
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - name: fuzz targets build
+        working-directory: kob-usenet/fuzz
+        run: cargo fmt --all -- --check && cargo check
+      # src/vendor and tests/vendor are generated from the pin + upstream/patches; a hand
+      # edit or a patch that was not regenerated shows up as a diff.
+      - name: vendored code matches the pin and patches
+        run: |
+          scripts/vendor.sh
+          git diff --exit-code -- src/vendor tests/vendor rapidyenc
+          test -z "$(git status --porcelain -- src/vendor tests/vendor rapidyenc)"

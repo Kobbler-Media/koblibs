@@ -1,6 +1,8 @@
+mod failure;
 pub(crate) mod fetch;
 mod plan;
 mod probe;
+mod raw;
 mod run;
 mod store;
 
@@ -47,6 +49,12 @@ impl JobState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobFailure {
+    Content,
+    Infrastructure,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobStatus {
     pub id: String,
@@ -58,6 +66,7 @@ pub struct JobStatus {
     pub segments_total: u64,
     pub segments_done: u64,
     pub error: Option<String>,
+    pub failure: Option<JobFailure>,
     pub path: PathBuf,
 }
 
@@ -181,6 +190,7 @@ impl Jobs {
             segments_total: 0,
             segments_done: 0,
             error: None,
+            failure: None,
             path: stored.staging(),
         };
         self.shared.store.create(&stored, &spec.nzb, &status)?;
@@ -246,10 +256,22 @@ impl Jobs {
         let shared = Arc::clone(&self.shared);
         let id = spec.id.clone();
         let task = tokio::spawn(async move {
-            let Ok(_slot) = Arc::clone(&shared.slots).acquire_owned().await else {
-                return;
-            };
-            run::run(&shared, &spec).await;
+            let mut wait = shared.config.retry_after;
+            for attempt in 1.. {
+                let Ok(slot) = Arc::clone(&shared.slots).acquire_owned().await else {
+                    return;
+                };
+                let last_try = attempt >= shared.config.retry_attempts.max(1);
+                if matches!(
+                    run::run(&shared, &spec, last_try).await,
+                    run::Ended::Finished
+                ) {
+                    return;
+                }
+                drop(slot);
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(shared.config.retry_max);
+            }
         });
         self.shared
             .tasks

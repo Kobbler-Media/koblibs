@@ -11,6 +11,7 @@ use crate::vendor::archive::{self, Format};
 use crate::vendor::queue::names::{self, Kind};
 
 const TAIL: usize = 400;
+const DEPTH: usize = 3;
 
 pub struct Tools<'a> {
     pub unrar: &'a Path,
@@ -27,7 +28,22 @@ enum Family {
 type Sets = BTreeMap<(Family, String), Vec<(u32, PathBuf)>>;
 
 pub async fn unpack(tools: &Tools<'_>, dir: &Path, password: Option<&str>) -> Result<(), String> {
-    let sets = sets(dir).map_err(|e| format!("listing {}: {e}", dir.display()))?;
+    for _ in 0..DEPTH {
+        let sets = sets(dir).map_err(|e| format!("listing {}: {e}", dir.display()))?;
+        if sets.is_empty() {
+            break;
+        }
+        unpack_sets(tools, dir, password, sets).await?;
+    }
+    Ok(())
+}
+
+async fn unpack_sets(
+    tools: &Tools<'_>,
+    dir: &Path,
+    password: Option<&str>,
+    sets: Sets,
+) -> Result<(), String> {
     for ((family, set), mut volumes) in sets {
         volumes.sort();
         let paths: Vec<PathBuf> = volumes.into_iter().map(|(_, p)| p).collect();

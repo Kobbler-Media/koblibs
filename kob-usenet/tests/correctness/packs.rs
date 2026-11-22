@@ -9,7 +9,7 @@ use crate::post::{ARTICLE, Posted, articles, noise, video};
 use crate::proxy::BodyCounter;
 use crate::rar::{self, Member};
 
-const TARGET: &str = "Show.S01E05.mkv";
+const TARGETS: [&str; 2] = ["Show.S01E05.mkv", "Show.S01E03E04.mkv"];
 
 fn episodes() -> Vec<(String, Vec<u8>)> {
     let mut files: Vec<(String, Vec<u8>)> = [1, 2, 5]
@@ -41,14 +41,19 @@ struct Fetched {
     import_outside: u64,
 }
 
-async fn measure(posts: &[Posted], inside: &HashMap<String, bool>, truth: &[u8]) -> Fetched {
+async fn measure(
+    posts: &[Posted],
+    inside: &HashMap<String, bool>,
+    target: &str,
+    truth: &[u8],
+) -> Fetched {
     let nntp = LoopbackServer::start(articles(posts)).await.unwrap();
     let counter = BodyCounter::start(nntp.addr()).await;
     let (engine, _dir) = engine(vec![server("a", counter.addr(), 0)]).await;
     let release = import(&engine, &nzb::of(&posts.iter().collect::<Vec<_>>()))
         .await
         .unwrap();
-    for name in ["Show.S01E03E04.mkv", "Show.S01E05.srt", TARGET] {
+    for name in ["Show.S01E03E04.mkv", "Show.S01E05.srt", "Show.S01E05.mkv"] {
         assert!(
             output(&release, name).is_some(),
             "{name} missing from {:?}",
@@ -56,7 +61,7 @@ async fn measure(posts: &[Posted], inside: &HashMap<String, bool>, truth: &[u8])
         );
     }
     let imported = counter.take();
-    served(&engine, &release, TARGET, truth).await;
+    served(&engine, &release, target, truth).await;
     let read = counter.take();
     let sizes: HashMap<&str, u64> = posts
         .iter()
@@ -83,7 +88,7 @@ async fn measure(posts: &[Posted], inside: &HashMap<String, bool>, truth: &[u8])
     }
 }
 
-fn assert_within(shape: &str, f: &Fetched) {
+fn assert_within(shape: &str, target: &str, f: &Fetched) {
     let outside = f.import_outside + f.read_outside;
     eprintln!(
         "{shape}: member {} B, import fetched {} B ({} B outside), read fetched {} B inside and {} B outside",
@@ -91,12 +96,12 @@ fn assert_within(shape: &str, f: &Fetched) {
     );
     assert!(
         outside <= f.import + f.member / 100,
-        "{shape}: {outside} B outside {TARGET} exceeds import overhead {} B + 1%",
+        "{shape}: {outside} B outside {target} exceeds import overhead {} B + 1%",
         f.import
     );
     assert!(
         f.read_outside <= f.member / 100,
-        "{shape}: reading {TARGET} fetched {} B of other members",
+        "{shape}: reading {target} fetched {} B of other members",
         f.read_outside
     );
 }
@@ -109,13 +114,19 @@ fn overlaps(article: Range<usize>, pieces: &[Range<usize>]) -> bool {
 
 #[tokio::test]
 async fn streaming_one_episode_of_a_stored_rar_pack_fetches_only_that_member() {
+    for name in TARGETS {
+        stored_pack(name).await;
+    }
+}
+
+async fn stored_pack(name: &str) {
     let files = episodes();
     let members: Vec<Member<'_>> = files
         .iter()
         .map(|(name, data)| Member { name, data })
         .collect();
     let set = rar::stored(&members, 9 * ARTICLE);
-    let target = files.iter().position(|(n, _)| n == TARGET).unwrap();
+    let target = files.iter().position(|(n, _)| n == name).unwrap();
     let count = set.volumes.len();
     assert!(count >= 4);
     let posts: Vec<Posted> = set
@@ -141,12 +152,18 @@ async fn streaming_one_episode_of_a_stored_rar_pack_fetches_only_that_member() {
             inside.insert(a.message_id.clone(), overlaps(post.range(i), &pieces));
         }
     }
-    let fetched = measure(&posts, &inside, &files[target].1).await;
-    assert_within("stored RAR pack", &fetched);
+    let fetched = measure(&posts, &inside, name, &files[target].1).await;
+    assert_within("stored RAR pack", name, &fetched);
 }
 
 #[tokio::test]
 async fn streaming_one_episode_of_a_loose_pack_fetches_only_that_file() {
+    for name in TARGETS {
+        loose_pack(name).await;
+    }
+}
+
+async fn loose_pack(name: &str) {
     let posts: Vec<Posted> = episodes()
         .into_iter()
         .enumerate()
@@ -157,15 +174,10 @@ async fn streaming_one_episode_of_a_loose_pack_fetches_only_that_file() {
         .flat_map(|p| {
             p.articles
                 .iter()
-                .map(|a| (a.message_id.clone(), p.name == TARGET))
+                .map(|a| (a.message_id.clone(), p.name == name))
         })
         .collect();
-    let truth = posts
-        .iter()
-        .find(|p| p.name == TARGET)
-        .unwrap()
-        .data
-        .clone();
-    let fetched = measure(&posts, &inside, &truth).await;
-    assert_within("loose pack", &fetched);
+    let truth = posts.iter().find(|p| p.name == name).unwrap().data.clone();
+    let fetched = measure(&posts, &inside, name, &truth).await;
+    assert_within("loose pack", name, &fetched);
 }

@@ -591,6 +591,24 @@ impl Connection {
         }
     }
 
+    /// Logs out and waits for the provider to close, so it no longer counts this
+    /// connection against the account's limit. Best effort, within the timeout.
+    pub async fn quit(&mut self) {
+        if self.pending > 0 {
+            return;
+        }
+        self.write_buf.extend_from_slice(b"QUIT\r\n");
+        if self.flush().await.is_err() {
+            return;
+        }
+        let _ = timeout(self.timeout, async {
+            let _ = self.read_status().await;
+            let mut rest = [0; 64];
+            while matches!(self.stream.read(&mut rest).await, Ok(n) if n > 0) {}
+        })
+        .await;
+    }
+
     /// Sends all queued commands in one write.
     pub async fn flush(&mut self) -> Result<(), Error> {
         if self.write_buf.is_empty() {

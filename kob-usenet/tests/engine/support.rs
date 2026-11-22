@@ -172,3 +172,17 @@ pub async fn read_at<R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin>(
     reader.read_exact(&mut buf).await.expect("read");
     buf
 }
+
+pub async fn read_all(engine: &Engine, fixture: &Fixture) {
+    let release = import(engine, &fixture.standard_nzb(), None).await;
+    for out in &release.outputs {
+        let mut all = Vec::new();
+        engine
+            .open(&release.key, out.index, kob_usenet::Purpose::Play)
+            .unwrap()
+            .read_to_end(&mut all)
+            .await
+            .unwrap();
+        assert!(all == fixture.data(&out.path), "{}", out.path);
+    }
+}

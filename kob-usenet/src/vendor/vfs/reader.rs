@@ -128,7 +128,7 @@ fn prefetch(read_ahead: u64, size: u64, floor: Option<usize>) -> usize {
 /// segments are the whole posted file, so trusted sizes also give its `=ybegin size`.
 fn layout(segments: &Segments, offset: u64, whole: bool) -> impl Iterator<Item = Segment> + '_ {
     let trusted = segments.sizes_trusted;
-    let file_size = (trusted && whole).then(|| segments.size());
+    let file_size = (trusted && whole).then(|| segments.posted_size());
     segments.items.iter().scan(offset, move |at, s| {
         let expected = BodyExpectation {
             offset: trusted.then_some(*at),
@@ -186,6 +186,13 @@ impl Reader {
     #[must_use]
     pub(crate) fn with_watch(self, watch: Arc<Watch>) -> Self {
         self.map_segments(|r| r.with_watch(watch))
+    }
+
+    /// Strict background warming on spare capacity, whatever the container; see
+    /// [`SegmentReader::with_warming`].
+    #[must_use]
+    pub fn with_warming(self) -> Self {
+        self.map_segments(SegmentReader::with_warming)
     }
 
     /// Fails reads instead of serving bytes that are not exactly as posted.

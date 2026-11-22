@@ -130,7 +130,7 @@ async fn client_fails_over_and_reports_misses_conclusively() {
     let client = Client::new([
         provider(dead, 0, None, &downloads),
         provider(empty.addr().port(), 0, None, &downloads),
-        provider(full.addr().port(), 1, None, &downloads),
+        provider(full.addr().port(), 0, None, &downloads),
     ]);
     for (index, article) in corpus.articles.iter().enumerate() {
         let body = body(&client, &article.message_id).await.unwrap();
@@ -351,9 +351,10 @@ async fn a_corrupt_copy_is_damage_only_when_no_provider_failed() {
         for &kind in kinds {
             servers.push(start(kind, &corpus).await);
         }
-        let priorities = (0..).zip(&servers);
         let client = Client::new(
-            priorities.map(|(priority, s)| provider(s.addr().port(), priority, None, &downloads)),
+            servers
+                .iter()
+                .map(|s| provider(s.addr().port(), 0, None, &downloads)),
         );
 
         let result = body(&client, id).await.map(|b| b.data.to_vec());
@@ -832,7 +833,7 @@ async fn a_stalled_stream_read_fails_over_without_retrying() {
             pool: Pool::new(endpoint, config, Arc::clone(&downloads)).unwrap(),
             ..provider(port, 0, None, &downloads)
         },
-        provider(backup.addr().port(), 1, None, &downloads),
+        provider(backup.addr().port(), 0, None, &downloads),
     ]);
 
     let started = std::time::Instant::now();
@@ -905,16 +906,18 @@ async fn a_hung_new_connection_does_not_stall_playback() {
 }
 
 #[tokio::test]
-async fn a_request_waiting_on_a_hung_connect_fails_over() {
+async fn a_request_waiting_on_a_hung_connect_never_asks_the_next_level() {
     let corpus = Corpus::generate(1025, 3, ARTICLE_SIZE);
     let (flaky, backup, client, busy) = hung_connects(&corpus).await;
 
-    client
-        .body(&corpus.articles[2].message_id, Workload::Queue, None)
-        .await
-        .unwrap();
+    assert!(
+        client
+            .body(&corpus.articles[2].message_id, Workload::Queue, None)
+            .await
+            .is_err()
+    );
     busy.await.unwrap().unwrap();
-    assert_eq!((flaky.body_commands(), backup.body_commands()), (2, 1));
+    assert_eq!((flaky.body_commands(), backup.body_commands()), (2, 0));
 }
 
 #[tokio::test]

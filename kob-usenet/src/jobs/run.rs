@@ -1,71 +1,100 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use crate::jobs::failure::Failure;
 use crate::jobs::fetch::Fetcher;
 use crate::jobs::plan::{self, Next, has_par2};
 use crate::jobs::store::{Plan, StoredSpec};
-use crate::jobs::{JobState, Shared, probe};
+use crate::jobs::{JobFailure, JobState, Shared, probe, raw};
 use crate::repair::{self, OnDisk, RepairError, proof_damage};
 use crate::unpack::{Tools, unpack};
 use crate::vendor::core::FileMeta;
 use crate::vendor::queue::nzb::{self, Nzb};
 use crate::vendor::yenc::crc32;
-use crate::writer::{Tally, Target, Writer};
+use crate::writer::{Tally, Target, WriteError, Writer};
 
-type Failure = String;
+const NESTED: u32 = 3;
 
 enum Settled {
     Clean,
     Raw,
 }
 
-pub async fn run(shared: &Shared, spec: &StoredSpec) {
+pub enum Ended {
+    Finished,
+    Retry,
+}
+
+pub async fn run(shared: &Shared, spec: &StoredSpec, last_try: bool) -> Ended {
     let outcome = execute(shared, spec).await;
+    let ended = match &outcome {
+        Err(Failure::Infrastructure(_)) if !last_try => Ended::Retry,
+        _ => Ended::Finished,
+    };
     shared.set_state(&spec.id, |status| match outcome {
         Ok(path) => {
             status.state = JobState::Completed;
             status.path = path;
             status.error = None;
+            status.failure = None;
         }
-        Err(reason) => {
+        Err(Failure::Infrastructure(reason)) if !last_try => {
+            tracing::info!(job = %spec.id, %reason, "download waits to retry");
+            status.state = JobState::Queued;
+            status.error = Some(reason);
+            status.failure = None;
+        }
+        Err(Failure::Infrastructure(reason)) => {
+            tracing::warn!(job = %spec.id, %reason, "download gave up retrying");
+            status.state = JobState::Failed;
+            status.error = Some(reason);
+            status.failure = Some(JobFailure::Infrastructure);
+        }
+        Err(Failure::Content(reason)) => {
             tracing::warn!(job = %spec.id, %reason, "download failed");
             status.state = JobState::Failed;
             status.error = Some(reason);
+            status.failure = Some(JobFailure::Content);
         }
     });
+    ended
 }
 
 async fn execute(shared: &Shared, spec: &StoredSpec) -> Result<PathBuf, Failure> {
-    let raw = shared
-        .store
-        .nzb(&spec.id)
-        .map_err(|e| format!("reading the stored NZB: {e}"))?;
-    let xml = nzb::decompress(&raw).map_err(|e| format!("invalid NZB: {e}"))?;
-    let nzb = nzb::parse(&xml).map_err(|e| format!("invalid NZB: {e}"))?;
-    let password = nzb
-        .meta("password")
-        .next()
-        .map(str::to_owned)
-        .or_else(|| spec.password.clone());
-    let fetcher = Fetcher::new(
-        &shared.client,
-        nzb.files.iter().filter_map(|f| f.date).max(),
-    );
-    let staging = spec.staging();
-    shared.set_state(&spec.id, |s| s.state = JobState::Downloading);
-    let mut plan = match stored(shared.store.plan(&spec.id))? {
-        Some(plan) => plan,
-        None => match plan::direct(&fetcher, &nzb, &spec.name, password.as_deref()).await {
-            Next::Plan(plan) => save(shared, spec, plan)?,
-            Next::Raw => go_raw(shared, spec, &fetcher, &nzb, &staging).await?,
-            Next::Fail(reason) => return Err(reason),
-        },
+    let mut nested = 0;
+    let (nzb, mut plan) = loop {
+        let nzb = stored_nzb(shared, spec)?;
+        let fetcher = fetcher(shared, &nzb);
+        shared.set_state(&spec.id, |s| s.state = JobState::Downloading);
+        let plan = match stored(shared.store.plan(&spec.id))? {
+            Some(plan) => plan,
+            None => match plan::direct(&fetcher, &nzb, &spec.name, password(spec, &nzb).as_deref())
+                .await
+            {
+                Next::Plan(plan) => save(shared, spec, plan)?,
+                Next::Raw => go_raw(shared, spec, &fetcher, &nzb, &spec.staging()).await?,
+                Next::Nested(_) if nested >= NESTED => {
+                    return Err("The download holds NZBs nested too deep.".to_owned().into());
+                }
+                Next::Nested(inner) => {
+                    nested += 1;
+                    shared
+                        .store
+                        .put_nzb(&spec.id, &inner)
+                        .map_err(|e| Failure::io("saving the inner NZB", e))?;
+                    continue;
+                }
+                Next::Fail(failure) => return Err(failure),
+            },
+        };
+        break (nzb, plan);
     };
+    let password = password(spec, &nzb);
+    let fetcher = fetcher(shared, &nzb);
+    let staging = spec.staging();
     loop {
         if !plan.probed {
-            if let Some(reason) = probe::hopeless(&fetcher, &nzb, &plan).await {
-                return Err(reason);
-            }
+            probe::hopeless(&fetcher, &nzb, &plan).await?;
             plan.probed = true;
             plan = save(shared, spec, plan)?;
         }
@@ -88,6 +117,29 @@ async fn execute(shared: &Shared, spec: &StoredSpec) -> Result<PathBuf, Failure>
     finish(spec, &staging)
 }
 
+fn stored_nzb(shared: &Shared, spec: &StoredSpec) -> Result<Nzb, Failure> {
+    let raw = shared
+        .store
+        .nzb(&spec.id)
+        .map_err(|e| Failure::io("reading the stored NZB", e))?;
+    let xml = nzb::decompress(&raw).map_err(|e| format!("invalid NZB: {e}"))?;
+    Ok(nzb::parse(&xml).map_err(|e| format!("invalid NZB: {e}"))?)
+}
+
+fn password(spec: &StoredSpec, nzb: &Nzb) -> Option<String> {
+    nzb.meta("password")
+        .next()
+        .map(str::to_owned)
+        .or_else(|| spec.password.clone())
+}
+
+fn fetcher(shared: &Shared, nzb: &Nzb) -> Fetcher {
+    Fetcher::new(
+        &shared.client,
+        nzb.files.iter().filter_map(|f| f.date).max(),
+    )
+}
+
 async fn go_raw(
     shared: &Shared,
     spec: &StoredSpec,
@@ -95,14 +147,14 @@ async fn go_raw(
     nzb: &Nzb,
     staging: &Path,
 ) -> Result<Plan, Failure> {
-    let plan = plan::raw(fetcher, nzb).await?;
+    let plan = raw::raw(fetcher, nzb).await?;
     shared
         .store
         .clear_maps(&spec.id)
-        .map_err(|e| format!("resetting the job: {e}"))?;
+        .map_err(|e| Failure::io("resetting the job", e))?;
     match std::fs::remove_dir_all(staging) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            return Err(format!("resetting {}: {e}", staging.display()));
+            return Err(format!("resetting {}: {e}", staging.display()).into());
         }
         _ => {}
     }
@@ -115,7 +167,7 @@ fn save(shared: &Shared, spec: &StoredSpec, plan: Plan) -> Result<Plan, Failure>
 }
 
 fn stored<T>(result: Result<T, crate::Error>) -> Result<T, Failure> {
-    result.map_err(|e| format!("job state: {e}"))
+    result.map_err(|e| Failure::io("job state", e))
 }
 
 async fn write(
@@ -154,7 +206,10 @@ async fn write(
     writer
         .write(&targets, &progress)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| match e {
+            WriteError::Providers(error) => Failure::providers(&error),
+            WriteError::Io(error) => Failure::io("writing to disk", error),
+        })
 }
 
 enum Check {
@@ -178,7 +233,7 @@ async fn settle(
         tokio::task::spawn_blocking(move || check(&plan, &damage, &staging))
             .await
             .map_err(|e| e.to_string())?
-            .map_err(|e| format!("verifying: {e}"))?
+            .map_err(|e| Failure::io("verifying", e))?
     };
     let fallback = !plan.raw && has_par2(nzb);
     for check in &checks {
@@ -188,7 +243,7 @@ async fn settle(
                 return Ok(Settled::Raw);
             }
             Check::Member(reason) | Check::Unprotected(reason) => {
-                return Err(format!("{reason}, and no PAR2 recovery can repair it"));
+                return Err(format!("{reason}, and no PAR2 recovery can repair it").into());
             }
             Check::Clean | Check::Repairable => {}
         }
@@ -227,7 +282,8 @@ async fn settle(
             tracing::info!(job = %spec.id, %reason, "downloading whole volumes to repair");
             Ok(Settled::Raw)
         }
-        Err(error) => Err(error.to_string()),
+        Err(RepairError::Providers(error)) => Err(Failure::providers(&error)),
+        Err(error) => Err(error.to_string().into()),
     }
 }
 
@@ -294,7 +350,8 @@ fn crc_of(path: &Path) -> std::io::Result<u32> {
 }
 
 fn finish(spec: &StoredSpec, staging: &Path) -> Result<PathBuf, Failure> {
-    std::fs::create_dir_all(staging).map_err(|e| format!("creating {}: {e}", staging.display()))?;
+    std::fs::create_dir_all(staging)
+        .map_err(|e| Failure::io(&format!("creating {}", staging.display()), e))?;
     let mut target = spec.dest_dir.join(&spec.folder);
     let mut n = 1;
     while target.exists() {
@@ -302,6 +359,6 @@ fn finish(spec: &StoredSpec, staging: &Path) -> Result<PathBuf, Failure> {
         n += 1;
     }
     std::fs::rename(staging, &target)
-        .map_err(|e| format!("moving to {}: {e}", target.display()))?;
+        .map_err(|e| Failure::io(&format!("moving to {}", target.display()), e))?;
     Ok(target)
 }

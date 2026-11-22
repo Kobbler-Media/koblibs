@@ -43,9 +43,9 @@ impl ServerConfig {
     }
 
     #[must_use]
-    pub fn retains(&self, posted_day: i64, today: i64) -> bool {
+    pub fn retains(&self, posted: i64, now: i64) -> bool {
         self.retention_days
-            .is_none_or(|days| today - posted_day <= i64::from(days))
+            .is_none_or(|days| now - posted <= i64::from(days) * day::SECONDS)
     }
 }
 
@@ -76,8 +76,12 @@ pub struct EngineConfig {
     pub data_dir: PathBuf,
     pub pipeline_depth: usize,
     pub min_connections: usize,
+    pub provider_timeout: Duration,
     pub nzb_cache_bytes: u64,
+    pub release_cache_bytes: u64,
+    pub maintenance_interval: Duration,
     pub read_ahead_bytes: u64,
+    pub flight_cache_bytes: u64,
     pub read_budget_bytes: usize,
     pub download: DownloadConfig,
 }
@@ -90,8 +94,12 @@ impl EngineConfig {
             data_dir,
             pipeline_depth: 4,
             min_connections: 0,
+            provider_timeout: Duration::from_secs(30),
             nzb_cache_bytes: 256 << 20,
+            release_cache_bytes: 1 << 30,
+            maintenance_interval: Duration::from_secs(30),
             read_ahead_bytes: 32 << 20,
+            flight_cache_bytes: 96 << 20,
             read_budget_bytes: 256 << 20,
             download: DownloadConfig::default(),
         }
@@ -107,6 +115,9 @@ pub struct DownloadConfig {
     pub sevenzip: PathBuf,
     pub repair_memory_bytes: usize,
     pub straggler_after: Duration,
+    pub retry_after: Duration,
+    pub retry_max: Duration,
+    pub retry_attempts: u32,
 }
 
 impl Default for DownloadConfig {
@@ -119,6 +130,9 @@ impl Default for DownloadConfig {
             sevenzip: PathBuf::from("7z"),
             repair_memory_bytes: 1 << 30,
             straggler_after: Duration::from_secs(2),
+            retry_after: Duration::from_mins(1),
+            retry_max: Duration::from_mins(30),
+            retry_attempts: 12,
         }
     }
 }
@@ -132,6 +146,9 @@ impl fmt::Debug for DownloadConfig {
             .field("sevenzip", &self.sevenzip)
             .field("repair_memory_bytes", &self.repair_memory_bytes)
             .field("straggler_after", &self.straggler_after)
+            .field("retry_after", &self.retry_after)
+            .field("retry_max", &self.retry_max)
+            .field("retry_attempts", &self.retry_attempts)
             .finish_non_exhaustive()
     }
 }

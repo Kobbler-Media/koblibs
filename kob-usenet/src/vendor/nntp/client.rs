@@ -24,6 +24,12 @@ impl Lane {
     /// Every playback request without a lane of its own: playback pipelines only behind
     /// playback.
     pub(crate) const STREAM: Self = Self(u64::MAX);
+
+    /// One stream reader's own lane. Reader ids count up from zero and [`Lane::default`]
+    /// ids from one, so counting down from just below [`Lane::STREAM`] keeps them apart.
+    pub(crate) const fn reader(id: u64) -> Self {
+        Self(u64::MAX - 1 - id)
+    }
 }
 impl Default for Lane {
     fn default() -> Self {
@@ -48,14 +54,15 @@ pub struct Provider {
     pub key: String,
     pub name: String,
     /// Lower levels are asked first; providers sharing a level form one pool and the
-    /// next level is asked only after this one missed or failed.
+    /// next level is asked only for articles every provider on this one missed.
     pub priority: u32,
     /// Providers on one backbone store the same articles, so one miss covers all.
     pub backbone: Option<String>,
 }
 
-/// Fetches bodies across providers by priority level, least busy first within a level,
-/// failing over on misses, corrupt articles and provider failures.
+/// Fetches bodies across providers by priority level, least busy first within a level.
+/// Within a level it fails over on misses, corrupt articles and provider failures; the
+/// next level is asked only for articles every provider on this one missed.
 // ponytail: providers are walked one at a time; add parallel STAT probing after the
 // first miss when setups with 3+ backbones need it.
 pub struct Client {
@@ -157,9 +164,11 @@ impl Client {
         client
     }
 
-    /// Switches every new request to `providers`, with fresh circuit breakers.
+    /// Switches every new request to `providers`, with fresh circuit breakers. A pool
+    /// that is not among them any more is retired: requests already on it finish, then
+    /// its connections close. Pass a [`Pool`] clone to keep it.
     pub fn replace(&self, providers: impl IntoIterator<Item = Provider>) {
-        let next = {
+        let next: Arc<[Entry]> = {
             let mut known = self.known.lock().unwrap_or_else(PoisonError::into_inner);
             providers
                 .into_iter()
@@ -186,10 +195,21 @@ impl Client {
                 })
                 .collect()
         };
-        *self
-            .providers
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = next;
+        let old = std::mem::replace(
+            &mut *self
+                .providers
+                .write()
+                .unwrap_or_else(PoisonError::into_inner),
+            Arc::clone(&next),
+        );
+        for entry in old.iter() {
+            if !next
+                .iter()
+                .any(|e| e.provider.pool.same(&entry.provider.pool))
+            {
+                entry.provider.pool.retire();
+            }
+        }
     }
 
     /// Sets the [`BodySink`]; only the first call takes effect.
@@ -406,7 +426,8 @@ impl Client {
     /// that it lacks the article, or the id is empty (an article the NZB never listed);
     /// otherwise the last provider error, or [`Error::Unavailable`] when open circuits
     /// were skipped. A final corrupt copy becomes [`Error::Unavailable`] when another
-    /// provider was skipped or failed.
+    /// provider was skipped or failed. A level where any provider failed, was skipped or
+    /// gave up waiting ends the request there: lower levels are never asked for it.
     pub async fn body(
         &self,
         message_id: &str,
@@ -674,8 +695,12 @@ impl Client {
         message_id: &str,
         mut base: Tag,
     ) -> Result<Option<Body>, Error> {
-        if base.workload == Workload::Warm {
-            base.lane = Some(self.warm_lane);
+        match base.workload {
+            Workload::Warm => base.lane = Some(self.warm_lane),
+            Workload::Cache if base.lane.is_none() => {
+                base.lane = base.probe.as_ref().map(|probe| Lane::reader(probe.reader));
+            }
+            _ => {}
         }
         if message_id.is_empty() {
             return Err(Error::NotFound);
@@ -708,114 +733,132 @@ impl Client {
         let mut first_miss: Option<(u16, trace::Outcome)> = None;
         // Backbones whose stored copy is missing or corrupt.
         let mut missed: Vec<&str> = Vec::new();
-        // When every circuit is open, try them anyway: the fault is likely ours.
-        for force in [false, true] {
-            let mut attempted = false;
-            for entry in &order {
-                let backbone = entry.provider.backbone.as_deref();
-                if backbone.is_some_and(|b| missed.contains(&b)) {
-                    continue;
-                }
-                let group = backbone.unwrap_or(&entry.provider.key);
-                // Never forced: a used-up quota is the user's limit, not a fault.
-                if entry.provider.pool.exhausted() {
-                    skipped = true;
-                    continue;
-                }
-                // Past retention it is as good as a miss, but not one to remember: the
-                // same id may be asked again with another date.
-                if entry.provider.pool.outlives(age) {
-                    first_miss.get_or_insert((entry.id, trace::Outcome::NotFound));
-                    continue;
-                }
-                if self.missing.contains(group, message_id) {
-                    missed.extend(backbone);
-                    first_miss.get_or_insert((entry.id, trace::Outcome::NotFound));
-                    continue;
-                }
-                let Some(attempt) = entry.breaker.attempt(force) else {
-                    skipped = true;
-                    continue;
-                };
-                attempted = true;
-                let tag = Tag {
-                    provider: entry.id,
-                    stats: Some(Arc::clone(&entry.stats)),
-                    sink: Some(Arc::clone(&self.sink)),
-                    ..base.clone()
-                };
-                let result = entry.provider.pool.fetch(command, message_id, &tag).await;
-                // No slot in time says nothing about the provider: the attempt drops unrecorded.
-                if matches!(result, Err(Failure::Request(Error::Unavailable))) {
-                    skipped = true;
-                    continue;
-                }
-                if let Err(Failure::Request(error @ (Error::Status { .. } | Error::Protocol))) =
-                    &result
-                {
-                    let code = match error {
-                        Error::Status { code, .. } => Some(*code),
-                        _ => None,
+        // A lower level is asked only once every provider on this one missed: a level
+        // that is down, slow or busy ends the request instead of spending a backup
+        // account's quota on articles the primary holds.
+        for level in order.chunk_by(|a, b| a.provider.priority == b.provider.priority) {
+            let mut unresolved = false;
+            // When every circuit on the level is open, try them anyway: the fault is
+            // likely ours.
+            for force in [false, true] {
+                let mut attempted = false;
+                let mut open = false;
+                unresolved = false;
+                for entry in level {
+                    let backbone = entry.provider.backbone.as_deref();
+                    if backbone.is_some_and(|b| missed.contains(&b)) {
+                        continue;
+                    }
+                    let group = backbone.unwrap_or(&entry.provider.key);
+                    // Never forced and never blocking the next level: a used-up quota is
+                    // the user's limit, not a fault, and the account is as good as absent.
+                    if entry.provider.pool.exhausted() {
+                        skipped = true;
+                        continue;
+                    }
+                    // Past retention it is as good as a miss, but not one to remember: the
+                    // same id may be asked again with another date.
+                    if entry.provider.pool.outlives(age) {
+                        first_miss.get_or_insert((entry.id, trace::Outcome::NotFound));
+                        continue;
+                    }
+                    if self.missing.contains(group, message_id) {
+                        missed.extend(backbone);
+                        first_miss.get_or_insert((entry.id, trace::Outcome::NotFound));
+                        continue;
+                    }
+                    let Some(attempt) = entry.breaker.attempt(force) else {
+                        skipped = true;
+                        open = true;
+                        unresolved = true;
+                        continue;
                     };
-                    if let Some(suppressed) = entry.stats.unexpected(code, Instant::now()) {
-                        tracing::warn!(
-                            provider = entry.provider.name.as_str(),
-                            reason = %error,
-                            suppressed,
-                            "provider sent an unexpected reply; trying the next provider"
-                        );
+                    attempted = true;
+                    let tag = Tag {
+                        provider: entry.id,
+                        stats: Some(Arc::clone(&entry.stats)),
+                        sink: Some(Arc::clone(&self.sink)),
+                        ..base.clone()
+                    };
+                    let result = entry.provider.pool.fetch(command, message_id, &tag).await;
+                    // No slot in time, or withdrawn while waiting, says nothing about the
+                    // provider: the attempt drops unrecorded.
+                    if matches!(result, Err(Failure::Request(Error::Unavailable))) {
+                        skipped = true;
+                        unresolved = true;
+                        continue;
                     }
-                }
-                let (outcome, error) = match result {
-                    Ok(body) => {
-                        // Only a delivered body proves the provider fully healthy.
-                        attempt.finish(if body.is_some() {
-                            Outcome::Success
-                        } else {
-                            Outcome::Miss
-                        });
-                        if let Some((from, reason)) = first_miss {
-                            *self
-                                .rescues
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .entry((from, entry.id, reason))
-                                .or_default() += 1;
+                    if let Err(Failure::Request(error @ (Error::Status { .. } | Error::Protocol))) =
+                        &result
+                    {
+                        let code = match error {
+                            Error::Status { code, .. } => Some(*code),
+                            _ => None,
+                        };
+                        if let Some(suppressed) = entry.stats.unexpected(code, Instant::now()) {
+                            tracing::warn!(
+                                provider = entry.provider.name.as_str(),
+                                reason = %error,
+                                suppressed,
+                                "provider sent an unexpected reply; trying the next provider"
+                            );
                         }
-                        return Ok(body);
                     }
-                    Err(Failure::Request(Error::NotFound)) => (Outcome::Miss, None),
-                    Err(Failure::Request(
-                        error @ (Error::CrcMismatch { .. } | Error::Yenc(_) | Error::TooLarge),
-                    )) => (Outcome::Miss, Some(error)),
-                    Err(
-                        Failure::Connect(error)
-                        | Failure::Request(error @ Error::Status { code: 502, .. }),
-                    ) => (Outcome::Fatal, Some(error)),
-                    Err(Failure::Request(error)) => (Outcome::Failure, Some(error)),
-                };
-                failed |= matches!(outcome, Outcome::Failure | Outcome::Fatal);
-                if matches!(outcome, Outcome::Miss) {
-                    missed.extend(backbone);
-                    if error.is_none() && base.remember {
-                        self.missing.insert(group, message_id);
+                    let (outcome, error) = match result {
+                        Ok(body) => {
+                            // Only a delivered body proves the provider fully healthy.
+                            attempt.finish(if body.is_some() {
+                                Outcome::Success
+                            } else {
+                                Outcome::Miss
+                            });
+                            if let Some((from, reason)) = first_miss {
+                                *self
+                                    .rescues
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .entry((from, entry.id, reason))
+                                    .or_default() += 1;
+                            }
+                            return Ok(body);
+                        }
+                        Err(Failure::Request(Error::NotFound)) => (Outcome::Miss, None),
+                        Err(Failure::Request(
+                            error @ (Error::CrcMismatch { .. } | Error::Yenc(_) | Error::TooLarge),
+                        )) => (Outcome::Miss, Some(error)),
+                        Err(
+                            Failure::Connect(error)
+                            | Failure::Request(error @ Error::Status { code: 502, .. }),
+                        ) => (Outcome::Fatal, Some(error)),
+                        Err(Failure::Request(error)) => (Outcome::Failure, Some(error)),
+                    };
+                    let failure = matches!(outcome, Outcome::Failure | Outcome::Fatal);
+                    failed |= failure;
+                    unresolved |= failure;
+                    if matches!(outcome, Outcome::Miss) {
+                        missed.extend(backbone);
+                        if error.is_none() && base.remember {
+                            self.missing.insert(group, message_id);
+                        }
                     }
+                    first_miss.get_or_insert_with(|| {
+                        let reason = error
+                            .as_ref()
+                            .map_or(trace::Outcome::NotFound, stats::outcome);
+                        (entry.id, reason)
+                    });
+                    if attempt.finish(outcome) {
+                        entry.stats.tripped();
+                    }
+                    last_error = error.map(|e| (e, &entry.stats)).or(last_error);
                 }
-                first_miss.get_or_insert_with(|| {
-                    let reason = error
-                        .as_ref()
-                        .map_or(trace::Outcome::NotFound, stats::outcome);
-                    (entry.id, reason)
-                });
-                if attempt.finish(outcome) {
-                    entry.stats.tripped();
+                if attempted || !open || force {
+                    break;
                 }
-                last_error = error.map(|e| (e, &entry.stats)).or(last_error);
             }
-            if attempted || !skipped || force {
+            if unresolved {
                 break;
             }
-            skipped = false;
         }
         // ponytail: a request that never reached a provider (all skipped) is not
         // counted; give the client its own counter if quota cut-offs need showing.
@@ -1057,10 +1100,7 @@ mod tests {
             .await
             .expect("failed provider");
         let downloads = Downloads::new(4);
-        let first = provider(&failed, &downloads);
-        let mut second = provider(&bad, &downloads);
-        second.priority = 1;
-        let client = Client::new([first, second]);
+        let client = Client::new([provider(&failed, &downloads), provider(&bad, &downloads)]);
         assert!(matches!(
             client
                 .body(&corpus.articles[0].message_id, Workload::Health, None)
@@ -1069,6 +1109,123 @@ mod tests {
         ));
         assert_eq!(bad.body_commands(), 1);
         assert_eq!(downloads.available_permits(), 4);
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Primary {
+        Refused,
+        Stalled,
+        Saturated,
+        BreakerOpen,
+        Lacks,
+        Corrupt,
+        PastRetention,
+    }
+
+    #[tokio::test]
+    async fn a_backup_level_is_asked_only_after_every_primary_missed() {
+        use crate::vendor::nntp::BodyExpectation;
+        let corpus = Corpus::generate(1025, 1, 1024);
+        let id = corpus.articles[0].message_id.clone();
+        let posted = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 10 * 86_400;
+        for (scenario, backup_bodies) in [
+            (Primary::Refused, 0),
+            (Primary::Stalled, 0),
+            (Primary::Saturated, 0),
+            (Primary::BreakerOpen, 0),
+            (Primary::Lacks, 1),
+            (Primary::Corrupt, 1),
+            (Primary::PastRetention, 1),
+        ] {
+            let mut corrupt = corpus.articles[0].clone();
+            let at = corrupt
+                .wire
+                .windows(7)
+                .position(|w| w == b"pcrc32=")
+                .unwrap()
+                + 7;
+            corrupt.wire[at] = if corrupt.wire[at] == b'0' { b'1' } else { b'0' };
+            let served = match scenario {
+                Primary::Lacks => Vec::new(),
+                Primary::Corrupt => vec![corrupt],
+                _ => corpus.articles.clone(),
+            };
+            let server = match scenario {
+                Primary::Stalled => {
+                    LoopbackServer::start_stalling(served, 0, Duration::from_secs(5)).await
+                }
+                _ => LoopbackServer::start(served).await,
+            }
+            .unwrap();
+            let backup = LoopbackServer::start(corpus.articles.clone())
+                .await
+                .unwrap();
+            let own = Downloads::new(4);
+            let held = if scenario == Primary::Saturated {
+                own.acquire(false, 4).await
+            } else {
+                None
+            };
+            let mut primary = timed(
+                &server,
+                &own,
+                Duration::from_millis(300),
+                Duration::from_millis(200),
+            );
+            if scenario == Primary::PastRetention {
+                primary.pool = primary.pool.with_retention(Duration::from_secs(86_400));
+            }
+            let mut second = provider(&backup, &Downloads::new(4));
+            second.priority = 99;
+            let client = Client::new([primary, second]);
+            if matches!(scenario, Primary::Refused | Primary::BreakerOpen) {
+                server.refuse().await;
+            }
+            if scenario == Primary::BreakerOpen {
+                let providers = client.snapshot();
+                assert!(
+                    providers[0]
+                        .breaker
+                        .attempt(true)
+                        .unwrap()
+                        .finish(Outcome::Fatal)
+                );
+            }
+            let expected = BodyExpectation {
+                posted: Some(i64::try_from(posted).unwrap()),
+                ..BodyExpectation::NONE
+            };
+            // Background work waits for a slot rather than giving up.
+            let workloads: &[Workload] = if scenario == Primary::Saturated {
+                &[Workload::Stream]
+            } else {
+                &[Workload::Stream, Workload::Queue]
+            };
+            for &workload in workloads {
+                let result = client
+                    .body_expecting(&id, workload, None, None, expected)
+                    .await;
+                // A queue request retries a stall on the same primary, which may answer.
+                if backup_bodies > 0 || workload == Workload::Stream {
+                    assert_eq!(
+                        result.is_ok(),
+                        backup_bodies > 0,
+                        "{scenario:?} {workload:?}: {:?}",
+                        result.err()
+                    );
+                }
+            }
+            assert_eq!(
+                backup.body_commands(),
+                backup_bodies * workloads.len(),
+                "{scenario:?}"
+            );
+            drop(held);
+        }
     }
 
     #[tokio::test]

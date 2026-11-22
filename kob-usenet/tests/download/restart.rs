@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::durable::marked_done;
 use crate::nzb;
 use crate::post::{ARTICLE, Posted, video};
 use crate::support::{Rig, assert_file, completed, finish};
@@ -16,14 +17,12 @@ async fn a_restarted_engine_resumes_the_job_without_refetching_written_segments(
         let engine = rig.engine().await;
         engine.add_job(spec).await.unwrap();
         arrived.await.unwrap();
-        let mut done = engine.job(&id).unwrap().segments_done;
         loop {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            let now = engine.job(&id).unwrap().segments_done;
-            if now == done {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let done = engine.job(&id).unwrap().segments_done;
+            if done > 0 && marked_done(&rig) as u64 == done {
                 break done;
             }
-            done = now;
         }
     };
     drop(release);
@@ -44,6 +43,6 @@ async fn a_restarted_engine_resumes_the_job_without_refetching_written_segments(
     assert_eq!(
         rig.bodies(&post.articles) as u64,
         status.segments_total - done_at_kill,
-        "only segments the first run had not written are fetched again"
+        "only segments the first run had durably written are not fetched again"
     );
 }

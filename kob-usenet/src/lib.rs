@@ -9,13 +9,16 @@
 //!
 //! A release is keyed by [`ReleaseKey`], a hash of each file's first message-id, so the
 //! same post fetched from different indexers or re-encoded NZBs maps to one release, and
-//! its outputs are numbered over their sorted paths rather than NZB order.
+//! its outputs are numbered over their sorted paths rather than NZB order. An NZB that
+//! lists a different set of files (one indexer drops the PAR2 files, or a file's first
+//! segment) hashes to a different key, so the same post can then exist as two releases.
 
 mod config;
 mod day;
 mod engine;
 mod error;
 mod flight;
+mod health;
 mod import_mode;
 mod jobs;
 mod providers;
@@ -26,6 +29,7 @@ mod repair;
 mod space;
 mod store;
 mod unpack;
+mod verify;
 mod writer;
 
 #[allow(unsafe_code, clippy::all, clippy::pedantic, unused, rustdoc::all)]
@@ -34,8 +38,9 @@ pub mod vendor;
 pub use config::{DownloadConfig, EngineConfig, IpPreference, ServerConfig};
 pub use engine::Engine;
 pub use error::Error;
+pub use health::HealthSample;
 pub use import_mode::ImportMode;
-pub use jobs::{JobSpec, JobState, JobStatus};
+pub use jobs::{JobFailure, JobSpec, JobState, JobStatus};
 pub use purpose::Purpose;
 pub use reader::OutputReader;
 pub use release::{InvalidKey, OutputInfo, Release, ReleaseKey};

@@ -1,3 +1,5 @@
+use crate::vendor::nntp::Workload;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportMode {
     Stream,
@@ -9,6 +11,13 @@ impl ImportMode {
         match self {
             Self::Stream => 0,
             Self::Download => 5,
+        }
+    }
+
+    pub(crate) const fn workload(self) -> Workload {
+        match self {
+            Self::Stream => Workload::Cache,
+            Self::Download => Workload::Queue,
         }
     }
 

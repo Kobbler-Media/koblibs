@@ -12,7 +12,8 @@ impl Purpose {
     pub const fn workload(self) -> Workload {
         match self {
             Self::Play => Workload::Stream,
-            Self::Cache | Self::Warm => Workload::Warm,
+            Self::Cache => Workload::Cache,
+            Self::Warm => Workload::Warm,
         }
     }
 }

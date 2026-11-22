@@ -105,6 +105,7 @@ fn expectation(control: u8, value: u8) -> BodyExpectation {
         file_size: wanted(0x04).then_some(u64::from(value) * 64),
         offset: wanted(0x08).then_some(u64::from(value) * 128),
         decoded_len: wanted(0x10).then_some(u64::from(value) * 16),
+        ..BodyExpectation::NONE
     }
 }
 

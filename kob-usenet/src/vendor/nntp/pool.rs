@@ -7,7 +7,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use crate::vendor::core::trace::{Outcome, Probe, Reason, Step};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::vendor::nntp::article::Body;
@@ -42,13 +42,9 @@ const STREAM_HEADROOM_MIN_CONNECTIONS: usize = 4;
 /// Background work stays bounded this long after the last playback request: reads and
 /// seeks come in bursts.
 const STREAM_LINGER: Duration = Duration::from_secs(2);
-/// While bounded, background work leaves this many connections to playback (or one per
-/// playback request, if more), up to a quarter of the limit.
-const STREAM_RESERVE: usize = 4;
-/// While bounded, background work pipelines at most this deep, so a connection drains
-/// quickly when playback needs more than the reserve. Deeper than one: at provider round
-/// trips, unpipelined requests cost much of a connection's throughput.
-const STREAM_BACKGROUND_DEPTH: usize = 2;
+/// While bounded, background work leaves playback the connections it holds plus this
+/// many, a seek's first reads, up to a quarter of the limit.
+const STREAM_SPARE: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PoolConfig {
@@ -66,7 +62,8 @@ pub struct PoolConfig {
 
 /// Connections to one provider. Each connection is owned by its own task, which
 /// pipelines requests and reads every reply to completion, so a caller that stops
-/// waiting never desynchronises the connection.
+/// waiting never desynchronises the connection. Clones are handles to the same pool.
+#[derive(Clone)]
 pub struct Pool {
     endpoint: Endpoint,
     config: PoolConfig,
@@ -78,6 +75,9 @@ pub struct Pool {
     stream_waiting: Arc<AtomicUsize>,
     /// Playback requests holding a download slot and waiting for a connection.
     stream_parked: Arc<AtomicUsize>,
+    /// [`Workload::Cache`] requests holding a download slot and waiting for a
+    /// connection; lower-ranked background work takes none meanwhile.
+    cache_parked: Arc<AtomicUsize>,
     /// Connection tasks running.
     live: Arc<AtomicUsize>,
     state: Arc<Mutex<State>>,
@@ -89,6 +89,9 @@ pub struct Pool {
     weight_large: bool,
     /// How long the provider keeps articles; `None` for as long as anyone.
     retention: Option<Duration>,
+    /// One permit per open connection, shared by every pool on the same account, so a
+    /// pool replacing another opens connections only as the old one closes them.
+    account: Arc<Semaphore>,
 }
 
 /// Articles this large are never pipelined under `weight-large`.
@@ -111,6 +114,8 @@ struct State {
     streams: usize,
     /// Background work stays bounded until then.
     stream_until: Option<Instant>,
+    /// Replaced: takes no new requests and closes each connection once it drains.
+    retired: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -347,6 +352,7 @@ impl Pool {
             warm_busy: Arc::default(),
             stream_waiting: Arc::default(),
             stream_parked: Arc::default(),
+            cache_parked: Arc::default(),
             live: Arc::default(),
             state: Arc::default(),
             changed: Arc::default(),
@@ -354,7 +360,34 @@ impl Pool {
             stream_wait: STREAM_WAIT,
             weight_large: false,
             retention: None,
+            account: Arc::new(Semaphore::new(config.max_connections)),
         })
+    }
+
+    /// Shares the account's connection limit with other pools on it: `account` holds one
+    /// permit per connection the account allows.
+    #[must_use]
+    pub fn with_account(mut self, account: Arc<Semaphore>) -> Self {
+        self.account = account;
+        self
+    }
+
+    /// Whether `other` is a handle to this same pool.
+    #[must_use]
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Stops taking requests: idle connections close now, busy ones once their requests
+    /// are answered, which frees their account permits for the pool replacing this one.
+    pub fn retire(&self) {
+        let workers = {
+            let mut state = self.lock();
+            state.retired = true;
+            std::mem::take(&mut state.workers)
+        };
+        drop(workers);
+        self.changed.notify_waiters();
     }
 
     pub(crate) fn set_stats(&mut self, stats: Arc<Stats>) {
@@ -414,10 +447,11 @@ impl Pool {
             let mut state = self.lock();
             state.workers.retain(|w| !w.tx.is_closed());
             let open = state.workers.len() + state.connecting;
-            let backoff = open == 0
-                && state
-                    .failed_at
-                    .is_some_and(|at| at.elapsed() < CONNECT_BACKOFF);
+            let backoff = state.retired
+                || open == 0
+                    && state
+                        .failed_at
+                        .is_some_and(|at| at.elapsed() < CONNECT_BACKOFF);
             let reserved = if backoff || state.held(open).is_some() {
                 0
             } else {
@@ -479,7 +513,10 @@ impl Pool {
     /// Whether a playback hedge of `size` bytes would get a permit and an idle or new
     /// connection right now. A snapshot, not a reservation.
     pub(crate) fn can_hedge(&self, size: u32) -> bool {
-        if !self.downloads.can_acquire(true, self.weight(Some(size))) {
+        if !self
+            .downloads
+            .can_acquire(Workload::Stream, self.weight(Some(size)))
+        {
             return false;
         }
         let state = self.lock();
@@ -597,7 +634,7 @@ impl Pool {
             let admitted = tokio::time::Instant::now();
             let deadline = stream.then(|| admitted + budget);
             let acquire = self.downloads.acquire_for(
-                stream,
+                tag.workload,
                 self.weight(tag.probe.as_ref().map(|probe| probe.size)),
                 tag.probe.as_ref().map_or(0, |probe| probe.reader),
             );
@@ -609,9 +646,13 @@ impl Pool {
             }
             .ok_or(Failure::Request(Error::Closed))?;
             tag.step(Step::Permitted { provider });
-            let parked = stream.then(|| Load::acquire(&self.stream_parked));
+            let parked = match tag.workload {
+                Workload::Stream => Some(Load::acquire(&self.stream_parked)),
+                Workload::Cache => Some(Load::watched(&self.cache_parked, &self.changed)),
+                _ => None,
+            };
             let (tx, load, ahead, connection) =
-                self.worker(stream, tag.fresh, deadline, lane).await?;
+                self.worker(tag.workload, tag.fresh, deadline, lane).await?;
             drop(parked);
             // Withdrawn while it waited: someone else asks for the article instead.
             if tag
@@ -668,18 +709,20 @@ impl Pool {
     /// instead. A `fresh` request never pipelines: it waits for an idle connection instead.
     /// For limits of four or more, background work leaves one idle or unopened slot for
     /// playback and waits for pending connections before pipelining. While playback is
-    /// active or lingering, background work leaves a [`STREAM_RESERVE`] of the limit to
-    /// playback, pipelines only [`STREAM_BACKGROUND_DEPTH`] deep and never behind
-    /// playback, and takes no connection at all while playback waits for one.
+    /// active or lingering, background work leaves playback the connections it holds plus
+    /// [`STREAM_SPARE`], never pipelines behind playback, and takes no connection at all
+    /// while playback waits for one.
     /// Past the admission `deadline` it fails as [`Error::Unavailable`], except that a
     /// cold connect it started itself runs on, so a hung provider is blamed for it.
     async fn worker(
         &self,
-        stream: bool,
+        workload: Workload,
         fresh: bool,
         deadline: Option<tokio::time::Instant>,
         lane: Option<Lane>,
     ) -> Result<(mpsc::Sender<Request>, Load, usize, u32), Failure> {
+        let stream = workload == Workload::Stream;
+        let outranked = workload.rank().is_some_and(|rank| rank > 0);
         let (mut impatient, mut first) = (false, true);
         loop {
             // A spent budget still takes a connection that is free right away.
@@ -692,6 +735,9 @@ impl Pool {
             changed.as_mut().enable();
             let (reserved, live, held) = {
                 let mut state = self.lock();
+                if state.retired {
+                    return Err(Failure::Request(Error::Unavailable));
+                }
                 state.workers.retain(|w| !w.tx.is_closed());
                 let open = state.workers.len() + state.connecting;
                 let limit = self.limit(&state);
@@ -714,15 +760,27 @@ impl Pool {
                 };
                 // Connections background work holds, and may hold besides the reserve.
                 let share = bounded.then(|| {
-                    let reserve = state.streams.max(STREAM_RESERVE).min(limit / 4);
+                    let playing = state
+                        .workers
+                        .iter()
+                        .filter(|w| {
+                            w.load.load(Ordering::Relaxed) > 0
+                                && w.lane.load(Ordering::Relaxed) == Lane::STREAM.0
+                        })
+                        .count();
+                    let reserve = (playing + STREAM_SPARE).min(limit / 4);
                     let busy = state.workers.iter().filter(background).count();
                     (busy + state.connecting, limit.saturating_sub(reserve))
                 });
                 // Over its share, background work lets connections drain for playback.
                 let starved = bounded && self.stream_parked.load(Ordering::Relaxed) > 0
                     || share.is_some_and(|(busy, room)| busy > room);
+                // Below cache work, background work lets connections drain for a waiting
+                // cache request, which never pipelines behind it.
+                let yielding = outranked && self.cache_parked.load(Ordering::Relaxed) > 0;
                 let capped = starved || share.is_some_and(|(busy, room)| busy >= room);
-                let spare = open < limit && !hold_headroom && !capped && held.is_none();
+                let spare =
+                    open < limit && !hold_headroom && !capped && !yielding && held.is_none();
                 let live = !state.workers.is_empty();
                 let best = state
                     .workers
@@ -731,8 +789,9 @@ impl Pool {
                         let load = worker.load.load(Ordering::Relaxed);
                         !bounded
                             || (load == 0 && !capped)
-                            || (!starved && load < STREAM_BACKGROUND_DEPTH && background(worker))
+                            || (!starved && load < self.config.pipeline_depth && background(worker))
                     })
+                    .filter(|_| !yielding)
                     .filter(|worker| !hold_headroom || worker.load.load(Ordering::Relaxed) > 0)
                     .filter(|worker| {
                         lane.is_none_or(|lane| {
@@ -842,10 +901,21 @@ impl Pool {
         let usage = endpoint.usage().cloned();
         let live = Arc::clone(&self.live);
         let stats = Arc::clone(&self.stats);
+        let account = Arc::clone(&self.account);
         async move {
             let started = Instant::now();
             let limit = tokio::time::Instant::now() + endpoint.timeout();
             let until = until.map_or(limit, |until| until.min(limit));
+            let Ok(Ok(permit)) = tokio::time::timeout_at(until, account.acquire_owned()).await
+            else {
+                let others = connecting.lock().workers.iter().any(|w| !w.tx.is_closed());
+                drop(connecting);
+                return if others {
+                    Ok(None)
+                } else {
+                    Err(Failure::Request(Error::Unavailable))
+                };
+            };
             let conn = match Connection::connect_staged_until(&endpoint, until).await {
                 Ok(conn) => conn,
                 Err((stage, error)) => {
@@ -949,6 +1019,7 @@ impl Pool {
                 Live::acquire(&live),
                 usage,
                 endpoint.host().to_owned(),
+                permit,
             ));
             let mut state = connecting.lock();
             if let Some(backoff) = state.backoff.take() {
@@ -962,13 +1033,16 @@ impl Pool {
             state.failed_at = None;
             state.connect_error = None;
             state.connected = true;
-            state.workers.push(Worker {
-                lane: AtomicU64::new(lane.map_or(0, |lane| lane.0)),
-                tx: tx.clone(),
-                load,
-                task: task.abort_handle(),
-                link,
-            });
+            // Retired meanwhile: it serves the request that opened it, then closes.
+            if !state.retired {
+                state.workers.push(Worker {
+                    lane: AtomicU64::new(lane.map_or(0, |lane| lane.0)),
+                    tx: tx.clone(),
+                    load,
+                    task: task.abort_handle(),
+                    link,
+                });
+            }
             // A throttle set while these connects were pending must not hold below them.
             let open = state.workers.iter().filter(|w| !w.tx.is_closed()).count();
             if state.throttle.is_some() && open > state.limit(config.max_connections) {
@@ -1095,6 +1169,7 @@ async fn run(
     mut live: Live,
     usage: Option<Arc<Usage>>,
     host: String,
+    _account: OwnedSemaphorePermit,
 ) {
     let mut in_flight = VecDeque::with_capacity(config.pipeline_depth);
     loop {
@@ -1102,7 +1177,12 @@ async fn run(
             conn.link().set(Phase::Idle);
             match timeout(config.idle_timeout, rx.recv()).await {
                 Ok(Some(request)) => enqueue(&mut conn, &mut in_flight, request),
-                Ok(None) => return,
+                // Retired or dropped: the account permit stays held until the provider
+                // has let the connection go.
+                Ok(None) => {
+                    conn.quit().await;
+                    return;
+                }
                 Err(_)
                     if live.retire(if usage.as_ref().is_some_and(|u| u.exhausted()) {
                         0
@@ -1274,17 +1354,19 @@ mod tests {
         let pool = Pool::new(endpoint, config, Downloads::new(4)).unwrap();
         let deadline = Some(tokio::time::Instant::now());
         assert!(matches!(
-            pool.worker(true, false, deadline, None).await,
+            pool.worker(Workload::Stream, false, deadline, None).await,
             Err(Failure::Request(Error::Unavailable))
         ));
         assert_eq!(server.peak_connections(), 0);
         assert_eq!(pool.lock().connecting, 0);
 
-        let Ok((_, load, _, connection)) = pool.worker(true, false, None, None).await else {
+        let Ok((_, load, _, connection)) = pool.worker(Workload::Stream, false, None, None).await
+        else {
             panic!("a connection opens before admission expires");
         };
         drop(load);
-        let Ok((_, load, _, reused)) = pool.worker(true, false, deadline, None).await else {
+        let Ok((_, load, _, reused)) = pool.worker(Workload::Stream, false, deadline, None).await
+        else {
             panic!("an idle connection is reusable after admission expires");
         };
         assert_eq!(reused, connection);

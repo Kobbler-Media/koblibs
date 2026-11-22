@@ -35,3 +35,17 @@ path = "fuzz_targets/yenc_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "par2_packets"
+path = "fuzz_targets/par2_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blob_meta"
+path = "fuzz_targets/blob_meta.rs"
+test = false
+doc = false
+bench = false

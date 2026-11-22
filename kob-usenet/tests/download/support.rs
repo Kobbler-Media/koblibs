@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use kob_usenet::vendor::testkit::{Article, LoopbackServer};
 use kob_usenet::{
-    DownloadConfig, Engine, EngineConfig, FreeSpace, IpPreference, JobSpec, JobState, JobStatus,
-    ServerConfig,
+    DownloadConfig, Engine, EngineConfig, FreeSpace, IpPreference, JobFailure, JobSpec, JobState,
+    JobStatus, ServerConfig,
 };
 
 const FINISH_DEADLINE: Duration = Duration::from_secs(30);
@@ -47,6 +47,8 @@ impl Rig {
             free_space: Arc::clone(&self.space) as Arc<dyn FreeSpace>,
             free_space_floor: 1 << 20,
             straggler_after: Duration::from_millis(200),
+            retry_after: Duration::from_millis(200),
+            retry_max: Duration::from_secs(1),
             ..DownloadConfig::default()
         };
         config
@@ -116,6 +118,20 @@ pub async fn finish(engine: &Engine, id: &str) -> JobStatus {
     .unwrap_or_else(|_| panic!("job {id} did not finish: {:?}", engine.job(id)))
 }
 
+pub async fn waiting(engine: &Engine, id: &str) -> JobStatus {
+    tokio::time::timeout(FINISH_DEADLINE, async {
+        loop {
+            let status = engine.job(id).expect("job is listed");
+            if status.state.is_finished() || status.error.is_some() {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("job {id} never waited: {:?}", engine.job(id)))
+}
+
 pub fn completed(status: &JobStatus) -> PathBuf {
     assert_eq!(
         status.state,
@@ -127,7 +143,12 @@ pub fn completed(status: &JobStatus) -> PathBuf {
 }
 
 pub fn failed(status: &JobStatus) -> String {
+    failed_as(status, JobFailure::Content)
+}
+
+pub fn failed_as(status: &JobStatus, kind: JobFailure) -> String {
     assert_eq!(status.state, JobState::Failed, "{status:?}");
+    assert_eq!(status.failure, Some(kind), "{status:?}");
     status.error.clone().expect("a failed job says why")
 }
 

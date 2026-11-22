@@ -194,6 +194,8 @@ pub struct Rules {
     pub owners: HashMap<String, Vec<media::Kind>>,
     /// Requests in flight per import, across all its steps.
     pub concurrency: usize,
+    /// Whom the import's requests are for: a stream waiting on it ranks above downloads.
+    pub workload: Workload,
 }
 
 impl Default for Rules {
@@ -203,6 +205,7 @@ impl Default for Rules {
             blocklist: Vec::new(),
             owners: HashMap::new(),
             concurrency: CONCURRENCY,
+            workload: Workload::Queue,
         }
     }
 }
@@ -327,6 +330,7 @@ struct Job {
     client: Arc<Client>,
     /// Its requests pipeline only behind each other, never behind another job's.
     lane: Lane,
+    workload: Workload,
     requests: Semaphore,
     /// The permits of `requests`.
     concurrency: usize,
@@ -395,7 +399,7 @@ impl Articles for Job {
             self.progress.request();
             let found = self
                 .client
-                .stat_in_lane(id, self.lane, Workload::Queue, Some(&probe), self.posted)
+                .stat_in_lane(id, self.lane, self.workload, Some(&probe), self.posted)
                 .await;
             self.progress.answer();
             self.done(&probe);
@@ -416,7 +420,7 @@ impl Articles for Job {
                 .body_in_lane(
                     id,
                     self.lane,
-                    Workload::Queue,
+                    self.workload,
                     Some(&probe),
                     BodyExpectation {
                         posted: self.posted,
@@ -449,6 +453,7 @@ fn job(
     Arc::new(Job {
         client: Arc::clone(client),
         lane: Lane::default(),
+        workload: rules.workload,
         requests: Semaphore::new(concurrency),
         concurrency,
         posted,
@@ -501,7 +506,18 @@ async fn plan(
             match fetch_expecting(&job, &id, first).await? {
                 Fetched::Body(body) => Ok(Some(body)),
                 Fetched::Missing => Ok(None),
-                Fetched::Corrupt => fetch(&job, &id, Some(0)).await,
+                Fetched::Corrupt => {
+                    let any = fetch(&job, &id, Some(0)).await?;
+                    if let Some(body) = &any {
+                        tracing::warn!(
+                            message_id = %id,
+                            part = ?body.part,
+                            total = ?body.total,
+                            "no provider serves this file's part 1 as listed; using the copy found"
+                        );
+                    }
+                    Ok(any)
+                }
             }
         }
     }))
@@ -888,11 +904,11 @@ async fn fetch_expecting(job: &Job, id: &str, expected: BodyExpectation) -> Resu
     job.progress.request();
     let body = if job.inspected() {
         job.client
-            .body_unremembered(id, job.lane, Workload::Queue, Some(&probe), expected)
+            .body_unremembered(id, job.lane, job.workload, Some(&probe), expected)
             .await
     } else {
         job.client
-            .body_in_lane(id, job.lane, Workload::Queue, Some(&probe), expected)
+            .body_in_lane(id, job.lane, job.workload, Some(&probe), expected)
             .await
     };
     job.progress.answer();
@@ -922,7 +938,7 @@ async fn stat(job: &Job, id: &str) -> Result<bool, Error> {
         job.progress.request();
         let found = job
             .client
-            .stat_in_lane(id, job.lane, Workload::Queue, Some(&probe), job.posted)
+            .stat_in_lane(id, job.lane, job.workload, Some(&probe), job.posted)
             .await;
         job.progress.answer();
         match found {
@@ -1089,11 +1105,15 @@ async fn layout(
                     {
                         short = gap;
                     }
+                    trusted = true;
                     measure(job, &name, &ids, complete, short).await?
                 }
             }
         }
-        _ => measure(job, &name, &ids, complete, short).await?,
+        _ => {
+            trusted = true;
+            measure(job, &name, &ids, complete, short).await?
+        }
     };
     cached.push((head, first.data));
     job.bodies().extend(cached);
@@ -1114,6 +1134,7 @@ async fn layout(
                 sizes_trusted: trusted,
                 missing: Vec::new(),
                 corrupt: Vec::new(),
+                posted_size: (trusted && end != total).then_some(total),
             },
             offset: 0,
             data: ByteRange { start: 0, end },
@@ -1364,6 +1385,7 @@ impl Volume {
                         sizes_trusted: part.segments.sizes_trusted,
                         missing: Vec::new(),
                         corrupt: Vec::new(),
+                        posted_size: part.segments.posted_size,
                     },
                     offset,
                     data: ByteRange {

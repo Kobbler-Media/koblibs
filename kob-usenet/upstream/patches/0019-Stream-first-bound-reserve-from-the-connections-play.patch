@@ -1,0 +1,79 @@
+From da429556e68ecaeb6d6c32ea302fb432dfda2075 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 02:09:00 +1100
+Subject: [PATCH] Stream-first bound: reserve from the connections playback
+ holds, full depth
+
+Continuous playback kept the bound on for good: background work kept
+max(4, playback requests) connections free, and a reader's read-ahead counts
+dozens of requests, so the reserve sat at its quarter-of-the-limit cap; and
+background work pipelined only two deep. The reserve is now the connections
+playback holds plus four for a seek's first reads (still capped at a quarter),
+and background work pipelines at full depth; it still takes no connection while
+a playback request waits for one.
+---
+ crates/nntp/src/pool.rs | 30 ++++++++++++++++++------------
+ 1 file changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index d321a680..f209e2de 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -42,13 +42,9 @@ const STREAM_HEADROOM_MIN_CONNECTIONS: usize = 4;
+ /// Background work stays bounded this long after the last playback request: reads and
+ /// seeks come in bursts.
+ const STREAM_LINGER: Duration = Duration::from_secs(2);
+-/// While bounded, background work leaves this many connections to playback (or one per
+-/// playback request, if more), up to a quarter of the limit.
+-const STREAM_RESERVE: usize = 4;
+-/// While bounded, background work pipelines at most this deep, so a connection drains
+-/// quickly when playback needs more than the reserve. Deeper than one: at provider round
+-/// trips, unpipelined requests cost much of a connection's throughput.
+-const STREAM_BACKGROUND_DEPTH: usize = 2;
++/// While bounded, background work leaves playback the connections it holds plus this
++/// many, a seek's first reads, up to a quarter of the limit.
++const STREAM_SPARE: usize = 4;
+ 
+ #[derive(Debug, Clone, Copy)]
+ pub struct PoolConfig {
+@@ -713,9 +709,9 @@ impl Pool {
+     /// instead. A `fresh` request never pipelines: it waits for an idle connection instead.
+     /// For limits of four or more, background work leaves one idle or unopened slot for
+     /// playback and waits for pending connections before pipelining. While playback is
+-    /// active or lingering, background work leaves a [`STREAM_RESERVE`] of the limit to
+-    /// playback, pipelines only [`STREAM_BACKGROUND_DEPTH`] deep and never behind
+-    /// playback, and takes no connection at all while playback waits for one.
++    /// active or lingering, background work leaves playback the connections it holds plus
++    /// [`STREAM_SPARE`], never pipelines behind playback, and takes no connection at all
++    /// while playback waits for one.
+     /// Past the admission `deadline` it fails as [`Error::Unavailable`], except that a
+     /// cold connect it started itself runs on, so a hung provider is blamed for it.
+     async fn worker(
+@@ -764,7 +760,15 @@ impl Pool {
+                 };
+                 // Connections background work holds, and may hold besides the reserve.
+                 let share = bounded.then(|| {
+-                    let reserve = state.streams.max(STREAM_RESERVE).min(limit / 4);
++                    let playing = state
++                        .workers
++                        .iter()
++                        .filter(|w| {
++                            w.load.load(Ordering::Relaxed) > 0
++                                && w.lane.load(Ordering::Relaxed) == Lane::STREAM.0
++                        })
++                        .count();
++                    let reserve = (playing + STREAM_SPARE).min(limit / 4);
+                     let busy = state.workers.iter().filter(background).count();
+                     (busy + state.connecting, limit.saturating_sub(reserve))
+                 });
+@@ -785,7 +789,9 @@ impl Pool {
+                         let load = worker.load.load(Ordering::Relaxed);
+                         !bounded
+                             || (load == 0 && !capped)
+-                            || (!starved && load < STREAM_BACKGROUND_DEPTH && background(worker))
++                            || (!starved
++                                && load < self.config.pipeline_depth
++                                && background(worker))
+                     })
+                     .filter(|_| !yielding)
+                     .filter(|worker| !hold_headroom || worker.load.load(Ordering::Relaxed) > 0)

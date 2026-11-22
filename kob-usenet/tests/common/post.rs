@@ -100,6 +100,48 @@ impl Posted {
         }
     }
 
+    pub fn uneven(prefix: &str, name: &str, data: Vec<u8>, sizes: &[usize]) -> Self {
+        assert_eq!(sizes.iter().sum::<usize>(), data.len());
+        let mut at = 0;
+        let articles = sizes
+            .iter()
+            .enumerate()
+            .map(|(part, &len)| {
+                let header = Header {
+                    name,
+                    part: part + 1,
+                    total: sizes.len(),
+                    size: data.len(),
+                    range: (at, at + len),
+                };
+                let payload = &data[at..at + len];
+                at += len;
+                Article {
+                    message_id: format!("{prefix}-{part}@loopback"),
+                    wire: wire(header, payload, crc32(0, payload)),
+                }
+            })
+            .collect();
+        Self {
+            name: name.to_owned(),
+            data,
+            articles,
+        }
+    }
+
+    pub fn claiming(prefix: &str, name: &str, data: Vec<u8>, claimed: usize) -> Self {
+        let mut posted = Self::new(prefix, name, data);
+        for part in 0..posted.articles.len() {
+            let header = Header {
+                size: claimed,
+                ..posted.header(part)
+            };
+            let payload = &posted.data[posted.range(part)];
+            posted.articles[part].wire = wire(header, payload, crc32(0, payload));
+        }
+        posted
+    }
+
     pub fn header(&self, part: usize) -> Header<'_> {
         let range = self.range(part);
         Header {

@@ -1,7 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod archives;
 mod benchmark;
 mod damage;
+mod encrypted;
+mod geometry;
 mod harness;
 #[allow(dead_code)]
 #[path = "../common/nzb.rs"]
@@ -19,3 +22,4 @@ mod proxy;
 #[path = "../common/rar.rs"]
 mod rar;
 mod tiers;
+mod warming;
