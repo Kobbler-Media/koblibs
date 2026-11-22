@@ -916,6 +916,7 @@ mod tests {
                 source: NameSource::Subject,
                 set: None,
             },
+            crc32: None,
         };
         let result = inspector.files(&job, vec![output; 512], "job").await;
         assert!(matches!(result, Err(Error::Limit(TIMED_OUT))));

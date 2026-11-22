@@ -6,6 +6,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{EngineConfig, ServerConfig};
 use crate::flight::Flights;
+use crate::jobs::{JobSpec, JobStatus, Jobs};
 use crate::providers::{Accounts, Shape};
 use crate::reader::OutputReader;
 use crate::release::{OutputInfo, Release, ReleaseKey};
@@ -26,6 +27,7 @@ pub struct Engine {
     flights: Flights,
     layouts: Mutex<HashMap<ReleaseKey, Arc<Layout>>>,
     warm: JoinHandle<()>,
+    jobs: Jobs,
 }
 
 impl Engine {
@@ -38,6 +40,12 @@ impl Engine {
         };
         let client = Arc::new(Client::new(accounts.build(&config.servers, &shape)?));
         let warm = tokio::spawn(keep_warm(Arc::clone(&client)));
+        let jobs = Jobs::open(
+            &config.data_dir,
+            Arc::clone(&client),
+            config.download,
+            config.pipeline_depth,
+        )?;
         Ok(Self {
             client,
             servers: RwLock::new(config.servers),
@@ -47,6 +55,7 @@ impl Engine {
             flights: Flights::new(config.read_ahead_bytes, config.read_budget_bytes),
             layouts: Mutex::default(),
             warm,
+            jobs,
         })
     }
 
@@ -158,6 +167,29 @@ impl Engine {
             None => reader,
         };
         Ok(OutputReader::new(reader, meta.size()))
+    }
+
+    pub async fn add_job(&self, spec: JobSpec) -> Result<JobStatus, Error> {
+        self.jobs.add(spec)
+    }
+
+    #[must_use]
+    pub fn jobs(&self) -> Vec<JobStatus> {
+        self.jobs.list()
+    }
+
+    #[must_use]
+    pub fn job(&self, id: &str) -> Option<JobStatus> {
+        self.jobs.get(id)
+    }
+
+    pub async fn remove_job(&self, id: &str, delete_files: bool) -> Result<(), Error> {
+        self.jobs.remove(id, delete_files).await
+    }
+
+    #[must_use]
+    pub fn paused_for_space(&self) -> bool {
+        self.jobs.paused_for_space()
     }
 
     #[must_use]

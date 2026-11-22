@@ -43,8 +43,9 @@ which drives upstream's database-backed queue service.
 | 11 | Endpoint address family preference | ours |
 | 12 | Import concurrency in `Rules`, one lane per import job | ours + SuperFork `0156be60` queue part |
 | 13 | Per-provider retention | ours |
+| 14 | Archive member CRC on import outputs | ours, for the downloader's member check |
 
-Patches 5–13 are candidates to offer upstream.
+Patches 5–14 are candidates to offer upstream.
 
 ## Monthly sync
 

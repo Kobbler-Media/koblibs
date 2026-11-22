@@ -17,20 +17,27 @@ mod engine;
 mod error;
 mod flight;
 mod import_mode;
+mod jobs;
 mod providers;
 mod purpose;
 mod reader;
 mod release;
+mod repair;
+mod space;
 mod store;
+mod unpack;
+mod writer;
 
 #[allow(unsafe_code, clippy::all, clippy::pedantic, unused, rustdoc::all)]
 pub mod vendor;
 
-pub use config::{EngineConfig, IpPreference, ServerConfig};
+pub use config::{DownloadConfig, EngineConfig, IpPreference, ServerConfig};
 pub use engine::Engine;
 pub use error::Error;
 pub use import_mode::ImportMode;
+pub use jobs::{JobSpec, JobState, JobStatus};
 pub use purpose::Purpose;
 pub use reader::OutputReader;
 pub use release::{InvalidKey, OutputInfo, Release, ReleaseKey};
+pub use space::{FreeSpace, Statvfs};
 pub use vendor::nntp::ProviderStats;

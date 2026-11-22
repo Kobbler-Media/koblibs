@@ -11,6 +11,7 @@ const MULTI_VOLUME: u64 = 0x1;
 const NUMBERED: u64 = 0x2;
 const MORE_VOLUMES: u64 = 0x1;
 const UNIX: u64 = 1;
+const DATA_CRC: u64 = 0x4;
 
 pub struct Member<'a> {
     pub name: &'a str,
@@ -93,9 +94,10 @@ fn open(number: usize, multi: bool) -> Vec<u8> {
 
 fn file_header(member: &Member<'_>, flags: u64, data_len: usize) -> Vec<u8> {
     let mut fields = Vec::new();
-    fields.extend(vint(0));
+    fields.extend(vint(DATA_CRC));
     fields.extend(vint(member.data.len() as u64));
     fields.extend(vint(0o644));
+    fields.extend(crc32(0, member.data).to_le_bytes());
     fields.extend(vint(0));
     fields.extend(vint(UNIX));
     fields.extend(vint(member.name.len() as u64));

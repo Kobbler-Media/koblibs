@@ -30,9 +30,20 @@ impl Posted {
 }
 
 pub fn nzb(files: &[Listed<'_>]) -> Vec<u8> {
+    nzb_with(&[], files)
+}
+
+pub fn nzb_with(meta: &[(&str, &str)], files: &[Listed<'_>]) -> Vec<u8> {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
     );
+    if !meta.is_empty() {
+        xml.push_str("<head>\n");
+        for (kind, value) in meta {
+            let _ = writeln!(xml, "<meta type=\"{kind}\">{value}</meta>");
+        }
+        xml.push_str("</head>\n");
+    }
     for (n, file) in files.iter().enumerate() {
         let subject =
             format!("[{}/{}] - {}", n + 1, files.len(), file.subject).replace('"', "&quot;");

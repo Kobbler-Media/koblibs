@@ -214,6 +214,8 @@ pub struct Output {
     pub path: Vec<String>,
     pub meta: FileMeta,
     pub origin: Origin,
+    /// CRC32 of the whole plaintext file from its archive header, when recorded there.
+    pub crc32: Option<u32>,
 }
 
 /// What gave an output its name.
@@ -1393,6 +1395,7 @@ fn plain(v: Volume, origin: Origin) -> Option<Output> {
             proof: part.proof,
         }),
         origin,
+        crc32: None,
     })
 }
 
@@ -1484,6 +1487,8 @@ struct Member {
     crypt: Option<Encryption>,
     open: bool,
     parts: Vec<FilePart>,
+    /// From the last volume's header: the CRC of the whole file.
+    crc32: Option<u32>,
 }
 
 async fn rar_set(
@@ -1533,6 +1538,7 @@ async fn rar_set(
                     crypt: e.crypt.clone(),
                     open: false,
                     parts: Vec::new(),
+                    crc32: None,
                 });
                 members.last_mut().expect("pushed above")
             };
@@ -1540,6 +1546,9 @@ async fn rar_set(
             member.stored &= e.stored;
             member.encrypted |= e.encrypted;
             member.open = e.split_after;
+            if !e.split_after {
+                member.crc32 = e.crc32;
+            }
             member.size = e.size.or(member.size);
         }
     }
@@ -1609,6 +1618,8 @@ async fn rar_set(
                     source: NameSource::ArchiveHeader,
                     set,
                 },
+                // RAR5 stores an encrypted file's CRC keyed by the password.
+                crc32: m.crc32.filter(|_| !m.encrypted),
             });
         }
     }
@@ -1783,6 +1794,7 @@ async fn sevenzip_set(
                     source: NameSource::ArchiveHeader,
                     set,
                 },
+                crc32: e.crc32,
             });
         }
     }
@@ -1804,6 +1816,7 @@ fn split_set(vols: Vec<Volume>, origin: Origin) -> Option<Output> {
         path,
         meta: FileMeta::Multipart(MultipartFile { parts, crypt: None }),
         origin,
+        crc32: None,
     })
 }
 
@@ -2295,6 +2308,7 @@ mod tests {
                     proof: None,
                 }),
                 origin: POSTED,
+                crc32: None,
             };
 
             let error = check_articles(&job, vec![output], 100).await.unwrap_err();
@@ -2399,6 +2413,7 @@ mod tests {
                 crypt: None,
             }),
             origin: POSTED,
+            crc32: None,
         };
         let mut outputs = vec![
             out("a1b2c3d4e5f6.mkv"),
@@ -2440,6 +2455,7 @@ mod tests {
                 crypt: None,
             }),
             origin: POSTED,
+            crc32: None,
         }];
         assert!(require(&disc, &[media::Kind::Video]).is_err());
         assert!(require(&disc, &[]).is_ok(), "unowned categories keep it");

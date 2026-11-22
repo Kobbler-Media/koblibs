@@ -26,6 +26,10 @@ pub enum Error {
     Stored(String),
     #[error("reader: {0}")]
     Reader(#[from] vendor::vfs::Error),
+    #[error("a job with id {0} already exists")]
+    DuplicateJob(String),
+    #[error("unknown job {0}")]
+    UnknownJob(String),
     #[error("data directory: {0}")]
     Io(#[from] std::io::Error),
 }

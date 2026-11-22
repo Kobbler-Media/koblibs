@@ -1,7 +1,10 @@
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::day;
+use crate::space::{FreeSpace, Statvfs};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IpPreference {
@@ -76,11 +79,12 @@ pub struct EngineConfig {
     pub nzb_cache_bytes: u64,
     pub read_ahead_bytes: u64,
     pub read_budget_bytes: usize,
+    pub download: DownloadConfig,
 }
 
 impl EngineConfig {
     #[must_use]
-    pub const fn new(data_dir: PathBuf, servers: Vec<ServerConfig>) -> Self {
+    pub fn new(data_dir: PathBuf, servers: Vec<ServerConfig>) -> Self {
         Self {
             servers,
             data_dir,
@@ -89,6 +93,45 @@ impl EngineConfig {
             nzb_cache_bytes: 256 << 20,
             read_ahead_bytes: 32 << 20,
             read_budget_bytes: 256 << 20,
+            download: DownloadConfig::default(),
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct DownloadConfig {
+    pub active_jobs: usize,
+    pub free_space_floor: u64,
+    pub free_space: Arc<dyn FreeSpace>,
+    pub unrar: PathBuf,
+    pub sevenzip: PathBuf,
+    pub repair_memory_bytes: usize,
+    pub straggler_after: Duration,
+}
+
+impl Default for DownloadConfig {
+    fn default() -> Self {
+        Self {
+            active_jobs: 2,
+            free_space_floor: 1 << 30,
+            free_space: Arc::new(Statvfs),
+            unrar: PathBuf::from("unrar"),
+            sevenzip: PathBuf::from("7z"),
+            repair_memory_bytes: 1 << 30,
+            straggler_after: Duration::from_secs(2),
+        }
+    }
+}
+
+impl fmt::Debug for DownloadConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DownloadConfig")
+            .field("active_jobs", &self.active_jobs)
+            .field("free_space_floor", &self.free_space_floor)
+            .field("unrar", &self.unrar)
+            .field("sevenzip", &self.sevenzip)
+            .field("repair_memory_bytes", &self.repair_memory_bytes)
+            .field("straggler_after", &self.straggler_after)
+            .finish_non_exhaustive()
     }
 }
