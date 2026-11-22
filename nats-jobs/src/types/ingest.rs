@@ -22,4 +22,8 @@ pub enum IngestResultStatus {
     /// temporarily unavailable) but will retry automatically. The download
     /// orchestrator should NOT re-search or treat this as a permanent failure.
     Deferred,
+    /// The ingest failed for a reason outside the release (the files could not
+    /// be fetched from the orchestrator or stored). The orchestrator should
+    /// resend the ingest later and must not hold it against the release.
+    Retry,
 }
