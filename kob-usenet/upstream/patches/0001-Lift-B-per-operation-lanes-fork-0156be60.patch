@@ -1,0 +1,401 @@
+From abbb8ffb02e9aa8fba77929b2cfbb62805d3e240 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Sun, 22 Nov 2026 22:10:30 +1100
+Subject: [PATCH 01/13] Lift B: per-operation lanes (fork 0156be60)
+
+Lane test uses upstream LoopbackServer::hold_article instead of the fork's
+start_gated_many (fork e78f37e8 testkit gate not lifted).
+---
+ crates/nntp/src/client.rs   |  63 ++++++++++++++++-
+ crates/nntp/src/lib.rs      |   2 +-
+ crates/nntp/src/pool.rs     |  35 +++++++---
+ crates/nntp/tests/client.rs | 135 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 225 insertions(+), 10 deletions(-)
+
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index c11bf9ab..203789b2 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -1,5 +1,5 @@
+ use std::collections::HashMap;
+-use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+ use std::time::{Duration, Instant};
+ 
+@@ -15,6 +15,23 @@ use crate::pool::{Command, Failure, Load, Pool, Tag, join_all};
+ use crate::stats::{self, ProviderStats, Rescue, Stats, Workload};
+ use crate::{Error, Progress};
+ 
++/// Requests in one lane may pipeline together, but never behind another lane's
++/// unfinished reply. Import jobs use distinct lanes so a stalled job cannot capture
++/// a different job's otherwise independent connection work.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Lane(pub(crate) u64);
++impl Default for Lane {
++    fn default() -> Self {
++        static NEXT: AtomicU64 = AtomicU64::new(1);
++        loop {
++            let id = NEXT.fetch_add(1, Ordering::Relaxed);
++            if id != 0 {
++                return Self(id);
++            }
++        }
++    }
++}
++
+ /// Sees every body a request returns, with the message-id, who asked, and whether the
+ /// caller had already left (the reply was drained to keep the connection in sync).
+ pub type BodySink = Box<dyn Fn(&str, Workload, &Body, bool) + Send + Sync>;
+@@ -384,6 +401,50 @@ impl Client {
+         self.body_tagged(message_id, tag).await
+     }
+ 
++    /// A BODY belonging to one independently scheduled operation. Requests from the
++    /// same lane retain normal pipelining and the global provider/permit limits.
++    pub async fn body_in_lane(
++        &self,
++        message_id: &str,
++        lane: Lane,
++        workload: Workload,
++        probe: Option<&Probe>,
++        begin: Option<u64>,
++    ) -> Result<Body, Error> {
++        self.body_tagged(
++            message_id,
++            Tag {
++                lane: Some(lane),
++                workload,
++                probe: probe.cloned(),
++                begin,
++                ..Tag::UNTRACKED
++            },
++        )
++        .await
++    }
++    /// A STAT in the same connection lane as that operation's BODY requests.
++    pub async fn stat_in_lane(
++        &self,
++        message_id: &str,
++        lane: Lane,
++        workload: Workload,
++        probe: Option<&Probe>,
++    ) -> Result<(), Error> {
++        self.request(
++            Command::Stat,
++            message_id,
++            Tag {
++                lane: Some(lane),
++                workload,
++                probe: probe.cloned(),
++                ..Tag::UNTRACKED
++            },
++        )
++        .await
++        .map(drop)
++    }
++
+     /// A playback body racing a slow fetch of the same article: waits for an idle
+     /// connection rather than pipeline behind another request.
+     pub async fn hedge(
+diff --git a/crates/nntp/src/lib.rs b/crates/nntp/src/lib.rs
+index 348c5bc0..8940ec65 100644
+--- a/crates/nntp/src/lib.rs
++++ b/crates/nntp/src/lib.rs
+@@ -23,7 +23,7 @@ use bytes::Bytes;
+ 
+ pub use article::{Body, MAX_DECODED_LEN};
+ pub use bandwidth::Bandwidth;
+-pub use client::{BodySink, Client, Lease, Provider};
++pub use client::{BodySink, Client, Lane, Lease, Provider};
+ pub use connection::{Connection, ConnectionStats, Endpoint, Phase, Progress, Timing, TlsMode};
+ pub use downloads::Downloads;
+ pub use pool::{Pool, PoolConfig};
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index 2b3702a1..91b0afba 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -1,7 +1,7 @@
+ use std::collections::VecDeque;
+ use std::future::{Future, poll_fn};
+ use std::pin::{Pin, pin};
+-use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+ use std::task::Poll;
+ use std::time::{Duration, Instant};
+@@ -11,7 +11,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
+ use tokio::time::timeout;
+ 
+ use crate::article::Body;
+-use crate::client::BodySink;
++use crate::client::{BodySink, Lane};
+ use crate::connection::{ConnectionStats, Link, Phase, Timing, validate_message_id};
+ use crate::downloads::{Downloads, Permit};
+ use crate::stats::{Stats, Workload, outcome};
+@@ -152,6 +152,7 @@ pub(crate) enum Failure {
+ }
+ 
+ struct Worker {
++    lane: AtomicU64,
+     tx: mpsc::Sender<Request>,
+     load: Arc<AtomicUsize>,
+     task: tokio::task::AbortHandle,
+@@ -181,6 +182,7 @@ pub(crate) struct Tag {
+     pub(crate) fresh: bool,
+     /// A provider's miss is remembered, so later requests skip that provider.
+     pub(crate) remember: bool,
++    pub(crate) lane: Option<Lane>,
+ }
+ 
+ impl Tag {
+@@ -194,6 +196,7 @@ impl Tag {
+         sink: None,
+         fresh: false,
+         remember: true,
++        lane: None,
+     };
+ 
+     fn step(&self, step: Step) {
+@@ -384,7 +387,7 @@ impl Pool {
+             reserved
+         };
+         // Dropping a new connection's load leaves it idle in the pool.
+-        join_all((0..reserved).map(|_| self.open(self.connecting(), None))).await;
++        join_all((0..reserved).map(|_| self.open(self.connecting(), None, None))).await;
+     }
+ 
+     /// Ends every connection now, abandoning the requests on them.
+@@ -535,7 +538,8 @@ impl Pool {
+             }
+             .ok_or(Failure::Request(Error::Closed))?;
+             tag.step(Step::Permitted { provider });
+-            let (tx, load, ahead, connection) = self.worker(stream, tag.fresh, deadline).await?;
++            let (tx, load, ahead, connection) =
++                self.worker(stream, tag.fresh, deadline, tag.lane).await?;
+             budget = budget.saturating_sub(admitted.elapsed());
+             tag.step(Step::Connected {
+                 provider,
+@@ -587,6 +591,7 @@ impl Pool {
+         stream: bool,
+         fresh: bool,
+         deadline: Option<tokio::time::Instant>,
++        lane: Option<Lane>,
+     ) -> Result<(mpsc::Sender<Request>, Load, usize, u32), Failure> {
+         let (mut impatient, mut first) = (false, true);
+         loop {
+@@ -618,6 +623,12 @@ impl Pool {
+                     .workers
+                     .iter()
+                     .filter(|worker| !hold_headroom || worker.load.load(Ordering::Relaxed) > 0)
++                    .filter(|worker| {
++                        lane.is_none_or(|lane| {
++                            worker.load.load(Ordering::Relaxed) == 0
++                                || worker.lane.load(Ordering::Relaxed) == lane.0
++                        })
++                    })
+                     .min_by_key(|w| w.load.load(Ordering::Relaxed));
+                 let reserved = match best {
+                     // Spread before pipelining: providers cap bandwidth per connection,
+@@ -627,6 +638,12 @@ impl Pool {
+                             || (!fresh && (impatient || (!spare && state.connecting == 0))) =>
+                     {
+                         let ahead = w.load.load(Ordering::Relaxed);
++                        // An unscoped caller makes the connection mixed until idle;
++                        // scoped callers may not pipeline behind that unknown work.
++                        if ahead == 0 || lane.is_none() {
++                            w.lane
++                                .store(lane.map_or(0, |lane| lane.0), Ordering::Relaxed);
++                        }
+                         return Ok((
+                             w.tx.clone(),
+                             Load::watched(&w.load, &self.changed),
+@@ -662,7 +679,7 @@ impl Pool {
+                 let until = deadline
+                     .filter(|_| !(stream && live))
+                     .map(|deadline| deadline.max(now + STREAM_CONNECT_WAIT));
+-                let mut open = Box::pin(self.open(self.connecting(), until));
++                let mut open = Box::pin(self.open(self.connecting(), until, lane));
+                 let opened = if stream && live {
+                     let mut patience = now + STREAM_CONNECT_WAIT.min(self.endpoint.timeout() / 2);
+                     if let Some(deadline) = deadline {
+@@ -707,6 +724,7 @@ impl Pool {
+         &self,
+         connecting: Connecting,
+         until: Option<tokio::time::Instant>,
++        lane: Option<Lane>,
+     ) -> impl Future<Output = Result<Option<(mpsc::Sender<Request>, Load, u32)>, Failure>> + Send + 'static
+     {
+         let (endpoint, config) = (self.endpoint.clone(), self.config);
+@@ -834,6 +852,7 @@ impl Pool {
+             state.connect_error = None;
+             state.connected = true;
+             state.workers.push(Worker {
++                lane: AtomicU64::new(lane.map_or(0, |lane| lane.0)),
+                 tx: tx.clone(),
+                 load,
+                 task: task.abort_handle(),
+@@ -1080,17 +1099,17 @@ mod tests {
+         let pool = Pool::new(endpoint, config, Downloads::new(4)).unwrap();
+         let deadline = Some(tokio::time::Instant::now());
+         assert!(matches!(
+-            pool.worker(true, false, deadline).await,
++            pool.worker(true, false, deadline, None).await,
+             Err(Failure::Request(Error::Unavailable))
+         ));
+         assert_eq!(server.peak_connections(), 0);
+         assert_eq!(pool.lock().connecting, 0);
+ 
+-        let Ok((_, load, _, connection)) = pool.worker(true, false, None).await else {
++        let Ok((_, load, _, connection)) = pool.worker(true, false, None, None).await else {
+             panic!("a connection opens before admission expires");
+         };
+         drop(load);
+-        let Ok((_, load, _, reused)) = pool.worker(true, false, deadline).await else {
++        let Ok((_, load, _, reused)) = pool.worker(true, false, deadline, None).await else {
+             panic!("an idle connection is reusable after admission expires");
+         };
+         assert_eq!(reused, connection);
+diff --git a/crates/nntp/tests/client.rs b/crates/nntp/tests/client.rs
+index 2f820a76..db12dcca 100644
+--- a/crates/nntp/tests/client.rs
++++ b/crates/nntp/tests/client.rs
+@@ -1207,3 +1207,138 @@ async fn requests_during_the_connect_backoff_count_one_connect_failure() {
+         "every caller still saw its failure"
+     );
+ }
++
++#[tokio::test]
++async fn independent_lanes_do_not_pipeline_behind_another_jobs_stalled_reply() {
++    let articles = post("lanes", "fixture.bin", &[3; 32], 16);
++    let first = articles[0].message_id.clone();
++    let second = articles[1].message_id.clone();
++    let server = LoopbackServer::start(articles).await.unwrap();
++    let (arrived_a, release_a) = server.hold_article(&first);
++    let (arrived_b, release_b) = server.hold_article(&second);
++    let downloads = Downloads::new(8);
++    let pool = Pool::new(
++        Endpoint::new(
++            "127.0.0.1",
++            server.addr().port(),
++            TlsMode::Plain,
++            None,
++            Duration::from_secs(60),
++        )
++        .unwrap(),
++        PoolConfig {
++            max_connections: 2,
++            pipeline_depth: 2,
++            idle_timeout: Duration::from_secs(30),
++            min_connections: 0,
++        },
++        Arc::clone(&downloads),
++    )
++    .unwrap();
++    let client = Arc::new(Client::new([Provider {
++        pool,
++        key: "fixture".into(),
++        name: "fixture".into(),
++        priority: 0,
++        backbone: None,
++    }]));
++    let lane_a = infinidysk_nntp::Lane::default();
++    let lane_b = infinidysk_nntp::Lane::default();
++    let a = {
++        let client = Arc::clone(&client);
++        tokio::spawn(async move {
++            client
++                .body_in_lane(&first, lane_a, Workload::Queue, None, None)
++                .await
++        })
++    };
++    tokio::time::timeout(Duration::from_secs(5), arrived_a)
++        .await
++        .unwrap()
++        .unwrap();
++    let connection_a = client.stats()[0].connections[0].id;
++    let b = {
++        let client = Arc::clone(&client);
++        let second = second.clone();
++        tokio::spawn(async move {
++            client
++                .body_in_lane(&second, lane_b, Workload::Queue, None, None)
++                .await
++        })
++    };
++    tokio::time::timeout(Duration::from_secs(5), arrived_b)
++        .await
++        .unwrap()
++        .unwrap();
++    let stat = {
++        let client = Arc::clone(&client);
++        tokio::spawn(async move {
++            client
++                .stat_in_lane(&second, lane_b, Workload::Queue, None)
++                .await
++        })
++    };
++    tokio::time::timeout(Duration::from_secs(5), async {
++        loop {
++            if client.stats()[0]
++                .connections
++                .iter()
++                .map(|c| c.requests)
++                .sum::<usize>()
++                == 3
++            {
++                break;
++            }
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .expect("same-lane STAT pipelined before either BODY was released");
++    let stats = client.stats();
++    let connections = &stats[0].connections;
++    assert_eq!(connections.len(), 2);
++    assert_eq!(
++        connections
++            .iter()
++            .find(|c| c.id == connection_a)
++            .unwrap()
++            .requests,
++        1,
++        "another job cannot queue behind held A"
++    );
++    assert_eq!(
++        connections
++            .iter()
++            .find(|c| c.id != connection_a)
++            .unwrap()
++            .requests,
++        2,
++        "same-lane BODY and STAT retain pipelining"
++    );
++    release_b.send(()).unwrap();
++    tokio::time::timeout(Duration::from_secs(5), b)
++        .await
++        .unwrap()
++        .unwrap()
++        .unwrap();
++    tokio::time::timeout(Duration::from_secs(5), stat)
++        .await
++        .unwrap()
++        .unwrap()
++        .unwrap();
++    assert!(
++        !a.is_finished(),
++        "independent job finished while A was still held"
++    );
++    release_a.send(()).unwrap();
++    a.await.unwrap().unwrap();
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while client.stats()[0].busy != 0 {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .unwrap();
++    assert_eq!(client.free_permits(), Some(8));
++    assert_eq!(server.peak_connections(), 2);
++}

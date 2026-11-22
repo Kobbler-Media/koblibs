@@ -1,0 +1,720 @@
+From bea79e4adf61031d98e05d680414efff86267992 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Sun, 22 Nov 2026 22:19:34 +1100
+Subject: [PATCH 04/13] Lift A+G: foreground demand, spare-capacity warming,
+ strict warming reads, waiting playback in load (fork 95a9d85a e05d42c6
+ f7120c54 d853830e 7641c95a)
+
+Prerequisites taken minimally: Workload::Warm, SegmentReader background /
+with_warming and Warm fault reports (fork 8284cbb7); warm_lane (fork
+b2724e71); preference(workload) / busy_permille(warming) (fork #268,
+b2d799bf) without its pending-connect and warm_waiting logic. Wire credits,
+Metered refill fix and retained-cache warming are not lifted. Fork tests use
+LoopbackServer::hold_article instead of start_gated(_many).
+---
+ crates/nntp/src/client.rs     | 153 ++++++++++++++++++++++++++++++++--
+ crates/nntp/src/downloads.rs  |  10 +++
+ crates/nntp/src/pool.rs       |  83 +++++++++++++++++-
+ crates/nntp/src/stats.rs      |   4 +-
+ crates/stream/src/lib.rs      |  78 +++++++++++++----
+ crates/stream/tests/reader.rs |  95 +++++++++++++++++++--
+ 6 files changed, 390 insertions(+), 33 deletions(-)
+
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index 5af74eab..c994195f 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -69,6 +69,18 @@ pub struct Client {
+     preempt: Arc<Mutex<Option<CancellationToken>>>,
+     /// Requests admitted and not yet finished.
+     admitted: Arc<AtomicUsize>,
++    foreground: Arc<AtomicUsize>,
++    warm_lane: Lane,
++}
++
++fn warm_target(floor: usize, held: usize, total: usize, free: usize, pressure: bool) -> usize {
++    let floor = floor.clamp(1, 8);
++    if pressure {
++        return floor;
++    }
++    held.saturating_add(free)
++        .saturating_sub(total.div_ceil(4))
++        .clamp(floor, 128)
+ }
+ 
+ /// Exclusive use of the providers for a diagnostic: background requests wait at
+@@ -108,7 +120,7 @@ struct Entry {
+ 
+ impl Entry {
+     /// Request order: lower first.
+-    fn preference(&self) -> (u32, bool, bool, usize) {
++    fn preference(&self, workload: Workload) -> (u32, bool, bool, usize) {
+         // A due probe goes first on its level, or a peer serving every request
+         // keeps it from ever being sent.
+         let due = self.breaker.probe_due();
+@@ -116,7 +128,7 @@ impl Entry {
+             self.provider.priority,
+             self.breaker.is_open() && !due,
+             !due,
+-            self.provider.pool.busy_permille(),
++            self.provider.pool.busy_permille(workload == Workload::Warm),
+         )
+     }
+ }
+@@ -133,6 +145,8 @@ impl Client {
+             gate: Arc::default(),
+             preempt: Arc::default(),
+             admitted: Arc::default(),
++            foreground: Arc::default(),
++            warm_lane: Lane::default(),
+         };
+         client.replace(providers);
+         client
+@@ -270,10 +284,18 @@ impl Client {
+                 !entry.provider.pool.exhausted()
+                     && (!entry.breaker.is_open() || entry.breaker.probe_due())
+             })
+-            .min_by_key(|entry| entry.preference())
++            .min_by_key(|entry| entry.preference(Workload::Stream))
+             .is_some_and(|entry| entry.provider.pool.can_hedge(size))
+     }
+ 
++    /// Uncached foreground callers waiting for providers. Local repaired bodies
++    /// and decoded/native cache hits do not consume this signal. Cancelled callers
++    /// stop counting even while an abandoned reply drains in the background.
++    #[must_use]
++    pub fn foreground_pending(&self) -> bool {
++        self.foreground.load(Ordering::Acquire) > 0
++    }
++
+     /// Connection limit of the first priority level.
+     #[must_use]
+     pub fn max_connections(&self) -> usize {
+@@ -286,6 +308,36 @@ impl Client {
+             .sum()
+     }
+ 
++    /// Bounded warming window from the first available provider level. Keeps a
++    /// quarter of effective connection capacity for other transfers. Pressure
++    /// reduces new scheduling to the floor; existing replies drain normally.
++    #[must_use]
++    pub fn warming_window(&self, floor: usize) -> usize {
++        let providers = self.snapshot();
++        let available = |e: &&Entry| !e.provider.pool.exhausted() && !e.breaker.is_open();
++        let level = providers
++            .iter()
++            .filter(available)
++            .map(|e| e.provider.priority)
++            .min();
++        let mut total = 0usize;
++        let mut free = 0usize;
++        let mut held = 0usize;
++        let mut pressure = self.foreground_pending();
++        for entry in providers
++            .iter()
++            .filter(available)
++            .filter(|e| Some(e.provider.priority) == level)
++        {
++            let (limit, busy, warm, waiting) = entry.provider.pool.warming_capacity();
++            total = total.saturating_add(limit);
++            free = free.saturating_add(limit.saturating_sub(busy));
++            held = held.saturating_add(warm);
++            pressure |= waiting;
++        }
++        warm_target(floor, held, total, free, pressure)
++    }
++
+     fn snapshot(&self) -> Arc<[Entry]> {
+         Arc::clone(
+             &self
+@@ -587,20 +639,24 @@ impl Client {
+         &self,
+         command: Command,
+         message_id: &str,
+-        base: Tag,
++        mut base: Tag,
+     ) -> Result<Option<Body>, Error> {
++        if base.workload == Workload::Warm {
++            base.lane = Some(self.warm_lane);
++        }
+         if message_id.is_empty() {
+             return Err(Error::NotFound);
+         }
+         validate_message_id(message_id)?;
+         let workload = base.workload;
++        let _foreground = (workload == Workload::Stream).then(|| Load::acquire(&self.foreground));
+         let _admitted = self.admit(workload).await;
+         let providers = self.snapshot();
+         if providers.is_empty() {
+             return Err(Error::Unavailable);
+         }
+         let mut order: Vec<_> = providers.iter().collect();
+-        order.sort_by_cached_key(|entry| entry.preference());
++        order.sort_by_cached_key(|entry| entry.preference(workload));
+ 
+         let mut last_error = None;
+         let mut skipped = false;
+@@ -739,6 +795,93 @@ mod tests {
+     use crate::{Downloads, Endpoint, PoolConfig, TlsMode};
+     use infinidysk_testkit::{Corpus, Impairment, LoopbackServer};
+ 
++    #[test]
++    fn warm_capacity_keeps_a_quarter_reserve_and_shrinks_without_revoking_held_replies() {
++        assert_eq!(warm_target(2, 4, 40, 30, false), 24);
++        assert_eq!(warm_target(2, 4, 40, 10, false), 4);
++        assert_eq!(warm_target(2, 12, 40, 28, true), 2);
++        assert_eq!(warm_target(3, 0, 8, 0, false), 3);
++        assert_eq!(warm_target(3, 0, 0, 0, false), 3);
++        assert_eq!(warm_target(2, 0, 400, 400, false), 128);
++        assert_eq!(warm_target(2, 0, 160, 160, false), 120);
++        assert_eq!(warm_target(2, 0, 96, 96, false), 72);
++        assert_eq!(warm_target(2, 0, 4, 4, false), 3);
++        assert_eq!(warm_target(99, 0, 0, 0, true), 8);
++    }
++    #[tokio::test]
++    async fn foreground_demand_excludes_background_work_and_cancelled_callers() {
++        for workload in [Workload::Stream, Workload::Health] {
++            let corpus = Corpus::generate(1025, 1, 1024);
++            let id = corpus.articles[0].message_id.clone();
++            let server = LoopbackServer::start(corpus.articles)
++                .await
++                .expect("server");
++            let (arrived, release) = server.hold_article(&id);
++            let downloads = Downloads::new(4);
++            let client = Arc::new(Client::new([provider(&server, &downloads)]));
++            assert!(!client.foreground_pending());
++            let task = {
++                let client = client.clone();
++                tokio::spawn(async move { client.body(&id, workload, None).await })
++            };
++            tokio::time::timeout(Duration::from_secs(5), arrived)
++                .await
++                .expect("admitted")
++                .expect("held");
++            assert_eq!(client.foreground_pending(), workload == Workload::Stream);
++            task.abort();
++            assert!(task.await.expect_err("caller cancelled").is_cancelled());
++            assert!(
++                !client.foreground_pending(),
++                "the still-draining old response is not new playback demand"
++            );
++            release.send(()).expect("still held");
++            tokio::time::timeout(Duration::from_secs(5), async {
++                while downloads.available_permits() != 4 {
++                    tokio::task::yield_now().await;
++                }
++            })
++            .await
++            .expect("drain releases permits");
++        }
++    }
++    #[tokio::test]
++    async fn playback_spreads_between_providers_before_global_admission() {
++        let first = LoopbackServer::start(Vec::new()).await.unwrap();
++        let second = LoopbackServer::start(Vec::new()).await.unwrap();
++        let downloads = Downloads::new(1);
++        let held = downloads.acquire(true, 1).await.unwrap();
++        let client = Client::new([provider(&first, &downloads), provider(&second, &downloads)]);
++        let providers = client.snapshot();
++        let mut a = Box::pin(client.body("a@loopback.invalid", Workload::Stream, None));
++        assert!(
++            std::future::poll_fn(|cx| std::task::Poll::Ready(a.as_mut().poll(cx)))
++                .await
++                .is_pending()
++        );
++        assert!(providers[0].provider.pool.busy_permille(false) > 0);
++        assert_eq!(providers[1].provider.pool.busy_permille(false), 0);
++        let mut b = Box::pin(client.body("b@loopback.invalid", Workload::Stream, None));
++        assert!(
++            std::future::poll_fn(|cx| std::task::Poll::Ready(b.as_mut().poll(cx)))
++                .await
++                .is_pending()
++        );
++        assert_eq!(
++            providers[0].provider.pool.busy_permille(false),
++            providers[1].provider.pool.busy_permille(false)
++        );
++        assert_eq!(
++            (first.peak_connections(), second.peak_connections()),
++            (0, 0)
++        );
++        drop((a, b, held));
++        for entry in providers.iter() {
++            assert_eq!(entry.provider.pool.busy_permille(false), 0);
++        }
++        assert_eq!(downloads.available_permits(), 1);
++    }
++
+     #[allow(clippy::unwrap_used)] // Test helper; panics are the assertions.
+     fn provider(server: &LoopbackServer, downloads: &Arc<Downloads>) -> Provider {
+         let port = server.addr().port();
+diff --git a/crates/nntp/src/downloads.rs b/crates/nntp/src/downloads.rs
+index 28e7bcb4..508896a6 100644
+--- a/crates/nntp/src/downloads.rs
++++ b/crates/nntp/src/downloads.rs
+@@ -52,6 +52,16 @@ impl Downloads {
+         self.lock().free
+     }
+ 
++    /// Live transfers waiting for global admission; abandoned waiters do not count.
++    pub(crate) fn pressured(&self) -> bool {
++        let lanes = self.lock();
++        lanes
++            .urgent
++            .iter()
++            .chain(&lanes.background)
++            .any(|(_, tx)| !tx.is_closed())
++    }
++
+     /// Whether [`Self::acquire`] would admit this request right now. A snapshot, not a
+     /// reservation.
+     pub(crate) fn can_acquire(&self, urgent: bool, weight: usize) -> bool {
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index 438705d5..5fccc528 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -63,6 +63,9 @@ pub struct Pool {
+     downloads: Arc<Downloads>,
+     /// Requests holding a ticket.
+     busy: Arc<AtomicUsize>,
++    warm_busy: Arc<AtomicUsize>,
++    /// Playback requests waiting for global admission or a provider connection.
++    stream_waiting: Arc<AtomicUsize>,
+     /// Connection tasks running.
+     live: Arc<AtomicUsize>,
+     state: Arc<Mutex<State>>,
+@@ -283,6 +286,7 @@ struct Ticket {
+     _download: Permit,
+     _load: Load,
+     _busy: Load,
++    _warm: Option<Load>,
+ }
+ 
+ pub(crate) struct Load(Arc<AtomicUsize>, Option<Arc<Notify>>);
+@@ -324,6 +328,8 @@ impl Pool {
+             config,
+             downloads,
+             busy: Arc::default(),
++            warm_busy: Arc::default(),
++            stream_waiting: Arc::default(),
+             live: Arc::default(),
+             state: Arc::default(),
+             changed: Arc::default(),
+@@ -462,10 +468,33 @@ impl Pool {
+         self.downloads.available_permits()
+     }
+ 
+-    /// In-flight requests per mille of capacity.
+-    pub(crate) fn busy_permille(&self) -> usize {
+-        let capacity = self.config.max_connections * self.config.pipeline_depth;
+-        self.busy().saturating_mul(1000) / capacity
++    /// Requests per mille of capacity. Playback includes requests still awaiting
++    /// admission and uses the throttled limit.
++    pub(crate) fn busy_permille(&self, warming: bool) -> usize {
++        let (capacity, pending) = if warming {
++            (self.config.max_connections * self.config.pipeline_depth, 0)
++        } else {
++            let state = self.lock();
++            (
++                self.limit(&state) * self.config.pipeline_depth,
++                self.stream_waiting.load(Ordering::Relaxed),
++            )
++        };
++        self.busy().saturating_add(pending).saturating_mul(1000) / capacity
++    }
++
++    /// Effective connection capacity, occupied request slots and physical warming
++    /// requests. Tickets keep abandoned drains counted until transport completion.
++    pub(crate) fn warming_capacity(&self) -> (usize, usize, usize, bool) {
++        let state = self.lock();
++        let limit = self.limit(&state);
++        drop(state);
++        (
++            limit,
++            self.busy.load(Ordering::Relaxed),
++            self.warm_busy.load(Ordering::Relaxed),
++            self.downloads.pressured(),
++        )
+     }
+ 
+     /// Requests in flight or queued on a connection.
+@@ -526,6 +555,7 @@ impl Pool {
+         // Shared by retries; only admission waits spend it, not transfers.
+         let mut budget = self.stream_wait;
+         loop {
++            let stream_waiting = stream.then(|| Load::acquire(&self.stream_waiting));
+             let admitted = tokio::time::Instant::now();
+             let deadline = stream.then(|| admitted + budget);
+             let acquire = self.downloads.acquire(
+@@ -552,7 +582,9 @@ impl Pool {
+                 _download: download,
+                 _load: load,
+                 _busy: Load::acquire(&self.busy),
++                _warm: (tag.workload == Workload::Warm).then(|| Load::acquire(&self.warm_busy)),
+             };
++            drop(stream_waiting);
+             let request = Request {
+                 command,
+                 message_id: message_id.to_owned(),
+@@ -1084,6 +1116,49 @@ fn enqueue(conn: &mut Connection, in_flight: &mut VecDeque<Request>, request: Re
+ mod tests {
+     use super::*;
+ 
++    #[tokio::test]
++    async fn playback_load_counts_admission_waits_and_releases_cancelled_waiters() {
++        let endpoint = Endpoint::new(
++            "127.0.0.1",
++            1,
++            crate::TlsMode::Plain,
++            None,
++            Duration::from_secs(5),
++        )
++        .unwrap();
++        let downloads = Downloads::new(1);
++        let held = downloads.acquire(true, 1).await.unwrap();
++        let pool = Pool::new(
++            endpoint,
++            PoolConfig {
++                max_connections: 4,
++                pipeline_depth: 2,
++                idle_timeout: Duration::from_secs(60),
++                min_connections: 0,
++            },
++            Arc::clone(&downloads),
++        )
++        .unwrap();
++        let mut request = Box::pin(pool.body("poc@loopback.invalid"));
++        assert!(
++            std::future::poll_fn(|cx| Poll::Ready(request.as_mut().poll(cx)))
++                .await
++                .is_pending()
++        );
++        assert_eq!(pool.busy(), 0);
++        assert_eq!(pool.busy_permille(false), 125);
++        // Playback ranks this pool against its current capacity, rather than the
++        // configured ceiling the server has just refused.
++        pool.lock().throttle = Some((2, Instant::now()));
++        assert_eq!(pool.busy_permille(false), 250);
++        drop(request);
++        assert_eq!(pool.busy_permille(false), 0);
++        assert_eq!(pool.lock().connecting, 0);
++        assert_eq!(downloads.available_permits(), 0);
++        drop(held);
++        assert_eq!(downloads.available_permits(), 1);
++    }
++
+     #[tokio::test]
+     async fn expired_admission_reuses_an_idle_connection_but_never_opens_one() {
+         let server = infinidysk_testkit::LoopbackServer::start(Vec::new())
+diff --git a/crates/nntp/src/stats.rs b/crates/nntp/src/stats.rs
+index 99277a6c..835876fd 100644
+--- a/crates/nntp/src/stats.rs
++++ b/crates/nntp/src/stats.rs
+@@ -15,10 +15,11 @@ pub enum Workload {
+     Stream,
+     Queue,
+     Health,
++    Warm,
+ }
+ 
+ impl Workload {
+-    pub const ALL: [Self; 3] = [Self::Stream, Self::Queue, Self::Health];
++    pub const ALL: [Self; 4] = [Self::Stream, Self::Queue, Self::Health, Self::Warm];
+ 
+     #[must_use]
+     pub const fn label(self) -> &'static str {
+@@ -26,6 +27,7 @@ impl Workload {
+             Self::Stream => "stream",
+             Self::Queue => "queue",
+             Self::Health => "health",
++            Self::Warm => "warm",
+         }
+     }
+ }
+diff --git a/crates/stream/src/lib.rs b/crates/stream/src/lib.rs
+index ff61e9be..f17d8d80 100644
+--- a/crates/stream/src/lib.rs
++++ b/crates/stream/src/lib.rs
+@@ -330,6 +330,8 @@ pub struct SegmentReader {
+     prewarm: bool,
+     /// Background-priority reads that fail instead of filling, padding or cutting.
+     strict: bool,
++    background: Workload,
++    warm_floor: usize,
+     budget: Option<Budget>,
+     cache: Option<Arc<Cache>>,
+     /// Segments from here on are fetched only when read: the caller's range ends before.
+@@ -382,6 +384,8 @@ impl SegmentReader {
+             prefetch,
+             prewarm: true,
+             strict: false,
++            background: Workload::Health,
++            warm_floor: 2,
+             budget: None,
+             cache: None,
+             end,
+@@ -425,6 +429,24 @@ impl SegmentReader {
+         self
+     }
+ 
++    /// Strict background warming, accounted separately from health and playback.
++    #[must_use]
++    pub const fn with_warming(self) -> Self {
++        self.with_warming_floor(2)
++    }
++
++    /// Warming starts at the selected floor and borrows unused provider capacity.
++    #[must_use]
++    pub const fn with_warming_floor(mut self, floor: usize) -> Self {
++        self.strict = true;
++        self.prewarm = false;
++        self.background = Workload::Warm;
++        self.prefetch = 128;
++        self.initial = 2;
++        self.warm_floor = floor;
++        self
++    }
++
+     /// Shares `budget` with other readers to bound decoded bytes held in memory.
+     #[must_use]
+     pub fn with_budget(mut self, budget: Budget) -> Self {
+@@ -595,6 +617,9 @@ impl SegmentReader {
+     /// Segments to keep in flight ahead of the reader. Large articles grow the window by
+     /// the opening size per segment read, so an open does not queue the whole prefetch.
+     fn ahead(&self) -> usize {
++        if self.background == Workload::Warm {
++            return self.client.warming_window(self.warm_floor);
++        }
+         if self.bounded {
+             return self.prefetch;
+         }
+@@ -619,13 +644,14 @@ impl SegmentReader {
+         // The segment being read is always fetched, even past the range end.
+         let end = self.end.max(read_index + 1).min(self.layout.segments.len());
+         while self.next < end && self.next - self.head < ahead {
+-            let (client, layout, cache, hole, index, strict) = (
++            let (client, layout, cache, hole, index, strict, background) = (
+                 Arc::clone(&self.client),
+                 Arc::clone(&self.layout),
+                 self.cache.clone(),
+                 self.hole(self.next),
+                 self.next,
+                 self.strict,
++                self.background,
+             );
+             if !strict && hole.gaps.as_ref().is_some_and(|g| g.is_hole(index)) {
+                 let size = usize::try_from(layout.segments[index].size).unwrap_or(0);
+@@ -706,7 +732,7 @@ impl SegmentReader {
+                         Some(&probe),
+                         progress,
+                         &hole,
+-                        strict,
++                        strict.then_some(background),
+                     )
+                     .await?;
+                     Ok(((data, permit, filled), started.elapsed()))
+@@ -795,7 +821,7 @@ impl SegmentReader {
+                 Some(&probe),
+                 Some(progress),
+                 &hole,
+-                false,
++                None,
+             )
+             .await?;
+             Ok(((data, None, filled), started.elapsed()))
+@@ -920,7 +946,7 @@ impl SegmentReader {
+                     Some(&probe),
+                     None,
+                     &hole,
+-                    false,
++                    None,
+                 )
+                 .await
+             }));
+@@ -1122,16 +1148,13 @@ async fn fetch(
+     probe: Option<&Probe>,
+     progress: Option<Progress>,
+     hole: &Hole,
+-    strict: bool,
++    background: Option<Workload>,
+ ) -> io::Result<(Bytes, bool)> {
+     let size = usize::try_from(segment.size)
+         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "segment too large"))?;
+     let (id, begin) = (&segment.message_id, segment.begin);
+-    let workload = if strict {
+-        Workload::Health
+-    } else {
+-        Workload::Stream
+-    };
++    let strict = background.is_some();
++    let workload = background.unwrap_or(Workload::Stream);
+     let body = match source {
+         Source::Direct => client
+             .body_with(id, workload, probe, progress.as_ref(), begin)
+@@ -1152,10 +1175,17 @@ async fn fetch(
+     };
+     match body {
+         Ok(data) if data.len() == size => Ok((data, false)),
+-        Ok(_) if strict => Err(io::Error::new(
+-            io::ErrorKind::InvalidData,
+-            "decoded size differs from layout",
+-        )),
++        Ok(_) if strict => {
++            if background == Some(Workload::Warm)
++                && let Some(report) = &hole.report
++            {
++                report(hole.index, Fault::Corrupt);
++            }
++            Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "decoded size differs from layout",
++            ))
++        }
+         Ok(data) => {
+             if let Some(suppressed) = hole.gaps.as_ref().map_or(Some(0), |gaps| gaps.log()) {
+                 tracing::warn!(
+@@ -1202,7 +1232,25 @@ async fn fetch(
+             }
+             Ok((hole.filler.fill(hole.at, size).into(), true))
+         }
+-        Err(error) => Err(io::Error::other(error)),
++        Err(error) => {
++            if background == Some(Workload::Warm)
++                && matches!(
++                    *error,
++                    Error::NotFound | Error::CrcMismatch { .. } | Error::Yenc(_)
++                )
++                && let Some(report) = &hole.report
++            {
++                report(
++                    hole.index,
++                    if matches!(*error, Error::NotFound) {
++                        Fault::Missing
++                    } else {
++                        Fault::Corrupt
++                    },
++                );
++            }
++            Err(io::Error::other(error))
++        }
+     }
+ }
+ 
+diff --git a/crates/stream/tests/reader.rs b/crates/stream/tests/reader.rs
+index 610251ed..8001e3dc 100644
+--- a/crates/stream/tests/reader.rs
++++ b/crates/stream/tests/reader.rs
+@@ -563,12 +563,19 @@ async fn response_waits_use_spare_capacity_without_moving_the_stall() {
+             1
+         } else {
+             assert!(first.is_err(), "original status lines are still blocked");
+-            assert_eq!(
+-                fast.body_commands(),
+-                0,
+-                "the cold first pool took the whole window"
+-            );
+-            assert_eq!(downloads.available_permits(), permits - PREFETCH);
++            if priority == 0 {
++                assert!(
++                    fast.body_commands() > 0,
++                    "pending connects on the first pool leave work for its peer"
++                );
++                assert!(
++                    downloads.available_permits() > 0,
++                    "finished peer requests leave admission capacity for a hedge"
++                );
++            } else {
++                assert_eq!(fast.body_commands(), 0, "priority levels stay separate");
++                assert_eq!(downloads.available_permits(), permits - PREFETCH);
++            }
+             0
+         };
+ 
+@@ -577,9 +584,9 @@ async fn response_waits_use_spare_capacity_without_moving_the_stall() {
+             reader.read_exact(&mut received[consumed..]),
+         )
+         .await;
+-        if permits > PREFETCH && priority == 0 && !transfer {
++        if priority == 0 {
+             result
+-                .expect("every head is rescued before the originals reply")
++                .expect("every stalled head is rescued by the same-priority peer")
+                 .unwrap();
+             assert!(received == corpus.data[..READ_BYTES], "exact bytes");
+             assert!(trace.summary().hedges > 0);
+@@ -882,3 +889,75 @@ fn setup_timed(
+     }));
+     (Arc::new(client), Arc::new(layout))
+ }
++
++#[tokio::test]
++async fn warming_borrows_spare_capacity_but_leaves_a_connection_for_foreground() {
++    let corpus = Corpus::generate(1025, 8, ARTICLE_SIZE);
++    let server = LoopbackServer::start(corpus.articles.clone())
++        .await
++        .unwrap();
++    let (arrived, releases): (Vec<_>, Vec<_>) = [0, 1, 2, 5]
++        .iter()
++        .map(|&i| server.hold_article(&corpus.articles[i].message_id))
++        .unzip();
++    let mut arrived = arrived.into_iter();
++    let (client, layout) = setup(&corpus, &server);
++    assert_eq!(client.warming_window(1), 3);
++    let warm = tokio::spawn({
++        let client = client.clone();
++        async move {
++            let mut reader = SegmentReader::new(client, layout, 1).with_warming_floor(1);
++            reader.set_end(3 * ARTICLE_SIZE as u64);
++            let mut data = vec![0; 3 * ARTICLE_SIZE];
++            reader.read_exact(&mut data).await.unwrap();
++            data
++        }
++    });
++    for arrival in arrived.by_ref().take(3) {
++        tokio::time::timeout(Duration::from_secs(2), arrival)
++            .await
++            .unwrap()
++            .unwrap();
++    }
++    assert_eq!(
++        server.body_commands(),
++        3,
++        "the reserved fourth connection remains free"
++    );
++    let foreground = tokio::spawn({
++        let client = client.clone();
++        let id = corpus.articles[5].message_id.clone();
++        async move {
++            client
++                .body(&id, infinidysk_nntp::Workload::Stream, None)
++                .await
++                .unwrap()
++        }
++    });
++    tokio::time::timeout(Duration::from_secs(2), arrived.next().unwrap())
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(
++        client.warming_window(1),
++        1,
++        "foreground pressure shrinks new warming admissions"
++    );
++    for release in releases {
++        release.send(()).unwrap();
++    }
++    let data = tokio::time::timeout(Duration::from_secs(2), warm)
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(data, corpus.data[..3 * ARTICLE_SIZE]);
++    assert_eq!(
++        foreground.await.unwrap().data,
++        corpus.data[5 * ARTICLE_SIZE..6 * ARTICLE_SIZE]
++    );
++    assert_eq!(
++        server.body_commands(),
++        4,
++        "the warming range did not fetch beyond its end"
++    );
++}

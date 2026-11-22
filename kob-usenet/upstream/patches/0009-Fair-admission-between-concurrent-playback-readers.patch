@@ -1,0 +1,498 @@
+From 3d8e2411205adc8938fbf81a6d24a159542f9cce Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 00:22:26 +1100
+Subject: [PATCH 09/13] Fair admission between concurrent playback readers
+
+Waiting playback requests took freed download slots strictly in arrival order,
+so a stream with a deep read-ahead queue held a second stream's reads behind its
+whole window: on a loopback provider with 4 connections at 4 MB/s, a stream
+opened 0.5 s after another got 20% of the throughput. Probe now carries the
+reader's id, and a freed slot goes to the waiting playback request of the
+reader holding the fewest slots, oldest first. The late stream now gets 40-43%.
+Background admission and the heavy-waiter rule are unchanged.
+---
+ crates/core/src/trace.rs        |   4 +
+ crates/nntp/src/downloads.rs    | 142 ++++++++++++++++++++++++--------
+ crates/nntp/src/pool.rs         |   3 +-
+ crates/nntp/tests/client.rs     |   1 +
+ crates/queue/src/import.rs      |   1 +
+ crates/stream/src/lib.rs        |   9 +-
+ crates/stream/tests/fairness.rs | 126 ++++++++++++++++++++++++++++
+ 7 files changed, 251 insertions(+), 35 deletions(-)
+ create mode 100644 crates/stream/tests/fairness.rs
+
+diff --git a/crates/core/src/trace.rs b/crates/core/src/trace.rs
+index 9d14d290..85992cae 100644
+--- a/crates/core/src/trace.rs
++++ b/crates/core/src/trace.rs
+@@ -406,6 +406,9 @@ pub struct Probe {
+     pub hedge: bool,
+     /// Expected decoded bytes, `0` when unknown.
+     pub size: u32,
++    /// The reader fetching, `0` for none: waiting playback is admitted fairly across
++    /// readers.
++    pub reader: u64,
+ }
+ 
+ impl Probe {
+@@ -952,6 +955,7 @@ mod tests {
+             segment: 0,
+             hedge: false,
+             size: 0,
++            reader: 0,
+         };
+         let done = |provider, outcome| Step::Done {
+             provider,
+diff --git a/crates/nntp/src/downloads.rs b/crates/nntp/src/downloads.rs
+index 508896a6..6545bb6d 100644
+--- a/crates/nntp/src/downloads.rs
++++ b/crates/nntp/src/downloads.rs
+@@ -1,17 +1,20 @@
+-use std::collections::VecDeque;
++use std::collections::{HashMap, VecDeque};
+ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+ 
+ use tokio::sync::oneshot;
+ 
+-/// Request slots shared by every provider pool. A freed slot goes to the oldest waiting
+-/// playback request before any background (import, health) request, so imports never
+-/// make a stream wait behind them; requests already admitted run to completion.
++/// Request slots shared by every provider pool. A freed slot goes to a waiting playback
++/// request before any background (import, health) request, so imports never make a
++/// stream wait behind them; requests already admitted run to completion. Among playback
++/// waiters it goes to the reader holding the fewest slots, oldest first, so one stream's
++/// deep read-ahead cannot queue another stream's reads behind it.
+ #[derive(Debug)]
+ pub struct Downloads {
+     lanes: Mutex<Lanes>,
+ }
+ 
+-type Waiter = (usize, oneshot::Sender<Permit>);
++/// Slots wanted, the reader asking (`0`: none of its own), and where to send the permit.
++type Waiter = (usize, u64, oneshot::Sender<Permit>);
+ 
+ #[derive(Debug)]
+ struct Lanes {
+@@ -19,16 +22,53 @@ struct Lanes {
+     free: usize,
+     urgent: VecDeque<Waiter>,
+     background: VecDeque<Waiter>,
++    /// Slots each reader's admitted playback requests hold.
++    held: HashMap<u64, usize>,
+ }
+ 
+-/// One admitted request holding `.1` slots; dropping it hands them to the next waiters.
++impl Lanes {
++    fn hold(&mut self, reader: u64, weight: usize) {
++        if reader != 0 {
++            *self.held.entry(reader).or_default() += weight;
++        }
++    }
++
++    fn unhold(&mut self, reader: u64, weight: usize) {
++        if let Some(held) = self.held.get_mut(&reader) {
++            *held = held.saturating_sub(weight);
++            if *held == 0 {
++                self.held.remove(&reader);
++            }
++        }
++    }
++
++    /// The playback waiter to admit next: the oldest of the reader holding fewest slots.
++    fn next_urgent(&self) -> Option<usize> {
++        self.urgent
++            .iter()
++            .enumerate()
++            .filter(|(_, (_, _, tx))| !tx.is_closed())
++            .min_by_key(|&(i, &(_, reader, _))| {
++                let held = if reader == 0 {
++                    0
++                } else {
++                    self.held.get(&reader).copied().unwrap_or(0)
++                };
++                (held, i)
++            })
++            .map(|(i, _)| i)
++    }
++}
++
++/// One admitted request holding `.1` slots for reader `.2`; dropping it hands them to
++/// the next waiters.
+ #[derive(Debug)]
+-pub(crate) struct Permit(Option<Arc<Downloads>>, usize);
++pub(crate) struct Permit(Option<Arc<Downloads>>, usize, u64);
+ 
+ impl Drop for Permit {
+     fn drop(&mut self) {
+         if let Some(owner) = self.0.take() {
+-            owner.release(self.1);
++            owner.release(self.1, self.2);
+         }
+     }
+ }
+@@ -42,6 +82,7 @@ impl Downloads {
+                 free: permits,
+                 urgent: VecDeque::new(),
+                 background: VecDeque::new(),
++                held: HashMap::new(),
+             }),
+         })
+     }
+@@ -59,7 +100,7 @@ impl Downloads {
+             .urgent
+             .iter()
+             .chain(&lanes.background)
+-            .any(|(_, tx)| !tx.is_closed())
++            .any(|(_, _, tx)| !tx.is_closed())
+     }
+ 
+     /// Whether [`Self::acquire`] would admit this request right now. A snapshot, not a
+@@ -74,14 +115,28 @@ impl Downloads {
+     /// Waits for `weight` slots (capped at the total); `urgent` waiters are served
+     /// before every background one, each lane strictly in order.
+     /// Cancel-safe: slots granted to a waiter that left are handed on.
++    #[cfg(test)]
+     pub(crate) async fn acquire(self: &Arc<Self>, urgent: bool, weight: usize) -> Option<Permit> {
++        self.acquire_for(urgent, weight, 0).await
++    }
++
++    /// [`acquire`](Self::acquire) for playback `reader` (`0`: none), which shares the
++    /// playback slots fairly with other readers.
++    pub(crate) async fn acquire_for(
++        self: &Arc<Self>,
++        urgent: bool,
++        weight: usize,
++        reader: u64,
++    ) -> Option<Permit> {
++        let reader = if urgent { reader } else { 0 };
+         let rx = {
+             let mut lanes = self.lock();
+             let weight = weight.clamp(1, lanes.total.max(1));
+             let queued = !lanes.urgent.is_empty() || (!urgent && !lanes.background.is_empty());
+             if !queued && lanes.free >= weight {
+                 lanes.free -= weight;
+-                return Some(Permit(Some(Arc::clone(self)), weight));
++                lanes.hold(reader, weight);
++                return Some(Permit(Some(Arc::clone(self)), weight, reader));
+             }
+             let (tx, rx) = oneshot::channel();
+             let lane = if urgent {
+@@ -91,47 +146,43 @@ impl Downloads {
+             };
+             // Amortised sweep of waiters that gave up.
+             if lane.len() >= 64 && lane.len().is_power_of_two() {
+-                lane.retain(|(_, w)| !w.is_closed());
++                lane.retain(|(_, _, w)| !w.is_closed());
+             }
+-            lane.push_back((weight, tx));
++            lane.push_back((weight, reader, tx));
+             rx
+         };
+         rx.await.ok()
+     }
+ 
+-    fn release(self: Arc<Self>, weight: usize) {
+-        let mut returned = weight;
++    fn release(self: Arc<Self>, weight: usize, reader: u64) {
++        let mut returned = (weight, reader);
+         loop {
+             let mut guard = self.lock();
+-            let Lanes {
+-                free,
+-                urgent,
+-                background,
+-                ..
+-            } = &mut *guard;
+-            *free += returned;
+-            for lane in [&mut *urgent, &mut *background] {
+-                while lane.front().is_some_and(|(_, w)| w.is_closed()) {
++            let lanes = &mut *guard;
++            lanes.free += returned.0;
++            lanes.unhold(returned.1, returned.0);
++            for lane in [&mut lanes.urgent, &mut lanes.background] {
++                while lane.front().is_some_and(|(_, _, w)| w.is_closed()) {
+                     lane.pop_front();
+                 }
+             }
+-            let lane = if urgent.is_empty() {
+-                background
+-            } else {
+-                urgent
++            let (lane, at) = match lanes.next_urgent() {
++                Some(at) => (&mut lanes.urgent, at),
++                None => (&mut lanes.background, 0),
+             };
+-            match lane.front() {
+-                Some(&(next, _)) if next <= *free => *free -= next,
++            match lane.get(at) {
++                Some(&(next, _, _)) if next <= lanes.free => lanes.free -= next,
+                 _ => return,
+             }
+-            let (next, waiter) = lane.pop_front().expect("front was just checked");
++            let (next, waiter_reader, waiter) = lane.remove(at).expect("index was just checked");
++            lanes.hold(waiter_reader, next);
+             drop(guard);
+-            returned = match waiter.send(Permit(Some(Arc::clone(&self)), next)) {
+-                Ok(()) => 0,
++            returned = match waiter.send(Permit(Some(Arc::clone(&self)), next, waiter_reader)) {
++                Ok(()) => (0, 0),
+                 // That waiter left; disarm so its slots are handed on here, not recursively.
+                 Err(mut permit) => {
+                     permit.0 = None;
+-                    next
++                    (next, waiter_reader)
+                 }
+             };
+         }
+@@ -177,6 +228,31 @@ mod tests {
+         assert_eq!(downloads.available_permits(), 1, "no slot leaked");
+     }
+ 
++    #[tokio::test]
++    async fn a_freed_slot_goes_to_the_stream_holding_fewest() {
++        let downloads = Downloads::new(2);
++        let first = downloads.acquire_for(true, 1, 1).await.unwrap();
++        let _second = downloads.acquire_for(true, 1, 1).await.unwrap();
++        let waiter = |reader| {
++            let d = Arc::clone(&downloads);
++            tokio::spawn(async move { d.acquire_for(true, 1, reader).await })
++        };
++        let deep = waiter(1);
++        tokio::task::yield_now().await;
++        let late = waiter(2);
++        tokio::task::yield_now().await;
++
++        drop(first);
++        let late = late.await.unwrap();
++        assert!(late.is_some(), "the reader holding nothing goes first");
++        assert!(
++            !deep.is_finished(),
++            "the older waiter of the deep reader waits"
++        );
++        drop(late);
++        drop(deep.await.unwrap());
++    }
++
+     #[tokio::test]
+     async fn a_heavy_waiter_is_not_overtaken_by_lighter_ones() {
+         let downloads = Downloads::new(4);
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index 76e0db44..f9687b4d 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -579,9 +579,10 @@ impl Pool {
+             let stream_waiting = stream.then(|| Load::acquire(&self.stream_waiting));
+             let admitted = tokio::time::Instant::now();
+             let deadline = stream.then(|| admitted + budget);
+-            let acquire = self.downloads.acquire(
++            let acquire = self.downloads.acquire_for(
+                 stream,
+                 self.weight(tag.probe.as_ref().map(|probe| probe.size)),
++                tag.probe.as_ref().map_or(0, |probe| probe.reader),
+             );
+             let download = match deadline {
+                 Some(deadline) => tokio::time::timeout_at(deadline, acquire)
+diff --git a/crates/nntp/tests/client.rs b/crates/nntp/tests/client.rs
+index 48abac05..a102e3c0 100644
+--- a/crates/nntp/tests/client.rs
++++ b/crates/nntp/tests/client.rs
+@@ -941,6 +941,7 @@ async fn a_large_article_takes_a_whole_depth_of_permits() {
+         segment: 0,
+         hedge: false,
+         size: 2_097_152,
++        reader: 0,
+     };
+     let fetch = tokio::spawn({
+         let (client, id) = (Arc::clone(&client), large.articles[0].message_id.clone());
+diff --git a/crates/queue/src/import.rs b/crates/queue/src/import.rs
+index 8a9fb504..7f41ba78 100644
+--- a/crates/queue/src/import.rs
++++ b/crates/queue/src/import.rs
+@@ -355,6 +355,7 @@ impl Job {
+             segment: 0,
+             hedge: false,
+             size: 0,
++            reader: 0,
+         };
+         probe.step(trace::Step::Queued);
+         let slot = self.requests.acquire().await.ok();
+diff --git a/crates/stream/src/lib.rs b/crates/stream/src/lib.rs
+index 7e7383ca..98809cf3 100644
+--- a/crates/stream/src/lib.rs
++++ b/crates/stream/src/lib.rs
+@@ -9,7 +9,7 @@ use std::future::Future;
+ use std::io::{self, SeekFrom};
+ use std::pin::Pin;
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ use std::task::{Context, Poll};
+ use std::time::Duration;
+ 
+@@ -51,6 +51,8 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(1);
+ /// whole: streaming them too would hold a second copy of each body, outside the
+ /// budget, until it is read.
+ const STREAMED_FETCHES: usize = 2;
++/// Reader ids; `0` means none, so the first is 1.
++static NEXT_READER: AtomicU64 = AtomicU64::new(1);
+ 
+ /// Why a segment was zero-filled: no provider has it, or every copy fails to decode.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -365,6 +367,9 @@ pub struct SegmentReader {
+     gaps: Option<Arc<Gaps>>,
+     /// Segment the reader has been waiting for, and since when; traced reads only.
+     waiting: Option<(usize, Instant)>,
++    /// Tells this reader's playback requests apart from other readers', for fair
++    /// admission.
++    id: u64,
+     /// When the last [`Event::Sample`] was recorded.
+     sampled: Option<Instant>,
+ }
+@@ -410,6 +415,7 @@ impl SegmentReader {
+             gaps: None,
+             waiting: None,
+             sampled: None,
++            id: NEXT_READER.fetch_add(1, Ordering::Relaxed),
+         }
+     }
+ 
+@@ -577,6 +583,7 @@ impl SegmentReader {
+             segment: segment_id(index),
+             hedge,
+             size: u32::try_from(self.layout.segments[index].size).unwrap_or(u32::MAX),
++            reader: self.id,
+         }
+     }
+ 
+diff --git a/crates/stream/tests/fairness.rs b/crates/stream/tests/fairness.rs
+new file mode 100644
+index 00000000..76b0e85c
+--- /dev/null
++++ b/crates/stream/tests/fairness.rs
+@@ -0,0 +1,126 @@
++#![allow(clippy::unwrap_used)] // Test helpers outside `#[test]` fns; panics are the assertions.
++
++use std::sync::Arc;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::Duration;
++
++use infinidysk_nntp::{
++    BodyExpectation, Client, Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode,
++};
++use infinidysk_stream::{Budget, Layout, Segment, SegmentReader};
++use infinidysk_testkit::{Article, Impairment, LoopbackServer, post};
++use tokio::io::AsyncReadExt;
++
++const ARTICLE_SIZE: usize = 256 * 1024;
++const ARTICLES: usize = 96;
++const CONNECTIONS: usize = 4;
++const DEPTH: usize = 4;
++/// ~50 ms before each reply, 4 MB/s per connection: two streams want more than the
++/// provider has.
++const IMPAIRMENT: Impairment = Impairment {
++    handshake_delay: Duration::from_millis(20),
++    response_delay: Duration::from_millis(50),
++    bandwidth: Some(4_000_000),
++};
++const HEAD_START: Duration = Duration::from_millis(500);
++const MEASURE: Duration = Duration::from_secs(3);
++
++fn file(prefix: &str, seed: u8) -> Vec<Article> {
++    let data: Vec<u8> = (0..ARTICLES * ARTICLE_SIZE)
++        .map(|i| u8::try_from(i % 251).unwrap() ^ seed)
++        .collect();
++    post(prefix, &format!("{prefix}.mkv"), &data, ARTICLE_SIZE)
++}
++
++fn layout(articles: &[Article]) -> Arc<Layout> {
++    Arc::new(Layout::new(
++        articles
++            .iter()
++            .map(|a| Segment {
++                message_id: a.message_id.clone(),
++                size: ARTICLE_SIZE as u64,
++                expected: BodyExpectation::NONE,
++            })
++            .collect(),
++    ))
++}
++
++/// Reads `layout` to the end, counting bytes into `read`.
++fn stream(
++    client: &Arc<Client>,
++    layout: Arc<Layout>,
++    budget: &Budget,
++    read: Arc<AtomicU64>,
++) -> tokio::task::JoinHandle<()> {
++    let mut reader = SegmentReader::new(Arc::clone(client), layout, 64)
++        .with_budget(budget.clone())
++        .strict(true);
++    tokio::spawn(async move {
++        let mut buf = vec![0; 64 * 1024];
++        loop {
++            let n = reader.read(&mut buf).await.unwrap();
++            if n == 0 {
++                return;
++            }
++            read.fetch_add(n as u64, Ordering::Relaxed);
++        }
++    })
++}
++
++#[tokio::test]
++async fn two_streams_under_contention_share_the_provider() {
++    let (first, second) = (file("a", 0), file("b", 0x5A));
++    let server = LoopbackServer::start_impaired(
++        first.iter().chain(&second).cloned().collect::<Vec<_>>(),
++        IMPAIRMENT,
++    )
++    .await
++    .unwrap();
++    let endpoint = Endpoint::new(
++        "127.0.0.1",
++        server.addr().port(),
++        TlsMode::Plain,
++        None,
++        Duration::from_secs(10),
++    )
++    .unwrap();
++    let config = PoolConfig {
++        max_connections: CONNECTIONS,
++        pipeline_depth: DEPTH,
++        idle_timeout: Duration::from_secs(60),
++        min_connections: 0,
++    };
++    let pool = Pool::new(endpoint, config, Downloads::new(CONNECTIONS * DEPTH)).unwrap();
++    let client = Arc::new(Client::new([Provider {
++        pool,
++        key: "loopback".into(),
++        name: "loopback".into(),
++        priority: 0,
++        backbone: None,
++    }]));
++    client.prewarm(CONNECTIONS).await;
++    let budget = Budget::new(256 << 20);
++
++    let (a, b) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
++    let early = stream(&client, layout(&first), &budget, Arc::clone(&a));
++    tokio::time::sleep(HEAD_START).await;
++    let late = stream(&client, layout(&second), &budget, Arc::clone(&b));
++    let (a0, b0) = (a.load(Ordering::Relaxed), b.load(Ordering::Relaxed));
++    tokio::time::sleep(MEASURE).await;
++    let (a1, b1) = (
++        a.load(Ordering::Relaxed) - a0,
++        b.load(Ordering::Relaxed) - b0,
++    );
++    early.abort();
++    late.abort();
++
++    let total = a1 + b1;
++    eprintln!("first {a1} B, second {b1} B in {MEASURE:?}");
++    assert!(total > 0);
++    for (name, bytes) in [("first", a1), ("second", b1)] {
++        assert!(
++            bytes * 100 >= total * 35,
++            "{name} stream got {bytes} of {total} bytes"
++        );
++    }
++}

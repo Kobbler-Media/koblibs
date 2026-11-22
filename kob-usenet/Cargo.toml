@@ -1,0 +1,48 @@
+[package]
+name = "kob-usenet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Usenet engine: NNTP pool with priority lanes, streaming reader, archive mapping, par2"
+license = "AGPL-3.0-only"
+links = "rapidyenc"
+
+[features]
+testkit = ["dep:rcgen"]
+
+[dependencies]
+aes = "0.9.3"
+bytes = "1.12.1"
+crc32fast = "1.5.2"
+flate2 = "1.1.10"
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "alloc"] }
+hmac = "0.13.0"
+lzma-rs = { version = "0.3.0", default-features = false }
+md-5 = "0.11.0"
+nix = { version = "0.31.3", default-features = false, features = ["dir", "fs"] }
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+quick-xml = "0.42.0"
+quick_cache = { version = "0.7.0", default-features = false }
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs"], optional = true }
+regex = "1.13.1"
+rustls = "0.23.45"
+serde = { version = "1.0.229", features = ["derive"] }
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+socket2 = "0.6.5"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-rustls = "0.26.6"
+tokio-util = { version = "0.7.20", features = ["io"] }
+tracing = "0.1"
+uuid = { version = "1.28.0", features = ["serde", "v4", "v7"] }
+webpki-roots = "1.0.9"
+zstd = "0.14.2"
+
+[build-dependencies]
+cmake = "0.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+kob-usenet = { path = ".", features = ["testkit"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util"] }

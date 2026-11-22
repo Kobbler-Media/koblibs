@@ -73,3 +73,28 @@ jobs:
             -e CARGO_TERM_COLOR=always \
             -v "$HOME/.cargo:/cargo" -v "$GITHUB_WORKSPACE:/w" -w /w/kob-ffmpeg \
             kobbler-tools:latest cargo test
+
+  kob-usenet:
+    name: kob-usenet (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    defaults:
+      run:
+        working-directory: kob-usenet
+    steps:
+      - uses: actions/checkout@v7
+      - name: System build deps (cmake + C++ for rapidyenc)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake g++
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kob-usenet -> target
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test

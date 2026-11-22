@@ -1,0 +1,55 @@
+From c4be74b7d98ef3438c85f8053c6bd6a5452860d2 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Sun, 22 Nov 2026 22:13:05 +1100
+Subject: [PATCH 03/13] Lift C: corrupt copy stays inconclusive after a
+ provider failure (fork dcb832f1)
+
+Upstream e8963eda (#1829) already implements the logic; only the fork's
+connection-failure test is lifted.
+---
+ crates/nntp/src/client.rs | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index 11d4297d..5af74eab 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -848,6 +848,38 @@ mod tests {
+         assert_eq!(bad.body_commands(), 1);
+     }
+ 
++    #[tokio::test]
++    async fn a_corrupt_copy_is_not_final_after_another_provider_connection_failed() {
++        let corpus = Corpus::generate(1025, 1, 1024);
++        let mut corrupt = corpus.articles[0].clone();
++        let at = corrupt
++            .wire
++            .windows(7)
++            .position(|w| w == b"pcrc32=")
++            .expect("CRC field")
++            + 7;
++        corrupt.wire[at] = if corrupt.wire[at] == b'0' { b'1' } else { b'0' };
++        let bad = LoopbackServer::start([corrupt])
++            .await
++            .expect("bad provider");
++        let failed = LoopbackServer::start_dropping(corpus.articles.clone(), 0)
++            .await
++            .expect("failed provider");
++        let downloads = Downloads::new(4);
++        let first = provider(&failed, &downloads);
++        let mut second = provider(&bad, &downloads);
++        second.priority = 1;
++        let client = Client::new([first, second]);
++        assert!(matches!(
++            client
++                .body(&corpus.articles[0].message_id, Workload::Health, None)
++                .await,
++            Err(Error::Unavailable)
++        ));
++        assert_eq!(bad.body_commands(), 1);
++        assert_eq!(downloads.available_permits(), 4);
++    }
++
+     #[tokio::test]
+     async fn a_stream_read_gives_up_without_a_download_slot() {
+         let corpus = Corpus::generate(1025, 1, 1024);

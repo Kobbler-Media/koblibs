@@ -1,0 +1,194 @@
+From dee7de5e1cc80753c62043218f952147174e4ff1 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 00:12:54 +1100
+Subject: [PATCH 08/13] Import takes part 1 from a provider whose copy matches
+
+The first-part fetch only checked offset 0, so another file's first article
+(#1915) or a short one on the primary failed the import ("the NZB lacks
+segments of this file") without trying the backup. It now expects part 1, offset
+0 and the NZB's segment count as total, failing over on a mismatch; when no
+provider matches (an NZB whose count differs from the post's total) it takes
+any first part as before.
+
+An article whose =yend CRC covers fewer bytes than its =ypart range (or a
+single-part =ybegin size) announces now fails as truncated, like one cut off
+before =yend, instead of being served short. body_unremembered takes a
+BodyExpectation.
+---
+ crates/nntp/src/client.rs     |  4 +--
+ crates/nntp/src/connection.rs | 14 +++++++---
+ crates/queue/src/import.rs    | 48 ++++++++++++++++++++++++++++++-----
+ 3 files changed, 54 insertions(+), 12 deletions(-)
+
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index 76794da6..ccc5e663 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -467,12 +467,12 @@ impl Client {
+         message_id: &str,
+         workload: Workload,
+         probe: Option<&Probe>,
+-        begin: Option<u64>,
++        expected: BodyExpectation,
+     ) -> Result<Body, Error> {
+         let tag = Tag {
+             workload,
+             probe: probe.cloned(),
+-            expected: BodyExpectation::at(begin),
++            expected,
+             remember: false,
+             ..Tag::UNTRACKED
+         };
+diff --git a/crates/nntp/src/connection.rs b/crates/nntp/src/connection.rs
+index f274d5cf..65ba1b34 100644
+--- a/crates/nntp/src/connection.rs
++++ b/crates/nntp/src/connection.rs
+@@ -31,6 +31,7 @@ const MAX_MESSAGE_ID_LEN: usize = 250;
+ const MAX_REPLY_LEN: usize = 120;
+ /// Extra decode capacity so `\r\n=yend` is reached without growing the body buffer.
+ const DECODE_SLACK: usize = 64;
++const SHORT: Error = Error::Yenc("article ended before its announced size");
+ const OTHER_PART: Error = Error::Yenc("article is another part of the file");
+ /// Longest TCP connect to an address with another one after it; also at most half the
+ /// time left, so a silent address cannot use up the connect deadline.
+@@ -621,13 +622,15 @@ impl Connection {
+         let other_part = |offset: u64| begin.is_some_and(|begin| begin != offset);
+         let mut offset = 0;
+         let mut expected = usize::try_from(file_size).unwrap_or(usize::MAX);
++        // `expected` is this article's own length: from `=ypart`, or a single-part size.
++        let mut ranged = part.is_none();
+         // Whether the offset was checked against `begin`; a `=ypart` line split across
+         // reads is only seen by the decoder, so the check waits for it or the first byte.
+         let mut checked = false;
+         if self.fill().await?.starts_with(b"=ypart ") {
+             self.read_line().await?;
+             match parse_ypart(&self.line) {
+-                Some((begin, len)) => (offset, expected) = (begin, len),
++                Some((begin, len)) => (offset, expected, ranged) = (begin, len, true),
+                 None => return self.fail_drained(Error::Yenc("invalid =ypart")).await,
+             }
+             if other_part(offset) {
+@@ -680,7 +683,7 @@ impl Connection {
+                     }
+                     // Without `=yend`, only the length shows the article is whole.
+                     if data.len() < expected {
+-                        return Err(Error::Yenc("article ended before its announced size"));
++                        return Err(SHORT);
+                     }
+                     break;
+                 }
+@@ -699,7 +702,7 @@ impl Connection {
+                                 return self.fail_drained(OTHER_PART).await;
+                             }
+                             Some((begin, len)) => {
+-                                (offset, expected) = (begin, len);
++                                (offset, expected, ranged) = (begin, len, true);
+                                 let fits = len.min(MAX_DECODED_LEN) + DECODE_SLACK;
+                                 if data.is_empty() && data.capacity() > fits {
+                                     data = Vec::with_capacity(fits);
+@@ -726,6 +729,11 @@ impl Connection {
+                                 actual: crc,
+                             });
+                         }
++                        // A CRC over fewer bytes than `=ypart` (or `=ybegin size`)
++                        // announces still leaves the rest of the range unposted.
++                        if ranged && data.len() < expected {
++                            return Err(SHORT);
++                        }
+                         break;
+                     }
+                 }
+diff --git a/crates/queue/src/import.rs b/crates/queue/src/import.rs
+index 74b5191e..8a9fb504 100644
+--- a/crates/queue/src/import.rs
++++ b/crates/queue/src/import.rs
+@@ -20,7 +20,7 @@ use infinidysk_core::{
+     ByteRange, FileMeta, FilePart, MultipartFile, NzbFile, Par2Proof, Segment, Segments, media,
+ };
+ use infinidysk_db::FirstCheck;
+-use infinidysk_nntp::{ArticleFuture, Articles, Body, Client, Workload};
++use infinidysk_nntp::{ArticleFuture, Articles, Body, BodyExpectation, Client, Workload};
+ use tokio::sync::Semaphore;
+ use tokio::task::JoinSet;
+ 
+@@ -454,7 +454,21 @@ async fn plan(
+     job.progress.plan(Step::Headers, nzb.files.len() + rest);
+     let firsts = join_all(nzb.files.iter().map(|f| {
+         let (job, id) = (Arc::clone(job), f.segments[0].id.clone());
+-        async move { fetch(&job, &id, Some(0)).await }
++        let first = BodyExpectation {
++            part: Some(1),
++            total: u32::try_from(f.segments.len()).ok(),
++            ..BodyExpectation::at(Some(0))
++        };
++        async move {
++            // Another file's first part (#1915) fails over to a provider holding this
++            // one. An NZB listing more or fewer segments than the post's `total` has no
++            // copy that matches; it takes any first part, as before.
++            match fetch_expecting(&job, &id, first).await? {
++                Fetched::Body(body) => Ok(Some(body)),
++                Fetched::Missing => Ok(None),
++                Fetched::Corrupt => fetch(&job, &id, Some(0)).await,
++            }
++        }
+     }))
+     .await
+     .into_iter()
+@@ -810,6 +824,24 @@ where
+ /// A body, or `None` when every provider lacks it or holds it corrupt. With `begin`, an
+ /// article for another part of the posted file counts as corrupt.
+ async fn fetch(job: &Job, id: &str, begin: Option<u64>) -> Result<Option<Body>, Error> {
++    Ok(
++        match fetch_expecting(job, id, BodyExpectation::at(begin)).await? {
++            Fetched::Body(body) => Some(body),
++            Fetched::Missing | Fetched::Corrupt => None,
++        },
++    )
++}
++
++enum Fetched {
++    Body(Body),
++    /// Every provider lacks it.
++    Missing,
++    /// No provider holds a copy that decodes and matches what was expected.
++    Corrupt,
++}
++
++/// [`fetch`] of a body that must match `expected`; one that does not counts as corrupt.
++async fn fetch_expecting(job: &Job, id: &str, expected: BodyExpectation) -> Result<Fetched, Error> {
+     use infinidysk_nntp::Error as E;
+     let (_slot, probe) = job.slot().await;
+     // After the slot: only the requests in flight can pass the budget.
+@@ -817,11 +849,11 @@ async fn fetch(job: &Job, id: &str, begin: Option<u64>) -> Result<Option<Body>,
+     job.progress.request();
+     let body = if job.inspected() {
+         job.client
+-            .body_unremembered(id, Workload::Queue, Some(&probe), begin)
++            .body_unremembered(id, Workload::Queue, Some(&probe), expected)
+             .await
+     } else {
+         job.client
+-            .body_with(id, Workload::Queue, Some(&probe), None, begin)
++            .body_expecting(id, Workload::Queue, Some(&probe), None, expected)
+             .await
+     };
+     job.progress.answer();
+@@ -829,13 +861,15 @@ async fn fetch(job: &Job, id: &str, begin: Option<u64>) -> Result<Option<Body>,
+     match body {
+         Ok(body) => {
+             job.received(body.data.len())?;
+-            Ok(Some(body))
++            Ok(Fetched::Body(body))
+         }
+         Err(E::NotFound) => {
+             job.missed(id);
+-            Ok(None)
++            Ok(Fetched::Missing)
++        }
++        Err(E::CrcMismatch { .. } | E::Yenc(_) | E::TooLarge | E::InvalidArgument(_)) => {
++            Ok(Fetched::Corrupt)
+         }
+-        Err(E::CrcMismatch { .. } | E::Yenc(_) | E::TooLarge | E::InvalidArgument(_)) => Ok(None),
+         Err(error) => Err(Error::Retry(error)),
+     }
+ }

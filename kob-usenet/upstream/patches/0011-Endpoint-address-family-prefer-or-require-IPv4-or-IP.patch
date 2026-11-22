@@ -1,0 +1,163 @@
+From 926c43de86a1abc90701ee9397f4cd94b6b038d7 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 00:34:36 +1100
+Subject: [PATCH 11/13] Endpoint address family: prefer or require IPv4 or IPv6
+
+Endpoint::with_family(Family) filters and orders the resolved addresses before
+connect_addresses tries them: Any (resolver order), PreferV4, PreferV6 (one
+family first, the resolver's order kept within each), V4Only and V6Only. A
+required family with no address fails the connect.
+---
+ crates/nntp/src/connection.rs | 95 +++++++++++++++++++++++++++++++++--
+ crates/nntp/src/lib.rs        |  4 +-
+ 2 files changed, 95 insertions(+), 4 deletions(-)
+
+diff --git a/crates/nntp/src/connection.rs b/crates/nntp/src/connection.rs
+index 65ba1b34..89bb59fb 100644
+--- a/crates/nntp/src/connection.rs
++++ b/crates/nntp/src/connection.rs
+@@ -269,6 +269,37 @@ pub struct Endpoint {
+     timeout: Duration,
+     usage: Option<Arc<Usage>>,
+     bandwidth: Option<Arc<Bandwidth>>,
++    family: Family,
++}
++
++/// Which resolved addresses a connect tries, and in what order.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub enum Family {
++    /// In the resolver's order.
++    #[default]
++    Any,
++    /// IPv4 first, then IPv6.
++    PreferV4,
++    /// IPv6 first, then IPv4.
++    PreferV6,
++    V4Only,
++    V6Only,
++}
++
++impl Family {
++    /// `addrs` filtered and ordered for this family; the resolver's order is kept
++    /// within each family.
++    #[must_use]
++    pub fn order(self, mut addrs: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
++        match self {
++            Self::Any => {}
++            Self::PreferV4 => addrs.sort_by_key(std::net::SocketAddr::is_ipv6),
++            Self::PreferV6 => addrs.sort_by_key(std::net::SocketAddr::is_ipv4),
++            Self::V4Only => addrs.retain(std::net::SocketAddr::is_ipv4),
++            Self::V6Only => addrs.retain(std::net::SocketAddr::is_ipv6),
++        }
++        addrs
++    }
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -304,6 +335,13 @@ impl Endpoint {
+         self
+     }
+ 
++    /// Connects over the addresses `family` allows, in its order.
++    #[must_use]
++    pub const fn with_family(mut self, family: Family) -> Self {
++        self.family = family;
++        self
++    }
++
+     /// Holds reads on connections from this endpoint to `bandwidth`'s limit.
+     #[must_use]
+     pub fn with_bandwidth(mut self, bandwidth: Arc<Bandwidth>) -> Self {
+@@ -338,6 +376,7 @@ impl Endpoint {
+             timeout,
+             usage: None,
+             bandwidth: None,
++            family: Family::Any,
+         })
+     }
+ }
+@@ -407,9 +446,11 @@ impl Connection {
+     ) -> Result<Self, Error> {
+         let timeout_after = endpoint.timeout;
+         let started = Instant::now();
+-        let addrs = resolve::PROVIDERS
+-            .resolve(&endpoint.host, endpoint.port, resolve::system)
+-            .await?;
++        let addrs = endpoint.family.order(
++            resolve::PROVIDERS
++                .resolve(&endpoint.host, endpoint.port, resolve::system)
++                .await?,
++        );
+         let resolved = Instant::now();
+         *stage = Stage::Tcp;
+         let tcp = connect_addresses(&addrs, deadline, TcpStream::connect).await?;
+@@ -967,6 +1008,54 @@ mod tests {
+         assert_eq!(tcp.peer_addr().unwrap(), good);
+     }
+ 
++    #[test]
++    fn address_families_order_or_filter_the_resolved_addresses() {
++        let addr = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
++        let resolved = vec![addr("[::1]:119"), addr("10.0.0.1:119"), addr("[::2]:119")];
++        let order = |family: Family| family.order(resolved.clone());
++        assert_eq!(order(Family::Any), resolved);
++        assert_eq!(
++            order(Family::PreferV4),
++            [addr("10.0.0.1:119"), addr("[::1]:119"), addr("[::2]:119")]
++        );
++        assert_eq!(
++            order(Family::PreferV6),
++            [addr("[::1]:119"), addr("[::2]:119"), addr("10.0.0.1:119")]
++        );
++        assert_eq!(order(Family::V4Only), [addr("10.0.0.1:119")]);
++        assert_eq!(
++            order(Family::V6Only),
++            [addr("[::1]:119"), addr("[::2]:119")]
++        );
++    }
++
++    #[tokio::test]
++    async fn a_required_family_without_an_address_fails_the_connect() {
++        let server = LoopbackServer::start(Vec::new()).await.unwrap();
++        let endpoint = |family| {
++            Endpoint::new(
++                "127.0.0.1",
++                server.addr().port(),
++                TlsMode::Plain,
++                None,
++                Duration::from_secs(5),
++            )
++            .unwrap()
++            .with_family(family)
++        };
++        for family in [Family::Any, Family::PreferV6, Family::V4Only] {
++            assert!(
++                Connection::connect(&endpoint(family)).await.is_ok(),
++                "{family:?}"
++            );
++        }
++        assert!(
++            Connection::connect(&endpoint(Family::V6Only))
++                .await
++                .is_err()
++        );
++    }
++
+     #[tokio::test]
+     async fn login_preserves_bandwidth_debt_until_the_limiter_is_attached() {
+         let server = LoopbackServer::start(Vec::new()).await.unwrap();
+diff --git a/crates/nntp/src/lib.rs b/crates/nntp/src/lib.rs
+index 45bfe54b..c4fce282 100644
+--- a/crates/nntp/src/lib.rs
++++ b/crates/nntp/src/lib.rs
+@@ -24,7 +24,9 @@ use bytes::Bytes;
+ pub use article::{Body, BodyExpectation, MAX_DECODED_LEN};
+ pub use bandwidth::Bandwidth;
+ pub use client::{BodySink, Client, Lane, Lease, Provider};
+-pub use connection::{Connection, ConnectionStats, Endpoint, Phase, Progress, Timing, TlsMode};
++pub use connection::{
++    Connection, ConnectionStats, Endpoint, Family, Phase, Progress, Timing, TlsMode,
++};
+ pub use downloads::Downloads;
+ pub use pool::{Pool, PoolConfig};
+ pub use stats::{LATENCY_BUCKETS, ProviderStats, Rescue, Workload, WorkloadStats};

@@ -1,0 +1,417 @@
+From 70f4eadfbee51263820e9f22a93b6cfce3f388da Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Sun, 22 Nov 2026 23:49:21 +1100
+Subject: [PATCH 05/13] Hard stream-first bound: playback lane, bounded
+ background work while playback is active
+
+Playback requests without a lane of their own share Lane::STREAM, so they never
+pipeline behind another lane's unfinished reply. While a playback request is in
+Pool::fetch, and for STREAM_LINGER (2 s) after the last one, background work
+(Queue, Health, Warm):
+- leaves min(max(4, playback requests), limit / 4) connections to playback,
+  letting connections drain when it holds more;
+- pipelines at most 2 deep, never onto a playback connection;
+- takes no connection while a playback request holds a slot and waits for one.
+Without playback, scheduling is unchanged.
+
+Loopback (8 connections, depth 4, 100 ms reply delay, 8 MB/s per connection,
+700 KB articles, saturating Queue load), 40 playback reads in 4-read seeks:
+before p50 867 / p95 870 / p99 870 ms, after 286 / 480 / 480 ms; Queue
+25.1 MB/s alone, 22.3 MB/s while seeking.
+---
+ crates/nntp/src/client.rs         |   5 +
+ crates/nntp/src/pool.rs           |  78 ++++++++++-
+ crates/nntp/tests/stream_first.rs | 211 ++++++++++++++++++++++++++++++
+ 3 files changed, 290 insertions(+), 4 deletions(-)
+ create mode 100644 crates/nntp/tests/stream_first.rs
+
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index c994195f..d148c4cc 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -20,6 +20,11 @@ use crate::{Error, Progress};
+ /// a different job's otherwise independent connection work.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub struct Lane(pub(crate) u64);
++impl Lane {
++    /// Every playback request without a lane of its own: playback pipelines only behind
++    /// playback.
++    pub(crate) const STREAM: Self = Self(u64::MAX);
++}
+ impl Default for Lane {
+     fn default() -> Self {
+         static NEXT: AtomicU64 = AtomicU64::new(1);
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index 5fccc528..ce9839c0 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -39,6 +39,16 @@ const STREAM_WAIT: Duration = Duration::from_secs(30);
+ const STREAM_CONNECT_WAIT: Duration = Duration::from_secs(3);
+ /// From this effective limit up, background work leaves one connection slot for playback.
+ const STREAM_HEADROOM_MIN_CONNECTIONS: usize = 4;
++/// Background work stays bounded this long after the last playback request: reads and
++/// seeks come in bursts.
++const STREAM_LINGER: Duration = Duration::from_secs(2);
++/// While bounded, background work leaves this many connections to playback (or one per
++/// playback request, if more), up to a quarter of the limit.
++const STREAM_RESERVE: usize = 4;
++/// While bounded, background work pipelines at most this deep, so a connection drains
++/// quickly when playback needs more than the reserve. Deeper than one: at provider round
++/// trips, unpipelined requests cost much of a connection's throughput.
++const STREAM_BACKGROUND_DEPTH: usize = 2;
+ 
+ #[derive(Debug, Clone, Copy)]
+ pub struct PoolConfig {
+@@ -66,6 +76,8 @@ pub struct Pool {
+     warm_busy: Arc<AtomicUsize>,
+     /// Playback requests waiting for global admission or a provider connection.
+     stream_waiting: Arc<AtomicUsize>,
++    /// Playback requests holding a download slot and waiting for a connection.
++    stream_parked: Arc<AtomicUsize>,
+     /// Connection tasks running.
+     live: Arc<AtomicUsize>,
+     state: Arc<Mutex<State>>,
+@@ -93,6 +105,10 @@ struct State {
+     /// Why that connect failed; cleared once one succeeds.
+     connect_error: Option<Arc<str>>,
+     connected: bool,
++    /// Playback requests in [`Pool::fetch`].
++    streams: usize,
++    /// Background work stays bounded until then.
++    stream_until: Option<Instant>,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -330,6 +346,7 @@ impl Pool {
+             busy: Arc::default(),
+             warm_busy: Arc::default(),
+             stream_waiting: Arc::default(),
++            stream_parked: Arc::default(),
+             live: Arc::default(),
+             state: Arc::default(),
+             changed: Arc::default(),
+@@ -554,6 +571,12 @@ impl Pool {
+         let stream = tag.workload == Workload::Stream;
+         // Shared by retries; only admission waits spend it, not transfers.
+         let mut budget = self.stream_wait;
++        let _streaming = stream.then(|| Streaming::start(&self.state));
++        let lane = if stream {
++            tag.lane.or(Some(Lane::STREAM))
++        } else {
++            tag.lane
++        };
+         loop {
+             let stream_waiting = stream.then(|| Load::acquire(&self.stream_waiting));
+             let admitted = tokio::time::Instant::now();
+@@ -570,8 +593,10 @@ impl Pool {
+             }
+             .ok_or(Failure::Request(Error::Closed))?;
+             tag.step(Step::Permitted { provider });
++            let parked = stream.then(|| Load::acquire(&self.stream_parked));
+             let (tx, load, ahead, connection) =
+-                self.worker(stream, tag.fresh, deadline, tag.lane).await?;
++                self.worker(stream, tag.fresh, deadline, lane).await?;
++            drop(parked);
+             budget = budget.saturating_sub(admitted.elapsed());
+             tag.step(Step::Connected {
+                 provider,
+@@ -617,7 +642,10 @@ impl Pool {
+     /// connect leaves it running in its own task and pipelines on a live connection
+     /// instead. A `fresh` request never pipelines: it waits for an idle connection instead.
+     /// For limits of four or more, background work leaves one idle or unopened slot for
+-    /// playback and waits for pending connections before pipelining.
++    /// playback and waits for pending connections before pipelining. While playback is
++    /// active or lingering, background work leaves a [`STREAM_RESERVE`] of the limit to
++    /// playback, pipelines only [`STREAM_BACKGROUND_DEPTH`] deep and never behind
++    /// playback, and takes no connection at all while playback waits for one.
+     /// Past the admission `deadline` it fails as [`Error::Unavailable`], except that a
+     /// cold connect it started itself runs on, so a hung provider is blamed for it.
+     async fn worker(
+@@ -651,11 +679,35 @@ impl Pool {
+                         .count();
+                     idle + limit.saturating_sub(open) <= 1
+                 };
+-                let spare = open < limit && !hold_headroom && held.is_none();
++                let linger = state
++                    .stream_until
++                    .filter(|&until| !stream && Instant::now() < until);
++                let bounded = !stream && (state.streams > 0 || linger.is_some());
++                let background = |worker: &&Worker| {
++                    worker.load.load(Ordering::Relaxed) > 0
++                        && worker.lane.load(Ordering::Relaxed) != Lane::STREAM.0
++                };
++                // Connections background work holds, and may hold besides the reserve.
++                let share = bounded.then(|| {
++                    let reserve = state.streams.max(STREAM_RESERVE).min(limit / 4);
++                    let busy = state.workers.iter().filter(background).count();
++                    (busy + state.connecting, limit.saturating_sub(reserve))
++                });
++                // Over its share, background work lets connections drain for playback.
++                let starved = bounded && self.stream_parked.load(Ordering::Relaxed) > 0
++                    || share.is_some_and(|(busy, room)| busy > room);
++                let capped = starved || share.is_some_and(|(busy, room)| busy >= room);
++                let spare = open < limit && !hold_headroom && !capped && held.is_none();
+                 let live = !state.workers.is_empty();
+                 let best = state
+                     .workers
+                     .iter()
++                    .filter(|worker| {
++                        let load = worker.load.load(Ordering::Relaxed);
++                        !bounded
++                            || (load == 0 && !capped)
++                            || (!starved && load < STREAM_BACKGROUND_DEPTH && background(worker))
++                    })
+                     .filter(|worker| !hold_headroom || worker.load.load(Ordering::Relaxed) > 0)
+                     .filter(|worker| {
+                         lane.is_none_or(|lane| {
+@@ -705,7 +757,7 @@ impl Pool {
+                     _ => false,
+                 };
+                 drop(state);
+-                (reserved, live, held)
++                (reserved, live, held.into_iter().chain(linger).min())
+             };
+             if reserved {
+                 let now = tokio::time::Instant::now();
+@@ -938,6 +990,24 @@ async fn dispatch(tx: &mpsc::Sender<Request>, mut request: Request) -> Option<Re
+     response.await.ok()
+ }
+ 
++/// Counts one playback request for the bound on background work, which lingers after it.
++struct Streaming(Arc<Mutex<State>>);
++
++impl Streaming {
++    fn start(state: &Arc<Mutex<State>>) -> Self {
++        state.lock().unwrap_or_else(PoisonError::into_inner).streams += 1;
++        Self(Arc::clone(state))
++    }
++}
++
++impl Drop for Streaming {
++    fn drop(&mut self) {
++        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
++        state.streams -= 1;
++        state.stream_until = Some(Instant::now() + STREAM_LINGER);
++    }
++}
++
+ /// Releases a reserved connection slot, also when `connect` fails or is cancelled.
+ struct Connecting {
+     state: Arc<Mutex<State>>,
+diff --git a/crates/nntp/tests/stream_first.rs b/crates/nntp/tests/stream_first.rs
+new file mode 100644
+index 00000000..33389244
+--- /dev/null
++++ b/crates/nntp/tests/stream_first.rs
+@@ -0,0 +1,211 @@
++#![allow(clippy::unwrap_used)] // Test helpers outside `#[test]` fns; panics are the assertions.
++
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::time::{Duration, Instant};
++
++use infinidysk_nntp::{Client, Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode, Workload};
++use infinidysk_testkit::{Corpus, Impairment, LoopbackServer};
++use tokio::task::JoinSet;
++
++/// A typical posted article, about 700 KB.
++const ARTICLE_SIZE: usize = 700 * 1024;
++const ARTICLES: usize = 48;
++const CONNECTIONS: usize = 8;
++const DEPTH: usize = 4;
++const BANDWIDTH: usize = 8_000_000;
++/// A remote provider: ~100 ms before each reply, ~8 MB/s per connection.
++const IMPAIRMENT: Impairment = Impairment {
++    handshake_delay: Duration::from_millis(100),
++    response_delay: Duration::from_millis(100),
++    bandwidth: Some(BANDWIDTH as u64),
++};
++
++struct Fixture {
++    corpus: Arc<Corpus>,
++    client: Arc<Client>,
++    _server: LoopbackServer,
++}
++
++async fn fixture() -> Fixture {
++    let corpus = Arc::new(Corpus::generate(1025, ARTICLES, ARTICLE_SIZE));
++    let server = LoopbackServer::start_impaired(corpus.articles.clone(), IMPAIRMENT)
++        .await
++        .unwrap();
++    let endpoint = Endpoint::new(
++        "127.0.0.1",
++        server.addr().port(),
++        TlsMode::Plain,
++        None,
++        Duration::from_secs(10),
++    )
++    .unwrap();
++    let config = PoolConfig {
++        max_connections: CONNECTIONS,
++        pipeline_depth: DEPTH,
++        idle_timeout: Duration::from_secs(60),
++        min_connections: 0,
++    };
++    let pool = Pool::new(endpoint, config, Downloads::new(CONNECTIONS * DEPTH)).unwrap();
++    let client = Arc::new(Client::new([Provider {
++        pool,
++        key: "loopback".into(),
++        name: "loopback".into(),
++        priority: 0,
++        backbone: None,
++    }]));
++    client.prewarm(CONNECTIONS).await;
++    Fixture {
++        corpus,
++        client,
++        _server: server,
++    }
++}
++
++/// Queue downloads keeping every request slot busy until dropped; counts bytes.
++struct QueueLoad {
++    stop: Arc<AtomicBool>,
++    bytes: Arc<AtomicU64>,
++    tasks: JoinSet<()>,
++}
++
++impl QueueLoad {
++    fn start(fixture: &Fixture) -> Self {
++        let stop = Arc::new(AtomicBool::new(false));
++        let bytes = Arc::new(AtomicU64::new(0));
++        let mut tasks = JoinSet::new();
++        for worker in 0..CONNECTIONS * DEPTH * 2 {
++            let (client, corpus) = (Arc::clone(&fixture.client), Arc::clone(&fixture.corpus));
++            let (stop, bytes) = (Arc::clone(&stop), Arc::clone(&bytes));
++            tasks.spawn(async move {
++                let mut index = worker;
++                while !stop.load(Ordering::Relaxed) {
++                    let id = &corpus.articles[index % ARTICLES].message_id;
++                    let body = client.body(id, Workload::Queue, None).await.unwrap();
++                    bytes.fetch_add(body.data.len() as u64, Ordering::Relaxed);
++                    index += CONNECTIONS * DEPTH * 2;
++                }
++            });
++        }
++        Self { stop, bytes, tasks }
++    }
++
++    /// MB/s while `during` runs.
++    async fn throughput<T>(&self, during: impl Future<Output = T>) -> (f64, T) {
++        let (before, started) = (self.bytes.load(Ordering::Relaxed), Instant::now());
++        let output = during.await;
++        let bytes = self.bytes.load(Ordering::Relaxed) - before;
++        let bytes = usize::try_from(bytes).unwrap();
++        (megabytes(bytes) / started.elapsed().as_secs_f64(), output)
++    }
++
++    async fn stop(mut self) {
++        self.stop.store(true, Ordering::Relaxed);
++        while let Some(task) = self.tasks.join_next().await {
++            task.unwrap();
++        }
++    }
++}
++
++fn megabytes(bytes: usize) -> f64 {
++    f64::from(u32::try_from(bytes).unwrap()) / 1e6
++}
++
++fn percentile(sorted: &[Duration], p: usize) -> Duration {
++    sorted[(sorted.len() * p).div_ceil(100).max(1) - 1]
++}
++
++/// Seeks while Queue work saturates the pool: each fetches the segment at the seek point
++/// and the three after it, as a reader's window does. Returns every read's latency.
++async fn seek_under_load(fixture: &Fixture, seeks: usize) -> Vec<Duration> {
++    let mut latencies = Vec::new();
++    for seek in 0..=seeks {
++        let mut window = JoinSet::new();
++        for segment in 0..4 {
++            let client = Arc::clone(&fixture.client);
++            let id = fixture.corpus.articles[(seek * 7 + segment) % ARTICLES]
++                .message_id
++                .clone();
++            window.spawn(async move {
++                let started = Instant::now();
++                client.body(&id, Workload::Stream, None).await.unwrap();
++                started.elapsed()
++            });
++        }
++        while let Some(latency) = window.join_next().await {
++            // Untimed: playback starts with the pool still full of queued downloads.
++            if seek > 0 {
++                latencies.push(latency.unwrap());
++            }
++        }
++        tokio::time::sleep(Duration::from_millis(300)).await;
++    }
++    latencies.sort_unstable();
++    latencies
++}
++
++#[tokio::test]
++async fn playback_reads_are_not_queued_behind_a_saturating_download() {
++    let fixture = fixture().await;
++    let load = QueueLoad::start(&fixture);
++    let (alone, ()) = load
++        .throughput(tokio::time::sleep(Duration::from_secs(2)))
++        .await;
++    let (shared, reads) = load.throughput(seek_under_load(&fixture, 10)).await;
++    load.stop().await;
++    let (p50, p95, p99) = (
++        percentile(&reads, 50),
++        percentile(&reads, 95),
++        percentile(&reads, 99),
++    );
++    eprintln!(
++        "stream reads={} p50={p50:?} p95={p95:?} p99={p99:?}; queue {alone:.1} MB/s alone, \
++         {shared:.1} MB/s while seeking",
++        reads.len()
++    );
++    // One read on an idle connection takes ~0.3 s; behind four queued articles, ~0.9 s.
++    assert!(p99 < Duration::from_millis(700), "p99 {p99:?}");
++    assert!(shared > alone * 0.8, "{shared:.1} of {alone:.1} MB/s");
++}
++
++#[tokio::test]
++async fn queue_work_pipelines_fully_once_playback_has_gone_quiet() {
++    let fixture = fixture().await;
++    let load = QueueLoad::start(&fixture);
++    let id = &fixture.corpus.articles[0].message_id;
++    fixture
++        .client
++        .body(id, Workload::Stream, None)
++        .await
++        .unwrap();
++    // Past the bound's linger after the last playback request.
++    tokio::time::sleep(Duration::from_millis(2500)).await;
++    let mut deepest = [0usize; CONNECTIONS];
++    let sampled = Instant::now();
++    while sampled.elapsed() < Duration::from_secs(1) {
++        let stats = fixture.client.stats();
++        assert_eq!(stats[0].connections.len(), CONNECTIONS);
++        for (deepest, connection) in deepest.iter_mut().zip(&stats[0].connections) {
++            *deepest = (*deepest).max(connection.requests);
++        }
++        tokio::time::sleep(Duration::from_millis(5)).await;
++    }
++    let (throughput, ()) = load
++        .throughput(tokio::time::sleep(Duration::from_secs(2)))
++        .await;
++    load.stop().await;
++    eprintln!("queue alone {throughput:.1} MB/s, deepest per connection {deepest:?}");
++    // Background work always leaves one connection idle for playback.
++    let pipelined = CONNECTIONS - 1;
++    assert!(
++        deepest.iter().filter(|&&depth| depth >= DEPTH).count() >= pipelined,
++        "{deepest:?}"
++    );
++    let transfer = megabytes(ARTICLE_SIZE) / megabytes(BANDWIDTH);
++    let ceiling =
++        megabytes(pipelined * ARTICLE_SIZE) / (IMPAIRMENT.response_delay.as_secs_f64() + transfer);
++    assert!(
++        throughput > ceiling * 0.9,
++        "{throughput:.1} of {ceiling:.1} MB/s"
++    );
++}

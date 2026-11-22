@@ -1,0 +1,398 @@
+From cef21d1ee4f0e5b6befdbff15712aea04382c0b5 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 00:38:26 +1100
+Subject: [PATCH 12/13] Import concurrency in Rules, one lane per import job
+
+Rules::concurrency (default 16, the old CONCURRENCY constant) sets the requests
+an import keeps in flight, so a caller can open a stream's import wider.
+
+Each import Job takes its own Lane for its STAT and BODY requests (fork
+0156be60's queue part), so one job never pipelines behind another job's stalled
+reply. body_in_lane and body_unremembered take a lane and a BodyExpectation, so
+the first-part checks keep working inside the lane.
+---
+ crates/nntp/src/client.rs   |   7 +-
+ crates/nntp/tests/client.rs |  10 +-
+ crates/queue/src/import.rs  | 188 ++++++++++++++++++++----------------
+ 3 files changed, 119 insertions(+), 86 deletions(-)
+
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index ccc5e663..e1f46e26 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -465,11 +465,13 @@ impl Client {
+     pub async fn body_unremembered(
+         &self,
+         message_id: &str,
++        lane: Lane,
+         workload: Workload,
+         probe: Option<&Probe>,
+         expected: BodyExpectation,
+     ) -> Result<Body, Error> {
+         let tag = Tag {
++            lane: Some(lane),
+             workload,
+             probe: probe.cloned(),
+             expected,
+@@ -481,13 +483,14 @@ impl Client {
+ 
+     /// A BODY belonging to one independently scheduled operation. Requests from the
+     /// same lane retain normal pipelining and the global provider/permit limits.
++    /// The body is checked against `expected` as in [`body_expecting`](Self::body_expecting).
+     pub async fn body_in_lane(
+         &self,
+         message_id: &str,
+         lane: Lane,
+         workload: Workload,
+         probe: Option<&Probe>,
+-        begin: Option<u64>,
++        expected: BodyExpectation,
+     ) -> Result<Body, Error> {
+         self.body_tagged(
+             message_id,
+@@ -495,7 +498,7 @@ impl Client {
+                 lane: Some(lane),
+                 workload,
+                 probe: probe.cloned(),
+-                expected: BodyExpectation::at(begin),
++                expected,
+                 ..Tag::UNTRACKED
+             },
+         )
+diff --git a/crates/nntp/tests/client.rs b/crates/nntp/tests/client.rs
+index a102e3c0..6e799bb0 100644
+--- a/crates/nntp/tests/client.rs
++++ b/crates/nntp/tests/client.rs
+@@ -1305,7 +1305,7 @@ async fn independent_lanes_do_not_pipeline_behind_another_jobs_stalled_reply() {
+         let client = Arc::clone(&client);
+         tokio::spawn(async move {
+             client
+-                .body_in_lane(&first, lane_a, Workload::Queue, None, None)
++                .body_in_lane(&first, lane_a, Workload::Queue, None, BodyExpectation::NONE)
+                 .await
+         })
+     };
+@@ -1319,7 +1319,13 @@ async fn independent_lanes_do_not_pipeline_behind_another_jobs_stalled_reply() {
+         let second = second.clone();
+         tokio::spawn(async move {
+             client
+-                .body_in_lane(&second, lane_b, Workload::Queue, None, None)
++                .body_in_lane(
++                    &second,
++                    lane_b,
++                    Workload::Queue,
++                    None,
++                    BodyExpectation::NONE,
++                )
+                 .await
+         })
+     };
+diff --git a/crates/queue/src/import.rs b/crates/queue/src/import.rs
+index 7f41ba78..a5d70a53 100644
+--- a/crates/queue/src/import.rs
++++ b/crates/queue/src/import.rs
+@@ -20,7 +20,7 @@ use infinidysk_core::{
+     ByteRange, FileMeta, FilePart, MultipartFile, NzbFile, Par2Proof, Segment, Segments, media,
+ };
+ use infinidysk_db::FirstCheck;
+-use infinidysk_nntp::{ArticleFuture, Articles, Body, BodyExpectation, Client, Workload};
++use infinidysk_nntp::{ArticleFuture, Articles, Body, BodyExpectation, Client, Lane, Workload};
+ use tokio::sync::Semaphore;
+ use tokio::task::JoinSet;
+ 
+@@ -34,8 +34,8 @@ pub use inspect::{
+     Inspector, Level, Timings,
+ };
+ 
+-/// Requests in flight per import, across all its steps.
+-const CONCURRENCY: usize = 16;
++/// Requests in flight per import, across all its steps, unless [`Rules`] say otherwise.
++pub const CONCURRENCY: usize = 16;
+ /// Futures one [`join_all`] runs at once: enough to keep every request slot busy.
+ const WINDOW: usize = 4 * CONCURRENCY;
+ const PAR2_MAGIC: &[u8] = b"PAR2\0PKT";
+@@ -192,6 +192,8 @@ pub struct Rules {
+     pub blocklist: Vec<String>,
+     /// Media kinds the Arrs owning each lowercased category import.
+     pub owners: HashMap<String, Vec<media::Kind>>,
++    /// Requests in flight per import, across all its steps.
++    pub concurrency: usize,
+ }
+ 
+ impl Default for Rules {
+@@ -200,6 +202,7 @@ impl Default for Rules {
+             check_percent: media::SAMPLE_PERCENT,
+             blocklist: Vec::new(),
+             owners: HashMap::new(),
++            concurrency: CONCURRENCY,
+         }
+     }
+ }
+@@ -320,7 +323,11 @@ struct Volume {
+ // that overshoot ever matters.
+ struct Job {
+     client: Arc<Client>,
++    /// Its requests pipeline only behind each other, never behind another job's.
++    lane: Lane,
+     requests: Semaphore,
++    /// The permits of `requests`.
++    concurrency: usize,
+     progress: Arc<Progress>,
+     /// Extra filename globs to drop.
+     blocklist: Vec<String>,
+@@ -331,7 +338,7 @@ struct Job {
+     password: Option<String>,
+     /// Keys derived from `password`, once per KDF: volumes of a set share one salt.
+     keys: Mutex<HashMap<Kdf, Arc<tokio::sync::OnceCell<Derived>>>>,
+-    /// Request time by what it waited on; `budget` is a slot of [`CONCURRENCY`].
++    /// Request time by what it waited on; `budget` is a slot of `requests`.
+     waits: Mutex<Causes>,
+     /// Set for a dry run: the inspection's budget and what the planner saw.
+     inspection: Option<Arc<inspect::Run>>,
+@@ -381,7 +388,10 @@ impl Articles for Job {
+         Box::pin(async move {
+             let (_slot, probe) = self.slot().await;
+             self.progress.request();
+-            let found = self.client.stat(id, Workload::Queue, Some(&probe)).await;
++            let found = self
++                .client
++                .stat_in_lane(id, self.lane, Workload::Queue, Some(&probe))
++                .await;
+             self.progress.answer();
+             self.done(&probe);
+             found
+@@ -398,7 +408,13 @@ impl Articles for Job {
+             self.progress.request();
+             let body = self
+                 .client
+-                .body_with(id, Workload::Queue, Some(&probe), None, begin)
++                .body_in_lane(
++                    id,
++                    self.lane,
++                    Workload::Queue,
++                    Some(&probe),
++                    BodyExpectation::at(begin),
++                )
+                 .await;
+             self.progress.answer();
+             self.done(&probe);
+@@ -415,9 +431,12 @@ fn job(
+     progress: Arc<Progress>,
+     inspection: Option<Arc<inspect::Run>>,
+ ) -> Arc<Job> {
++    let concurrency = rules.concurrency.max(1);
+     Arc::new(Job {
+         client: Arc::clone(client),
+-        requests: Semaphore::new(CONCURRENCY),
++        lane: Lane::default(),
++        requests: Semaphore::new(concurrency),
++        concurrency,
+         progress,
+         blocklist: rules.blocklist.clone(),
+         bodies: Mutex::default(),
+@@ -850,11 +869,11 @@ async fn fetch_expecting(job: &Job, id: &str, expected: BodyExpectation) -> Resu
+     job.progress.request();
+     let body = if job.inspected() {
+         job.client
+-            .body_unremembered(id, Workload::Queue, Some(&probe), expected)
++            .body_unremembered(id, job.lane, Workload::Queue, Some(&probe), expected)
+             .await
+     } else {
+         job.client
+-            .body_expecting(id, Workload::Queue, Some(&probe), None, expected)
++            .body_in_lane(id, job.lane, Workload::Queue, Some(&probe), expected)
+             .await
+     };
+     job.progress.answer();
+@@ -882,7 +901,10 @@ async fn stat(job: &Job, id: &str) -> Result<bool, Error> {
+     let mut attempt = 0;
+     let found = loop {
+         job.progress.request();
+-        let found = job.client.stat(id, Workload::Queue, Some(&probe)).await;
++        let found = job
++            .client
++            .stat_in_lane(id, job.lane, Workload::Queue, Some(&probe))
++            .await;
+         job.progress.answer();
+         match found {
+             Ok(()) => break Ok(true),
+@@ -1946,7 +1968,7 @@ async fn stat_all(
+                 |(position, index)| async move { (position, index, stat(job, &ids[index]).await) },
+             ),
+     )
+-    .buffer_unordered(CONCURRENCY);
++    .buffer_unordered(job.concurrency);
+     let mut missed = HashSet::new();
+     let mut inconclusive: Option<(usize, Error)> = None;
+     while let Some((position, index, found)) = pending.next().await {
+@@ -2188,9 +2210,18 @@ mod tests {
+     #[tokio::test]
+     async fn a_full_check_fails_at_the_first_missing_video_segment() {
+         use infinidysk_nntp::{Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode};
+-        use infinidysk_testkit::LoopbackServer;
+-
+-        let server = LoopbackServer::start(Vec::new()).await.unwrap();
++        use infinidysk_testkit::{Impairment, LoopbackServer};
++
++        // Replies come late, so every request slot the rules allow is taken first.
++        let server = LoopbackServer::start_impaired(
++            Vec::new(),
++            Impairment {
++                response_delay: Duration::from_millis(300),
++                ..Impairment::default()
++            },
++        )
++        .await
++        .unwrap();
+         let endpoint = Endpoint::new(
+             "127.0.0.1",
+             server.addr().port(),
+@@ -2199,69 +2230,66 @@ mod tests {
+             Duration::from_secs(5),
+         )
+         .unwrap();
+-        let config = PoolConfig {
+-            max_connections: 4,
+-            pipeline_depth: 4,
+-            idle_timeout: Duration::from_secs(5),
+-            min_connections: 0,
+-        };
+-        let client = Client::new([Provider {
+-            pool: Pool::new(endpoint, config, Downloads::new(32)).unwrap(),
+-            key: "test".to_owned(),
+-            name: String::new(),
+-            priority: 0,
+-            backbone: None,
+-        }]);
+-        let job = Arc::new(Job {
+-            client: Arc::new(client),
+-            requests: Semaphore::new(CONCURRENCY),
+-            progress: Arc::new(Progress::default()),
+-            blocklist: Vec::new(),
+-            bodies: Mutex::default(),
+-            password: None,
+-            keys: Mutex::default(),
+-            waits: Mutex::default(),
+-            inspection: None,
+-        });
+-        let output = Output {
+-            path: vec!["media.mkv".to_owned()],
+-            meta: FileMeta::Nzb(NzbFile {
+-                segments: Segments {
+-                    items: (0..200)
+-                        .map(|index| Segment {
+-                            id: format!("missing-{index}@loopback"),
+-                            size: 1000,
+-                            ..Segment::default()
+-                        })
+-                        .collect(),
+-                    sizes_trusted: true,
+-                    ..Segments::default()
++        for (rules, concurrency) in [
++            (Rules::default(), CONCURRENCY),
++            (
++                Rules {
++                    concurrency: 48,
++                    ..Rules::default()
+                 },
+-                proof: None,
+-            }),
+-            origin: POSTED,
+-        };
++                48,
++            ),
++        ] {
++            let config = PoolConfig {
++                max_connections: 4,
++                pipeline_depth: 4,
++                idle_timeout: Duration::from_secs(5),
++                min_connections: 0,
++            };
++            let client = Arc::new(Client::new([Provider {
++                pool: Pool::new(endpoint.clone(), config, Downloads::new(32)).unwrap(),
++                key: "test".to_owned(),
++                name: String::new(),
++                priority: 0,
++                backbone: None,
++            }]));
++            let job = job(&client, &rules, None, Arc::new(Progress::default()), None);
++            let output = Output {
++                path: vec!["media.mkv".to_owned()],
++                meta: FileMeta::Nzb(NzbFile {
++                    segments: Segments {
++                        items: (0..200)
++                            .map(|index| Segment {
++                                id: format!("missing-{index}@loopback"),
++                                size: 1000,
++                                ..Segment::default()
++                            })
++                            .collect(),
++                        sizes_trusted: true,
++                        ..Segments::default()
++                    },
++                    proof: None,
++                }),
++                origin: POSTED,
++            };
+ 
+-        let error = check_articles(&job, vec![output], 100).await.unwrap_err();
+-        assert!(matches!(&error, Error::Missing(_)), "{error}");
+-        assert_eq!(error.to_string(), missing("media.mkv").to_string());
+-        let issued = job.progress.issued.load(Ordering::Relaxed);
+-        assert!(issued > 0 && issued <= CONCURRENCY as u64, "{issued}");
++            let error = check_articles(&job, vec![output], 100).await.unwrap_err();
++            assert!(matches!(&error, Error::Missing(_)), "{error}");
++            assert_eq!(error.to_string(), missing("media.mkv").to_string());
++            let issued = job.progress.issued.load(Ordering::Relaxed);
++            assert_eq!(issued, concurrency as u64);
++        }
+     }
+ 
+     #[tokio::test]
+     async fn key_derivations_wait_for_a_free_slot() {
+-        let job = Arc::new(Job {
+-            client: Arc::new(Client::new([])),
+-            requests: Semaphore::new(CONCURRENCY),
+-            progress: Arc::new(Progress::default()),
+-            blocklist: Vec::new(),
+-            bodies: Mutex::default(),
+-            password: Some("secret".to_owned()),
+-            keys: Mutex::default(),
+-            waits: Mutex::default(),
+-            inspection: None,
+-        });
++        let job = job(
++            &Arc::new(Client::new([])),
++            &Rules::default(),
++            Some("secret".to_owned()).as_deref(),
++            Arc::new(Progress::default()),
++            None,
++        );
+         let kdf = Kdf::SevenZip {
+             salt: Vec::new(),
+             cycles: 0,
+@@ -2293,17 +2321,13 @@ mod tests {
+ 
+     #[tokio::test]
+     async fn a_dropped_key_derivation_frees_its_slot() {
+-        let job = Arc::new(Job {
+-            client: Arc::new(Client::new([])),
+-            requests: Semaphore::new(CONCURRENCY),
+-            progress: Arc::new(Progress::default()),
+-            blocklist: Vec::new(),
+-            bodies: Mutex::default(),
+-            password: Some("p".repeat(4096)),
+-            keys: Mutex::default(),
+-            waits: Mutex::default(),
+-            inspection: None,
+-        });
++        let job = job(
++            &Arc::new(Client::new([])),
++            &Rules::default(),
++            Some("p".repeat(4096)).as_deref(),
++            Arc::new(Progress::default()),
++            None,
++        );
+         // 2^24 rounds over a long password take minutes when nothing stops them.
+         let kdf = Kdf::SevenZip {
+             salt: Vec::new(),

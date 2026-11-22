@@ -1,0 +1,441 @@
+From 3117070b7554dbe7dc2dd89d68f39bbb19bcb101 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 00:09:57 +1100
+Subject: [PATCH 07/13] Strict reads on any workload
+
+Strict mode was tied to background analysis: a strict SegmentReader always
+fetched on Health or Warm, and playback could only fill gaps with zeros or TS
+null packets. SegmentReader::strict(bool) and vfs::Reader::strict(bool) now
+switch strictness alone, and with_workload picks the workload (Stream by
+default). A strict read errors on a gap or a copy no provider serves exactly as
+posted, serves bodies only once whole (so a CRC failure is never streamed out),
+and asks providers for known holes. Playback keeps prewarm, hedges and the
+on-demand refetch of a failed head; health and warming reads keep none.
+---
+ crates/stream/src/lib.rs      | 97 +++++++++++++++++++++++------------
+ crates/stream/tests/reader.rs | 48 ++++++++++++++++-
+ crates/vfs/src/reader.rs      | 58 ++++++++++-----------
+ 3 files changed, 138 insertions(+), 65 deletions(-)
+
+diff --git a/crates/stream/src/lib.rs b/crates/stream/src/lib.rs
+index 6f0641c6..7e7383ca 100644
+--- a/crates/stream/src/lib.rs
++++ b/crates/stream/src/lib.rs
+@@ -328,9 +328,9 @@ pub struct SegmentReader {
+     layout: Arc<Layout>,
+     prefetch: usize,
+     prewarm: bool,
+-    /// Background-priority reads that fail instead of filling, padding or cutting.
++    /// Fails instead of filling, padding or cutting, and serves bodies only once whole.
+     strict: bool,
+-    background: Workload,
++    workload: Workload,
+     warm_floor: usize,
+     budget: Option<Budget>,
+     cache: Option<Arc<Cache>>,
+@@ -384,7 +384,7 @@ impl SegmentReader {
+             prefetch,
+             prewarm: true,
+             strict: false,
+-            background: Workload::Health,
++            workload: Workload::Stream,
+             warm_floor: 2,
+             budget: None,
+             cache: None,
+@@ -426,6 +426,24 @@ impl SegmentReader {
+     pub const fn with_strict(mut self) -> Self {
+         self.strict = true;
+         self.prewarm = false;
++        self.workload = Workload::Health;
++        self
++    }
++
++    /// Whether a segment no provider serves exactly as posted fails the read instead of
++    /// being filled, padded or cut. Strict reads serve a body only once all of it is in
++    /// and ask providers for known holes too; workload, prewarm and hedges stay as set.
++    #[must_use]
++    pub const fn strict(mut self, strict: bool) -> Self {
++        self.strict = strict;
++        self
++    }
++
++    /// Fetches on `workload` ([`Workload::Stream`] by default). Only playback hedges a
++    /// slow head; health and warming reads never fetch a failed head again on demand.
++    #[must_use]
++    pub const fn with_workload(mut self, workload: Workload) -> Self {
++        self.workload = workload;
+         self
+     }
+ 
+@@ -440,7 +458,7 @@ impl SegmentReader {
+     pub const fn with_warming_floor(mut self, floor: usize) -> Self {
+         self.strict = true;
+         self.prewarm = false;
+-        self.background = Workload::Warm;
++        self.workload = Workload::Warm;
+         self.prefetch = 128;
+         self.initial = 2;
+         self.warm_floor = floor;
+@@ -617,7 +635,7 @@ impl SegmentReader {
+     /// Segments to keep in flight ahead of the reader. Large articles grow the window by
+     /// the opening size per segment read, so an open does not queue the whole prefetch.
+     fn ahead(&self) -> usize {
+-        if self.background == Workload::Warm {
++        if self.workload == Workload::Warm {
+             return self.client.warming_window(self.warm_floor);
+         }
+         if self.bounded {
+@@ -644,14 +662,14 @@ impl SegmentReader {
+         // The segment being read is always fetched, even past the range end.
+         let end = self.end.max(read_index + 1).min(self.layout.segments.len());
+         while self.next < end && self.next - self.head < ahead {
+-            let (client, layout, cache, hole, index, strict, background) = (
++            let (client, layout, cache, hole, index, strict, workload) = (
+                 Arc::clone(&self.client),
+                 Arc::clone(&self.layout),
+                 self.cache.clone(),
+                 self.hole(self.next),
+                 self.next,
+                 self.strict,
+-                self.background,
++                self.workload,
+             );
+             if !strict && hole.gaps.as_ref().is_some_and(|g| g.is_hole(index)) {
+                 let size = usize::try_from(layout.segments[index].size).unwrap_or(0);
+@@ -687,7 +705,8 @@ impl SegmentReader {
+                         watch: self.watch.clone(),
+                     }
+                 });
+-            let wait = (!strict || self.watch.is_some()).then(|| Arc::new(Wait::default()));
++            let wait = (!strict || workload == Workload::Stream || self.watch.is_some())
++                .then(|| Arc::new(Wait::default()));
+             let probe = self.probe(index, wait.clone(), false);
+             probe.step(Step::Queued);
+             // Bodies stream in once armed below, so a segment is readable before it
+@@ -732,7 +751,8 @@ impl SegmentReader {
+                         Some(&probe),
+                         progress,
+                         &hole,
+-                        strict.then_some(background),
++                        workload,
++                        strict,
+                     )
+                     .await?;
+                     Ok(((data, permit, filled), started.elapsed()))
+@@ -788,24 +808,36 @@ impl SegmentReader {
+             })
+     }
+ 
+-    /// Replaces the head fetch with a new one that streams in and skips the budget, as a
+-    /// fetch the reader waits on may.
++    /// Replaces the head fetch with a new one that skips the budget and, unless strict,
++    /// streams in, as a fetch the reader waits on may.
+     fn refetch_head(&mut self) {
+-        let (client, layout, cache, hole, index) = (
++        let (client, layout, cache, hole, index, workload, strict) = (
+             Arc::clone(&self.client),
+             Arc::clone(&self.layout),
+             self.cache.clone(),
+             self.hole(self.head),
+             self.head,
++            self.workload,
++            self.strict,
+         );
+         let wait = Some(Arc::new(Wait::default()));
+         let probe = self.probe(index, wait.clone(), false);
+         probe.step(Step::Queued);
+-        let wanted = Arc::new(AtomicBool::new(true));
+-        let (tx, rx) = mpsc::unbounded_channel();
+-        let progress = Progress {
+-            tx,
+-            wanted: Arc::clone(&wanted),
++        let (progress, partial) = if strict {
++            (None, None)
++        } else {
++            let wanted = Arc::new(AtomicBool::new(true));
++            let (tx, rx) = mpsc::unbounded_channel();
++            let progress = Progress {
++                tx,
++                wanted: Arc::clone(&wanted),
++            };
++            let partial = Partial {
++                rx,
++                data: Vec::new(),
++                wanted,
++            };
++            (Some(progress), Some(partial))
+         };
+         let task = tokio::spawn(async move {
+             probe.step(Step::Bypassed);
+@@ -819,9 +851,10 @@ impl SegmentReader {
+                 source,
+                 &layout.segments[index],
+                 Some(&probe),
+-                Some(progress),
++                progress,
+                 &hole,
+-                None,
++                workload,
++                strict,
+             )
+             .await?;
+             Ok(((data, None, filled), started.elapsed()))
+@@ -839,11 +872,7 @@ impl SegmentReader {
+             task,
+             started: Instant::now(),
+             waited: true,
+-            partial: Some(Partial {
+-                rx,
+-                data: Vec::new(),
+-                wanted,
+-            }),
++            partial,
+             urgent: None,
+             wait,
+         };
+@@ -872,7 +901,7 @@ impl SegmentReader {
+         if let Poll::Ready(result) = Pin::new(&mut head.task).poll(cx) {
+             // Read-ahead that failed while nobody waited gets one fetch on demand.
+             if first
+-                && !self.strict
++                && !matches!(self.workload, Workload::Health | Workload::Warm)
+                 && let Ok(Err(error)) = &result
+                 && is_transient(error)
+             {
+@@ -892,7 +921,7 @@ impl SegmentReader {
+             }
+             return Poll::Ready(Ok(fetched));
+         }
+-        if self.strict {
++        if self.workload != Workload::Stream {
+             return Poll::Pending;
+         }
+         if let Some(hedge) = &mut self.hedge {
+@@ -925,12 +954,13 @@ impl SegmentReader {
+                         u32::try_from(self.layout.segments[self.head].size).unwrap_or(u32::MAX),
+                     )))
+         {
+-            let (client, layout, cache, hole, index) = (
++            let (client, layout, cache, hole, index, strict) = (
+                 Arc::clone(&self.client),
+                 Arc::clone(&self.layout),
+                 self.cache.clone(),
+                 self.hole(self.head),
+                 self.head,
++                self.strict,
+             );
+             tracing::debug!(segment = index, "hedging slow segment");
+             self.note(Event::Hedge {
+@@ -946,7 +976,8 @@ impl SegmentReader {
+                     Some(&probe),
+                     None,
+                     &hole,
+-                    None,
++                    Workload::Stream,
++                    strict,
+                 )
+                 .await
+             }));
+@@ -1141,6 +1172,7 @@ struct Hole {
+ /// Body sized exactly to the segment. Articles unusable on every provider are filled
+ /// so playback continues and later offsets stay right, and reported with their layout
+ /// index; `strict` fails instead.
++#[allow(clippy::too_many_arguments)]
+ async fn fetch(
+     client: &Arc<Client>,
+     source: Source<'_>,
+@@ -1148,13 +1180,12 @@ async fn fetch(
+     probe: Option<&Probe>,
+     progress: Option<Progress>,
+     hole: &Hole,
+-    background: Option<Workload>,
++    workload: Workload,
++    strict: bool,
+ ) -> io::Result<(Bytes, bool)> {
+     let size = usize::try_from(segment.size)
+         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "segment too large"))?;
+     let (id, expected) = (&segment.message_id, segment.expected);
+-    let strict = background.is_some();
+-    let workload = background.unwrap_or(Workload::Stream);
+     let body = match source {
+         Source::Direct => client
+             .body_expecting(id, workload, probe, progress.as_ref(), expected)
+@@ -1176,7 +1207,7 @@ async fn fetch(
+     match body {
+         Ok(data) if data.len() == size => Ok((data, false)),
+         Ok(_) if strict => {
+-            if background == Some(Workload::Warm)
++            if workload == Workload::Warm
+                 && let Some(report) = &hole.report
+             {
+                 report(hole.index, Fault::Corrupt);
+@@ -1233,7 +1264,7 @@ async fn fetch(
+             Ok((hole.filler.fill(hole.at, size).into(), true))
+         }
+         Err(error) => {
+-            if background == Some(Workload::Warm)
++            if workload == Workload::Warm
+                 && matches!(
+                     *error,
+                     Error::NotFound | Error::CrcMismatch { .. } | Error::Yenc(_)
+diff --git a/crates/stream/tests/reader.rs b/crates/stream/tests/reader.rs
+index 04d06c61..1c76d862 100644
+--- a/crates/stream/tests/reader.rs
++++ b/crates/stream/tests/reader.rs
+@@ -7,7 +7,7 @@ use std::time::Duration;
+ use infinidysk_core::trace::{Event, Step, Trace};
+ use infinidysk_core::wait::{Stage, Watch};
+ use infinidysk_nntp::{
+-    BodyExpectation, Client, Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode,
++    BodyExpectation, Client, Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode, Workload,
+ };
+ use infinidysk_stream::{
+     Budget, Cache, CacheConfig, DiskConfig, Fault, Filler, Gaps, Layout, Report, Segment,
+@@ -74,6 +74,52 @@ async fn reads_and_seeks_across_segments_zero_filling_missing_ones() {
+     assert_eq!(all[..gap], corpus.data[..gap]);
+ }
+ 
++#[tokio::test]
++async fn strict_reads_keep_their_workload_and_fail_on_a_gap() {
++    let corpus = Corpus::generate(1025, 12, ARTICLE_SIZE);
++    let mut served = corpus.articles.clone();
++    served.remove(MISSING);
++    let server = LoopbackServer::start(served).await.unwrap();
++    let gaps = Arc::new(Gaps::default());
++    gaps.refresh([MISSING + 2].into(), false);
++    for workload in [Workload::Stream, Workload::Queue] {
++        let (client, layout) = setup(&corpus, &server);
++        let mut reader = SegmentReader::new(Arc::clone(&client), layout, 8)
++            .with_workload(workload)
++            .with_gaps(Arc::clone(&gaps))
++            .strict(true);
++        let mut head = vec![0; MISSING * ARTICLE_SIZE];
++        reader.read_exact(&mut head).await.unwrap();
++        assert!(head == corpus.data[..head.len()], "{workload:?}");
++        assert!(
++            reader.read(&mut [0; 8]).await.is_err(),
++            "{workload:?}: a strict read fails instead of filling"
++        );
++        reader
++            .seek(SeekFrom::Start(((MISSING + 2) * ARTICLE_SIZE) as u64))
++            .await
++            .unwrap();
++        let mut known = vec![0; ARTICLE_SIZE];
++        reader.read_exact(&mut known).await.unwrap();
++        assert!(
++            known == corpus.data[(MISSING + 2) * ARTICLE_SIZE..][..ARTICLE_SIZE],
++            "{workload:?}: a known hole is still asked for"
++        );
++        let attempts = |w: Workload| -> u64 {
++            client.stats()[0].workloads[w as usize]
++                .attempts
++                .iter()
++                .sum()
++        };
++        assert!(attempts(workload) > 0, "{workload:?}");
++        for other in [Workload::Stream, Workload::Queue, Workload::Health] {
++            if other != workload {
++                assert_eq!(attempts(other), 0, "{workload:?} asked as {other:?}");
++            }
++        }
++    }
++}
++
+ #[tokio::test]
+ async fn known_holes_skip_providers_and_too_many_in_a_row_fail() {
+     let corpus = Corpus::generate(1025, 12, ARTICLE_SIZE);
+diff --git a/crates/vfs/src/reader.rs b/crates/vfs/src/reader.rs
+index 949595b0..a1fecdad 100644
+--- a/crates/vfs/src/reader.rs
++++ b/crates/vfs/src/reader.rs
+@@ -9,7 +9,7 @@ use infinidysk_core::crypt::{BLOCK, Cipher};
+ use infinidysk_core::trace::Trace;
+ use infinidysk_core::wait::Watch;
+ use infinidysk_core::{FileMeta, Segments};
+-use infinidysk_nntp::{BodyExpectation, Client};
++use infinidysk_nntp::{BodyExpectation, Client, Workload};
+ use infinidysk_stream::{Budget, Cache, Filler, Gaps, Layout, Report, Segment, SegmentReader};
+ use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
+ 
+@@ -160,55 +160,51 @@ impl Reader {
+         }
+     }
+ 
+-    /// Shares `gaps` with the file's other readers; analysis readers stay without.
+-    #[must_use]
+-    pub(crate) fn with_gaps(self, gaps: Arc<Gaps>) -> Self {
++    /// Applies `f` to the segment reader underneath, if any.
++    fn map_segments(self, f: impl FnOnce(SegmentReader) -> SegmentReader) -> Self {
+         match self {
+             Self::Memory(_) => self,
+-            Self::Segments(r) => Self::Segments(r.with_gaps(gaps)),
++            Self::Segments(r) => Self::Segments(f(r)),
+             Self::Parts(mut r) => {
+-                r.inner = r.inner.with_gaps(gaps);
++                r.inner = f(r.inner);
+                 Self::Parts(r)
+             }
+             Self::Crypt(mut r) => {
+-                r.inner.inner = r.inner.inner.with_gaps(gaps);
++                r.inner.inner = f(r.inner.inner);
+                 Self::Crypt(r)
+             }
+         }
+     }
+ 
++    /// Shares `gaps` with the file's other readers; analysis readers stay without.
++    #[must_use]
++    pub(crate) fn with_gaps(self, gaps: Arc<Gaps>) -> Self {
++        self.map_segments(|r| r.with_gaps(gaps))
++    }
++
+     /// Keeps `watch` up to date with what the reader is blocked on.
+     #[must_use]
+     pub(crate) fn with_watch(self, watch: Arc<Watch>) -> Self {
+-        match self {
+-            Self::Memory(_) => self,
+-            Self::Segments(r) => Self::Segments(r.with_watch(watch)),
+-            Self::Parts(mut r) => {
+-                r.inner = r.inner.with_watch(watch);
+-                Self::Parts(r)
+-            }
+-            Self::Crypt(mut r) => {
+-                r.inner.inner = r.inner.inner.with_watch(watch);
+-                Self::Crypt(r)
+-            }
+-        }
++        self.map_segments(|r| r.with_watch(watch))
+     }
+ 
+     /// Fails reads instead of serving bytes that are not exactly as posted.
+     #[must_use]
+     pub(crate) fn into_strict(self) -> Self {
+-        match self {
+-            Self::Memory(_) => self,
+-            Self::Segments(r) => Self::Segments(r.with_strict()),
+-            Self::Parts(mut r) => {
+-                r.inner = r.inner.with_strict();
+-                Self::Parts(r)
+-            }
+-            Self::Crypt(mut r) => {
+-                r.inner.inner = r.inner.inner.with_strict();
+-                Self::Crypt(r)
+-            }
+-        }
++        self.map_segments(SegmentReader::with_strict)
++    }
++
++    /// Whether reads fail on a segment no provider serves exactly as posted, on the
++    /// reader's own workload; see [`SegmentReader::strict`].
++    #[must_use]
++    pub fn strict(self, strict: bool) -> Self {
++        self.map_segments(|r| r.strict(strict))
++    }
++
++    /// Fetches on `workload`; see [`SegmentReader::with_workload`].
++    #[must_use]
++    pub fn with_workload(self, workload: Workload) -> Self {
++        self.map_segments(|r| r.with_workload(workload))
+     }
+ 
+     /// The caller reads no further than `end`, so read-ahead stops there.

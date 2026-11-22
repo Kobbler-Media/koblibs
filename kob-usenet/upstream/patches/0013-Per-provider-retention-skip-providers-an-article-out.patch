@@ -1,0 +1,526 @@
+From 343a3ee8a24f3daa3bbf211dbbcc67e0a5addc93 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 00:44:15 +1100
+Subject: [PATCH 13/13] Per-provider retention: skip providers an article
+ outlived
+
+Pool::with_retention sets how long a provider keeps articles, and
+BodyExpectation::posted (or stat_in_lane's posted) says when an article was
+posted. Client routing skips a provider the article's age is past, as a miss it
+does not remember, so a release no provider retains ends NotFound without a
+request. Imports date every request by the NZB's newest file; a SegmentReader
+or vfs::Reader takes the date with with_posted.
+---
+ crates/nntp/src/article.rs         |  4 ++
+ crates/nntp/src/client.rs          | 23 ++++++++++-
+ crates/nntp/src/pool.rs            | 17 ++++++++
+ crates/nntp/tests/client.rs        | 65 +++++++++++++++++++++++++++++-
+ crates/queue/src/import.rs         | 36 ++++++++++++++---
+ crates/queue/src/import/inspect.rs | 10 ++++-
+ crates/stream/src/lib.rs           | 29 +++++++++++--
+ crates/vfs/src/reader.rs           |  6 +++
+ 8 files changed, 178 insertions(+), 12 deletions(-)
+
+diff --git a/crates/nntp/src/article.rs b/crates/nntp/src/article.rs
+index ca88b895..75ac9ca5 100644
+--- a/crates/nntp/src/article.rs
++++ b/crates/nntp/src/article.rs
+@@ -31,6 +31,9 @@ pub struct BodyExpectation {
+     pub file_size: Option<u64>,
+     pub offset: Option<u64>,
+     pub decoded_len: Option<u64>,
++    /// When the article was posted, in Unix seconds. Not checked against the body:
++    /// providers whose retention it is past are not asked.
++    pub posted: Option<i64>,
+ }
+ impl BodyExpectation {
+     /// Nothing known: every body passes.
+@@ -40,6 +43,7 @@ impl BodyExpectation {
+         file_size: None,
+         offset: None,
+         decoded_len: None,
++        posted: None,
+     };
+ 
+     /// Only the expected `=ypart` offset, when known.
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index e1f46e26..2aec663d 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -504,13 +504,15 @@ impl Client {
+         )
+         .await
+     }
+-    /// A STAT in the same connection lane as that operation's BODY requests.
++    /// A STAT in the same connection lane as that operation's BODY requests; `posted`
++    /// as in [`BodyExpectation::posted`].
+     pub async fn stat_in_lane(
+         &self,
+         message_id: &str,
+         lane: Lane,
+         workload: Workload,
+         probe: Option<&Probe>,
++        posted: Option<i64>,
+     ) -> Result<(), Error> {
+         self.request(
+             Command::Stat,
+@@ -519,6 +521,10 @@ impl Client {
+                 lane: Some(lane),
+                 workload,
+                 probe: probe.cloned(),
++                expected: BodyExpectation {
++                    posted,
++                    ..BodyExpectation::NONE
++                },
+                 ..Tag::UNTRACKED
+             },
+         )
+@@ -684,6 +690,15 @@ impl Client {
+         }
+         let mut order: Vec<_> = providers.iter().collect();
+         order.sort_by_cached_key(|entry| entry.preference(workload));
++        let age = base.expected.posted.and_then(|posted| {
++            let now = std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .ok()?
++                .as_secs();
++            Some(Duration::from_secs(
++                now.checked_sub(u64::try_from(posted).ok()?)?,
++            ))
++        });
+ 
+         let mut last_error = None;
+         let mut skipped = false;
+@@ -707,6 +722,12 @@ impl Client {
+                     skipped = true;
+                     continue;
+                 }
++                // Past retention it is as good as a miss, but not one to remember: the
++                // same id may be asked again with another date.
++                if entry.provider.pool.outlives(age) {
++                    first_miss.get_or_insert((entry.id, trace::Outcome::NotFound));
++                    continue;
++                }
+                 if self.missing.contains(group, message_id) {
+                     missed.extend(backbone);
+                     first_miss.get_or_insert((entry.id, trace::Outcome::NotFound));
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index 11f8c67c..57decbbd 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -87,6 +87,8 @@ pub struct Pool {
+     stream_wait: Duration,
+     /// `weight-large` experiment: articles of [`LARGE_ARTICLE`] or more weigh a full depth.
+     weight_large: bool,
++    /// How long the provider keeps articles; `None` for as long as anyone.
++    retention: Option<Duration>,
+ }
+ 
+ /// Articles this large are never pipelined under `weight-large`.
+@@ -351,6 +353,7 @@ impl Pool {
+             stats: Arc::default(),
+             stream_wait: STREAM_WAIT,
+             weight_large: false,
++            retention: None,
+         })
+     }
+ 
+@@ -364,6 +367,20 @@ impl Pool {
+         self
+     }
+ 
++    /// Articles older than `retention` are not asked of this provider.
++    #[must_use]
++    pub const fn with_retention(mut self, retention: Duration) -> Self {
++        self.retention = Some(retention);
++        self
++    }
++
++    /// Whether an article `age` old is past this provider's retention.
++    pub(crate) fn outlives(&self, age: Option<Duration>) -> bool {
++        self.retention
++            .zip(age)
++            .is_some_and(|(kept, age)| age > kept)
++    }
++
+     /// The `weight-large` experiment: articles of 2,097,152 bytes or more take a whole
+     /// connection's permits whatever the depth.
+     #[must_use]
+diff --git a/crates/nntp/tests/client.rs b/crates/nntp/tests/client.rs
+index 6e799bb0..a4e69ff7 100644
+--- a/crates/nntp/tests/client.rs
++++ b/crates/nntp/tests/client.rs
+@@ -459,6 +459,69 @@ async fn another_files_first_part_fails_over_before_any_byte_streams() {
+     assert_eq!(downloads.available_permits(), 16);
+ }
+ 
++#[tokio::test]
++async fn a_provider_is_not_asked_for_articles_past_its_retention() {
++    const DAY: u64 = 24 * 60 * 60;
++    let corpus = Corpus::generate(1025, 1, ARTICLE_SIZE);
++    let id = &corpus.articles[0].message_id;
++    let short = LoopbackServer::start(corpus.articles.clone())
++        .await
++        .unwrap();
++    let long = LoopbackServer::start(corpus.articles.clone())
++        .await
++        .unwrap();
++    let downloads = Downloads::new(16);
++    let recent = || {
++        let p = provider(short.addr().port(), 0, None, &downloads);
++        Provider {
++            pool: p.pool.with_retention(Duration::from_secs(30 * DAY)),
++            ..p
++        }
++    };
++    let now = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap()
++        .as_secs();
++    let posted = |days: u64| Some(i64::try_from(now - days * DAY).unwrap());
++    let at = |days| BodyExpectation {
++        posted: posted(days),
++        ..BodyExpectation::NONE
++    };
++    let both = Client::new([recent(), provider(long.addr().port(), 1, None, &downloads)]);
++    let only = Client::new([recent()]);
++    let lane = infinidysk_nntp::Lane::default();
++
++    let body = both
++        .body_expecting(id, Workload::Stream, None, None, at(40))
++        .await
++        .unwrap();
++    assert_eq!(body.data, corpus.data);
++    both.stat_in_lane(id, lane, Workload::Queue, None, posted(40))
++        .await
++        .unwrap();
++    assert_eq!(short.body_commands(), 0, "past retention");
++    assert!(matches!(
++        only.body_expecting(id, Workload::Stream, None, None, at(40))
++            .await,
++        Err(Error::NotFound)
++    ));
++    assert!(matches!(
++        only.stat_in_lane(id, lane, Workload::Queue, None, posted(40))
++            .await,
++        Err(Error::NotFound)
++    ));
++    assert_eq!(short.body_commands(), 0);
++
++    for expected in [at(10), BodyExpectation::NONE] {
++        let body = only
++            .body_expecting(id, Workload::Stream, None, None, expected)
++            .await
++            .unwrap();
++        assert_eq!(body.data, corpus.data);
++    }
++    assert_eq!(short.body_commands(), 2, "within retention, or undated");
++}
++
+ /// Answers every BODY with `chunks`, written 100 ms apart so each arrives as its own read.
+ async fn raw_body_server(chunks: Vec<Vec<u8>>) -> u16 {
+     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+@@ -1337,7 +1400,7 @@ async fn independent_lanes_do_not_pipeline_behind_another_jobs_stalled_reply() {
+         let client = Arc::clone(&client);
+         tokio::spawn(async move {
+             client
+-                .stat_in_lane(&second, lane_b, Workload::Queue, None)
++                .stat_in_lane(&second, lane_b, Workload::Queue, None, None)
+                 .await
+         })
+     };
+diff --git a/crates/queue/src/import.rs b/crates/queue/src/import.rs
+index a5d70a53..2d071a08 100644
+--- a/crates/queue/src/import.rs
++++ b/crates/queue/src/import.rs
+@@ -328,6 +328,9 @@ struct Job {
+     requests: Semaphore,
+     /// The permits of `requests`.
+     concurrency: usize,
++    /// When the newest file was posted, in Unix seconds: providers whose retention
++    /// even that is past are not asked.
++    posted: Option<i64>,
+     progress: Arc<Progress>,
+     /// Extra filename globs to drop.
+     blocklist: Vec<String>,
+@@ -390,7 +393,7 @@ impl Articles for Job {
+             self.progress.request();
+             let found = self
+                 .client
+-                .stat_in_lane(id, self.lane, Workload::Queue, Some(&probe))
++                .stat_in_lane(id, self.lane, Workload::Queue, Some(&probe), self.posted)
+                 .await;
+             self.progress.answer();
+             self.done(&probe);
+@@ -413,7 +416,10 @@ impl Articles for Job {
+                     self.lane,
+                     Workload::Queue,
+                     Some(&probe),
+-                    BodyExpectation::at(begin),
++                    BodyExpectation {
++                        posted: self.posted,
++                        ..BodyExpectation::at(begin)
++                    },
+                 )
+                 .await;
+             self.progress.answer();
+@@ -423,6 +429,11 @@ impl Articles for Job {
+     }
+ }
+ 
++/// When the newest file of `nzb` was posted, by the NZB's dates.
++fn posted(nzb: &Nzb) -> Option<i64> {
++    nzb.files.iter().filter_map(|f| f.date).max()
++}
++
+ /// One attempt's access to the providers; with `inspection` it is a dry run.
+ fn job(
+     client: &Arc<Client>,
+@@ -430,6 +441,7 @@ fn job(
+     password: Option<&str>,
+     progress: Arc<Progress>,
+     inspection: Option<Arc<inspect::Run>>,
++    posted: Option<i64>,
+ ) -> Arc<Job> {
+     let concurrency = rules.concurrency.max(1);
+     Arc::new(Job {
+@@ -437,6 +449,7 @@ fn job(
+         lane: Lane::default(),
+         requests: Semaphore::new(concurrency),
+         concurrency,
++        posted,
+         progress,
+         blocklist: rules.blocklist.clone(),
+         bodies: Mutex::default(),
+@@ -689,7 +702,7 @@ pub async fn import(
+     verifier: Option<&dyn Verifier>,
+ ) -> Result<Imported, Error> {
+     let started = Instant::now();
+-    let job = &job(client, rules, password, progress, None);
++    let job = &job(client, rules, password, progress, None, posted(nzb));
+     let mut at = Timings::default();
+     let outputs = plan(job, nzb, rules.check_percent, started, &mut at).await?;
+     let [firsts_at, par2_at, layouts_at, sets_at] =
+@@ -863,6 +876,10 @@ enum Fetched {
+ /// [`fetch`] of a body that must match `expected`; one that does not counts as corrupt.
+ async fn fetch_expecting(job: &Job, id: &str, expected: BodyExpectation) -> Result<Fetched, Error> {
+     use infinidysk_nntp::Error as E;
++    let expected = BodyExpectation {
++        posted: job.posted,
++        ..expected
++    };
+     let (_slot, probe) = job.slot().await;
+     // After the slot: only the requests in flight can pass the budget.
+     job.charge()?;
+@@ -903,7 +920,7 @@ async fn stat(job: &Job, id: &str) -> Result<bool, Error> {
+         job.progress.request();
+         let found = job
+             .client
+-            .stat_in_lane(id, job.lane, Workload::Queue, Some(&probe))
++            .stat_in_lane(id, job.lane, Workload::Queue, Some(&probe), job.posted)
+             .await;
+         job.progress.answer();
+         match found {
+@@ -2253,7 +2270,14 @@ mod tests {
+                 priority: 0,
+                 backbone: None,
+             }]));
+-            let job = job(&client, &rules, None, Arc::new(Progress::default()), None);
++            let job = job(
++                &client,
++                &rules,
++                None,
++                Arc::new(Progress::default()),
++                None,
++                None,
++            );
+             let output = Output {
+                 path: vec!["media.mkv".to_owned()],
+                 meta: FileMeta::Nzb(NzbFile {
+@@ -2289,6 +2313,7 @@ mod tests {
+             Some("secret".to_owned()).as_deref(),
+             Arc::new(Progress::default()),
+             None,
++            None,
+         );
+         let kdf = Kdf::SevenZip {
+             salt: Vec::new(),
+@@ -2327,6 +2352,7 @@ mod tests {
+             Some("p".repeat(4096)).as_deref(),
+             Arc::new(Progress::default()),
+             None,
++            None,
+         );
+         // 2^24 rounds over a long password take minutes when nothing stops them.
+         let kdf = Kdf::SevenZip {
+diff --git a/crates/queue/src/import/inspect.rs b/crates/queue/src/import/inspect.rs
+index 17f72e16..6d66da73 100644
+--- a/crates/queue/src/import/inspect.rs
++++ b/crates/queue/src/import/inspect.rs
+@@ -533,7 +533,14 @@ impl Inspector {
+         let started = Instant::now();
+         let limits = self.run.limits;
+         let (progress, run) = (Arc::clone(&self.progress), Arc::clone(&self.run));
+-        let job = &super::job(client, rules, password, progress, Some(run));
++        let job = &super::job(
++            client,
++            rules,
++            password,
++            progress,
++            Some(run),
++            super::posted(nzb),
++        );
+         let mut timings = Timings::default();
+         self.files_read = self.files_read.saturating_add(nzb.files.len());
+         let (planned, step) = if self.files_read > limits.files {
+@@ -895,6 +902,7 @@ mod tests {
+             None,
+             Arc::clone(&inspector.progress),
+             Some(Arc::clone(&inspector.run)),
++            None,
+         );
+         let output = Output {
+             path: vec!["Readable Name.txt".to_owned()],
+diff --git a/crates/stream/src/lib.rs b/crates/stream/src/lib.rs
+index 91065aa3..607c617e 100644
+--- a/crates/stream/src/lib.rs
++++ b/crates/stream/src/lib.rs
+@@ -333,6 +333,8 @@ pub struct SegmentReader {
+     /// Fails instead of filling, padding or cutting, and serves bodies only once whole.
+     strict: bool,
+     workload: Workload,
++    /// When the file was posted, in Unix seconds; see [`BodyExpectation::posted`].
++    posted: Option<i64>,
+     warm_floor: usize,
+     budget: Option<Budget>,
+     cache: Option<Arc<Cache>>,
+@@ -390,6 +392,7 @@ impl SegmentReader {
+             prewarm: true,
+             strict: false,
+             workload: Workload::Stream,
++            posted: None,
+             warm_floor: 2,
+             budget: None,
+             cache: None,
+@@ -445,6 +448,13 @@ impl SegmentReader {
+         self
+     }
+ 
++    /// Skips providers whose retention a file posted at `posted` (Unix seconds) is past.
++    #[must_use]
++    pub const fn with_posted(mut self, posted: i64) -> Self {
++        self.posted = Some(posted);
++        self
++    }
++
+     /// Fetches on `workload` ([`Workload::Stream`] by default). Only playback hedges a
+     /// slow head; health and warming reads never fetch a failed head again on demand.
+     #[must_use]
+@@ -672,7 +682,7 @@ impl SegmentReader {
+         // The segment being read is always fetched, even past the range end.
+         let end = self.end.max(read_index + 1).min(self.layout.segments.len());
+         while self.next < end && self.next - self.head < ahead {
+-            let (client, layout, cache, hole, index, strict, workload) = (
++            let (client, layout, cache, hole, index, strict, workload, posted) = (
+                 Arc::clone(&self.client),
+                 Arc::clone(&self.layout),
+                 self.cache.clone(),
+@@ -680,6 +690,7 @@ impl SegmentReader {
+                 self.next,
+                 self.strict,
+                 self.workload,
++                self.posted,
+             );
+             if !strict && hole.gaps.as_ref().is_some_and(|g| g.is_hole(index)) {
+                 let size = usize::try_from(layout.segments[index].size).unwrap_or(0);
+@@ -763,6 +774,7 @@ impl SegmentReader {
+                         &hole,
+                         workload,
+                         strict,
++                        posted,
+                     )
+                     .await?;
+                     Ok(((data, permit, filled), started.elapsed()))
+@@ -821,7 +833,7 @@ impl SegmentReader {
+     /// Replaces the head fetch with a new one that skips the budget and, unless strict,
+     /// streams in, as a fetch the reader waits on may.
+     fn refetch_head(&mut self) {
+-        let (client, layout, cache, hole, index, workload, strict) = (
++        let (client, layout, cache, hole, index, workload, strict, posted) = (
+             Arc::clone(&self.client),
+             Arc::clone(&self.layout),
+             self.cache.clone(),
+@@ -829,6 +841,7 @@ impl SegmentReader {
+             self.head,
+             self.workload,
+             self.strict,
++            self.posted,
+         );
+         let wait = Some(Arc::new(Wait::default()));
+         let probe = self.probe(index, wait.clone(), false);
+@@ -865,6 +878,7 @@ impl SegmentReader {
+                 &hole,
+                 workload,
+                 strict,
++                posted,
+             )
+             .await?;
+             Ok(((data, None, filled), started.elapsed()))
+@@ -964,13 +978,14 @@ impl SegmentReader {
+                         u32::try_from(self.layout.segments[self.head].size).unwrap_or(u32::MAX),
+                     )))
+         {
+-            let (client, layout, cache, hole, index, strict) = (
++            let (client, layout, cache, hole, index, strict, posted) = (
+                 Arc::clone(&self.client),
+                 Arc::clone(&self.layout),
+                 self.cache.clone(),
+                 self.hole(self.head),
+                 self.head,
+                 self.strict,
++                self.posted,
+             );
+             tracing::debug!(segment = index, "hedging slow segment");
+             self.note(Event::Hedge {
+@@ -988,6 +1003,7 @@ impl SegmentReader {
+                     &hole,
+                     Workload::Stream,
+                     strict,
++                    posted,
+                 )
+                 .await
+             }));
+@@ -1192,10 +1208,15 @@ async fn fetch(
+     hole: &Hole,
+     workload: Workload,
+     strict: bool,
++    posted: Option<i64>,
+ ) -> io::Result<(Bytes, bool)> {
+     let size = usize::try_from(segment.size)
+         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "segment too large"))?;
+-    let (id, expected) = (&segment.message_id, segment.expected);
++    let id = &segment.message_id;
++    let expected = BodyExpectation {
++        posted,
++        ..segment.expected
++    };
+     let body = match source {
+         Source::Direct => client
+             .body_expecting(id, workload, probe, progress.as_ref(), expected)
+diff --git a/crates/vfs/src/reader.rs b/crates/vfs/src/reader.rs
+index a1fecdad..31856fad 100644
+--- a/crates/vfs/src/reader.rs
++++ b/crates/vfs/src/reader.rs
+@@ -201,6 +201,12 @@ impl Reader {
+         self.map_segments(|r| r.strict(strict))
+     }
+ 
++    /// For a file posted at `posted`; see [`SegmentReader::with_posted`].
++    #[must_use]
++    pub fn with_posted(self, posted: i64) -> Self {
++        self.map_segments(|r| r.with_posted(posted))
++    }
++
+     /// Fetches on `workload`; see [`SegmentReader::with_workload`].
+     #[must_use]
+     pub fn with_workload(self, workload: Workload) -> Self {

@@ -1,0 +1,339 @@
+From e3cda4891950ffcfc6e81f6f3856eba62b09fd13 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 00:31:45 +1100
+Subject: [PATCH 10/13] Playback joins a background flight once its request is
+ sent
+
+A Stream fetch never joined a Warm, Queue or Health flight of the same article,
+so a background cache-ahead leading the player made it fetch every shared
+article twice. Playback now joins a background flight whose request reached a
+provider, and replaces it only while the request is still queued.
+
+The hand-off is atomic: Wait gets a send/withdraw state, the pool marks a
+request sent just before writing it (a withdrawn one is dropped unrecorded, as
+when no slot comes in time), and the cache replaces a background flight only if
+it withdraws that request first. The replaced flight is handed the playback
+flight and waits for it rather than fetching again. Every traced flight gets a
+leader wait for this.
+
+A Warm reader's window is also capped at its own prefetch, so a plain reader on
+the Warm workload keeps its read-ahead; warming readers are unchanged.
+---
+ crates/core/src/wait.rs    |  33 +++++++++
+ crates/nntp/src/pool.rs    |   9 +++
+ crates/stream/src/cache.rs | 139 +++++++++++++++++++++++++++++--------
+ crates/stream/src/lib.rs   |   5 +-
+ 4 files changed, 157 insertions(+), 29 deletions(-)
+
+diff --git a/crates/core/src/wait.rs b/crates/core/src/wait.rs
+index 9fc11dbe..78e25940 100644
+--- a/crates/core/src/wait.rs
++++ b/crates/core/src/wait.rs
+@@ -111,8 +111,14 @@ pub struct Wait {
+     flight: AtomicU64,
+     /// The fetch this one joined, whose stage is the real one.
+     follow: OnceLock<Arc<Self>>,
++    /// [`PENDING`], [`SENT`] or [`WITHDRAWN`]: whether its request reached a provider.
++    sending: AtomicU8,
+ }
+ 
++const PENDING: u8 = 0;
++const SENT: u8 = 1;
++const WITHDRAWN: u8 = 2;
++
+ impl Default for Wait {
+     fn default() -> Self {
+         Self {
+@@ -122,6 +128,7 @@ impl Default for Wait {
+             connection: AtomicU32::new(NONE32),
+             flight: AtomicU64::new(0),
+             follow: OnceLock::new(),
++            sending: AtomicU8::new(PENDING),
+         }
+     }
+ }
+@@ -152,6 +159,32 @@ impl Wait {
+             .store(Stage::after(step) as u8, Ordering::Relaxed);
+     }
+ 
++    /// Called just before the request is written to a provider: `false` when it was
++    /// withdrawn, and must not be sent.
++    pub fn send(&self) -> bool {
++        match self
++            .sending
++            .compare_exchange(PENDING, SENT, Ordering::AcqRel, Ordering::Acquire)
++        {
++            Ok(_) | Err(SENT) => true,
++            Err(_) => false,
++        }
++    }
++
++    /// Withdraws a request no provider has been sent yet; `false` once one has.
++    pub fn withdraw(&self) -> bool {
++        matches!(
++            self.sending
++                .compare_exchange(PENDING, WITHDRAWN, Ordering::AcqRel, Ordering::Acquire),
++            Ok(_) | Err(WITHDRAWN)
++        )
++    }
++
++    #[must_use]
++    pub fn withdrawn(&self) -> bool {
++        self.sending.load(Ordering::Acquire) == WITHDRAWN
++    }
++
+     /// This fetch started the shared fetch `flight`.
+     pub fn lead(&self, flight: u64) {
+         self.flight.store(flight, Ordering::Relaxed);
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index f9687b4d..11f8c67c 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -596,6 +596,15 @@ impl Pool {
+             let (tx, load, ahead, connection) =
+                 self.worker(stream, tag.fresh, deadline, lane).await?;
+             drop(parked);
++            // Withdrawn while it waited: someone else asks for the article instead.
++            if tag
++                .probe
++                .as_ref()
++                .and_then(|probe| probe.wait.as_ref())
++                .is_some_and(|wait| !wait.send())
++            {
++                return Err(Failure::Request(Error::Unavailable));
++            }
+             budget = budget.saturating_sub(admitted.elapsed());
+             tag.step(Step::Connected {
+                 provider,
+diff --git a/crates/stream/src/cache.rs b/crates/stream/src/cache.rs
+index 1e0a1104..71ccc371 100644
+--- a/crates/stream/src/cache.rs
++++ b/crates/stream/src/cache.rs
+@@ -5,17 +5,19 @@
+ use std::collections::HashMap;
+ use std::hash::RandomState;
+ use std::path::PathBuf;
++use std::pin::pin;
+ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex, PoisonError, RwLock};
+ use std::time::Duration;
+ 
+ use bytes::Bytes;
+-use futures_util::future::{BoxFuture, FutureExt, Shared, WeakShared};
++use futures_util::future::{BoxFuture, Either, FutureExt, Shared, WeakShared, select};
+ use infinidysk_core::trace::{Event, Probe, Step, Tier};
+ use infinidysk_core::wait::Wait;
+ use infinidysk_nntp::{BodyExpectation, Client, Error, Progress, Workload};
+ use quick_cache::sync::DefaultLifecycle;
+ use quick_cache::{OptionsBuilder, Weighter};
++use tokio::sync::oneshot;
+ 
+ use crate::disk::{Disk, DiskStats};
+ 
+@@ -71,13 +73,16 @@ struct Inflight {
+     flights: HashMap<Arc<str>, WeakFlight>,
+ }
+ 
+-/// A flight's generation, future, leader wait and starting workload.
+-type WeakFlight = (
+-    u64,
+-    WeakShared<BoxFuture<'static, Landed>>,
+-    Option<Arc<Wait>>,
+-    Workload,
+-);
++struct WeakFlight {
++    generation: u64,
++    flight: WeakShared<BoxFuture<'static, Landed>>,
++    leader: Option<Arc<Wait>>,
++    /// The workload that started it.
++    workload: Workload,
++    /// Hands a background flight the playback flight replacing it, so a request it has
++    /// not sent yet is dropped and it waits for that one instead.
++    replaced: Option<oneshot::Sender<Flight>>,
++}
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct CacheConfig {
+@@ -349,11 +354,17 @@ impl Cache {
+         if let Some((generation, flight, leader)) = inflight
+             .flights
+             .get(message_id)
+-            .filter(|(_, _, _, started)| {
+-                workload != Workload::Stream || *started == Workload::Stream
++            .filter(|current| {
++                workload != Workload::Stream
++                    || current.workload == Workload::Stream
++                    || current.leader.as_ref().is_some_and(|wait| !wait.withdraw())
+             })
+-            .and_then(|(generation, weak, leader, _)| {
+-                Some((*generation, weak.upgrade()?, leader.clone()))
++            .and_then(|current| {
++                Some((
++                    current.generation,
++                    current.flight.upgrade()?,
++                    current.leader.clone(),
++                ))
+             })
+         {
+             drop(inflight);
+@@ -367,7 +378,13 @@ impl Cache {
+         }
+         inflight.generation += 1;
+         let generation = inflight.generation;
+-        let leader = probe.and_then(|p| p.wait.clone());
++        // Every traced flight gets a wait, so playback can tell whether a background
++        // leader's request has left the queue.
++        let probe = probe.cloned().map(|mut probe| {
++            probe.wait.get_or_insert_with(Arc::default);
++            probe
++        });
++        let leader = probe.as_ref().and_then(|p| p.wait.clone());
+         if let Some(wait) = &leader {
+             wait.lead(generation);
+         }
+@@ -376,7 +393,10 @@ impl Cache {
+             key: message_id.into(),
+             generation,
+         };
+-        let (cache, client, probe) = (Arc::clone(self), Arc::clone(client), probe.cloned());
++        let (cache, client) = (Arc::clone(self), Arc::clone(client));
++        let own = leader.clone();
++        let withdrawn = move || own.as_ref().is_some_and(|wait| wait.withdrawn());
++        let (replaced, replacement) = oneshot::channel::<Flight>();
+         let flight = async move {
+             if let Some(disk) = cache.disk()
+                 && let Some(data) = disk.get(&landing.key, probe.as_ref()).await
+@@ -384,25 +404,44 @@ impl Cache {
+                 cache.remember(&landing.key, data.clone());
+                 return Ok((data, true));
+             }
+-            let body = cache
+-                .direct(
+-                    &client,
+-                    &landing.key,
+-                    workload,
+-                    expected,
+-                    probe.as_ref(),
+-                    progress.as_ref(),
+-                )
+-                .await;
++            let direct = cache.direct(
++                &client,
++                &landing.key,
++                workload,
++                expected,
++                probe.as_ref(),
++                progress.as_ref(),
++            );
++            // Polled first, so a woken flight that was replaced never sends its request.
++            let body = match select(replacement, pin!(direct)).await {
++                Either::Left((Ok(playback), _)) => return playback.await,
++                Either::Left((Err(_), direct)) => direct.await,
++                // Withdrawn just before the replacement was handed over.
++                Either::Right((Err(_), replacement)) if withdrawn() => match replacement.await {
++                    Ok(playback) => return playback.await,
++                    Err(_) => Err(Arc::new(Error::Unavailable)),
++                },
++                Either::Right((body, _)) => body,
++            };
+             drop(landing);
+             Ok((body?, false))
+         }
+         .boxed()
+         .shared();
+         if let Some(weak) = flight.downgrade() {
+-            inflight
+-                .flights
+-                .insert(message_id.into(), (generation, weak, leader, workload));
++            let previous = inflight.flights.insert(
++                message_id.into(),
++                WeakFlight {
++                    generation,
++                    flight: weak,
++                    leader,
++                    workload,
++                    replaced: (workload != Workload::Stream).then_some(replaced),
++                },
++            );
++            if let Some(tx) = previous.and_then(|p| p.replaced) {
++                let _ = tx.send(flight.clone());
++            }
+         }
+         drop(inflight);
+         (flight, false)
+@@ -429,7 +468,7 @@ impl Drop for Landing {
+         if inflight
+             .flights
+             .get(&self.key)
+-            .is_some_and(|(generation, _, _, _)| *generation == self.generation)
++            .is_some_and(|current| current.generation == self.generation)
+         {
+             inflight.flights.remove(&self.key);
+         }
+@@ -477,6 +516,50 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn playback_joins_a_background_flight_only_once_its_request_is_sent() {
++        let client = Arc::new(Client::new([]));
++        let cache = Arc::new(Cache::new(true, 1 << 20));
++        let probe = Probe {
++            trace: None,
++            wait: None,
++            watch: None,
++            segment: 0,
++            hedge: false,
++            size: 0,
++            reader: 0,
++        };
++        let flight = |workload| {
++            cache.flight(
++                &client,
++                "wire@test",
++                workload,
++                BodyExpectation::NONE,
++                Some(&probe),
++                None,
++            )
++        };
++        let leader = || {
++            cache.inflight.lock().unwrap().flights["wire@test"]
++                .leader
++                .clone()
++                .expect("a traced flight has a wait")
++        };
++        let (warm, _) = flight(Workload::Warm);
++        let queued = leader();
++        let (replacement, joined) = flight(Workload::Stream);
++        assert!(!joined, "a queued background request is replaced");
++        assert!(!queued.send(), "and may no longer be sent");
++        drop((warm, replacement));
++
++        let (warm, _) = flight(Workload::Warm);
++        assert!(leader().send());
++        let (_shared, joined) = flight(Workload::Stream);
++        assert!(joined, "a sent background request is joined");
++        assert!(leader().send(), "a retry may still be sent");
++        drop(warm);
++    }
++
+     #[test]
+     fn disable_clears_an_insertion_paused_after_its_enabled_check() {
+         let cache = Arc::new(Cache::new(true, 1 << 20));
+diff --git a/crates/stream/src/lib.rs b/crates/stream/src/lib.rs
+index 98809cf3..91065aa3 100644
+--- a/crates/stream/src/lib.rs
++++ b/crates/stream/src/lib.rs
+@@ -643,7 +643,10 @@ impl SegmentReader {
+     /// the opening size per segment read, so an open does not queue the whole prefetch.
+     fn ahead(&self) -> usize {
+         if self.workload == Workload::Warm {
+-            return self.client.warming_window(self.warm_floor);
++            return self
++                .client
++                .warming_window(self.warm_floor)
++                .min(self.prefetch);
+         }
+         if self.bounded {
+             return self.prefetch;
