@@ -312,3 +312,13 @@ async fn cold_start_requests_wait_for_their_own_connection_rather_than_queue() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn a_refusing_loopback_server_keeps_its_port_until_it_resumes() {
+    let server = LoopbackServer::start(Vec::new()).await.unwrap();
+    server.refuse().await;
+    assert!(tokio::net::TcpListener::bind(server.addr()).await.is_err());
+    assert!(tokio::net::TcpStream::connect(server.addr()).await.is_err());
+    server.resume().await.unwrap();
+    assert!(tokio::net::TcpStream::connect(server.addr()).await.is_ok());
+}

@@ -14,7 +14,7 @@ use crate::vendor::core::trace::{Event, Probe, Step, Tier};
 use crate::vendor::core::wait::Wait;
 use crate::vendor::nntp::{BodyExpectation, Client, Error, Progress, Workload};
 use bytes::Bytes;
-use futures_util::future::{BoxFuture, Either, FutureExt, Shared, WeakShared, select};
+use futures_util::future::{BoxFuture, Either, FutureExt, Shared, WeakShared, ready, select};
 use quick_cache::sync::DefaultLifecycle;
 use quick_cache::{OptionsBuilder, Weighter};
 use tokio::sync::oneshot;
@@ -376,6 +376,13 @@ impl Cache {
             }
             return (flight, true);
         }
+        // A fetch inserts before it leaves the map, so one that landed since the caller's
+        // memory check is found here.
+        if self.enabled.load(Ordering::Relaxed)
+            && let Some(data) = self.memory.get(message_id)
+        {
+            return (ready(Ok((data, false))).boxed().shared(), true);
+        }
         inflight.generation += 1;
         let generation = inflight.generation;
         // Every traced flight gets a wait, so playback can tell whether a background
@@ -486,6 +493,27 @@ mod tests {
     use std::sync::{TryLockError, mpsc};
 
     use super::*;
+
+    #[test]
+    fn a_body_landing_after_the_memory_check_is_not_fetched_again() {
+        let client = Arc::new(Client::new([]));
+        let cache = Arc::new(Cache::new(true, 1 << 20));
+        cache.insert("landed@test", Bytes::from_static(b"body"));
+        for workload in [Workload::Stream, Workload::Cache, Workload::Queue] {
+            let (flight, joined) = cache.flight(
+                &client,
+                "landed@test",
+                workload,
+                BodyExpectation::NONE,
+                None,
+                None,
+            );
+            assert!(joined, "{workload:?}");
+            let (data, from_disk) = flight.now_or_never().unwrap().unwrap();
+            assert_eq!((&data[..], from_disk), (&b"body"[..], false));
+        }
+        assert_eq!(cache.stats().misses, 0);
+    }
 
     #[test]
     fn replacing_background_flights_preserves_sharing_and_cleanup() {

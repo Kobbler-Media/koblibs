@@ -129,8 +129,10 @@ pub fn landed(dir: &Path) -> io::Result<Vec<(PathBuf, String)>> {
 }
 
 // Every byte counts: a recorded key skips extraction, so two archives may share one only if
-// they are the same archive in the same folder.
-pub fn identity(root: &Path, volumes: &[PathBuf]) -> io::Result<String> {
+// they are the same archive in the same folder. A split's output is named after its volumes,
+// so their names count too; other families name outputs from their headers, and obfuscated
+// RAR volumes are renamed between runs, so hashing their names would break resume.
+pub fn identity(root: &Path, family: Family, volumes: &[PathBuf]) -> io::Result<String> {
     let mut hash = Sha256::new();
     let parent = volumes[0].parent().unwrap_or(root);
     let folder = parent.strip_prefix(root).unwrap_or(parent);
@@ -138,6 +140,11 @@ pub fn identity(root: &Path, volumes: &[PathBuf]) -> io::Result<String> {
     let mut buf = vec![0; IDENTITY_READ];
     for volume in volumes {
         hash.update([0]);
+        if family == Family::Split {
+            let name = volume.file_name().unwrap_or_default().as_bytes();
+            hash.update((name.len() as u64).to_le_bytes());
+            hash.update(name);
+        }
         hash.update(fs::metadata(volume)?.len().to_le_bytes());
         let mut file = File::open(volume)?;
         loop {

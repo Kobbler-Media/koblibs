@@ -61,8 +61,12 @@ which drives upstream's database-backed queue service.
 | 27 | Coverage for the cache-first bound's second headroom slot and yield | ours, test only |
 | 28 | Extreme NZB segment numbers count as a gap instead of overflowing | ours |
 | 29 | Playback borrows up to a quarter of the download slots instead of waiting behind parked background requests | ours |
+| 30 | A body landing between a reader's memory check and its flight lookup is not fetched again | ours |
+| 31 | An account permit is owned by its connection and outlives the socket in every task state; idle connections log out before freeing it | ours |
+| 32 | Loopback server uncounts a connection before closing it, so `peak_connections` never counts one the client saw close | ours, test only |
+| 33 | A refusing loopback server keeps its port, so a parallel test's server cannot answer in its place | ours, test only |
 
-Patches 5–29 are candidates to offer upstream.
+Patches 5–33 are candidates to offer upstream.
 
 ## Monthly sync
 

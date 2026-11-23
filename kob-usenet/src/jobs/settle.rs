@@ -6,7 +6,7 @@ use crate::jobs::JobState;
 use crate::jobs::failure::Failure;
 use crate::jobs::run::Job;
 use crate::jobs::store::Plan;
-use crate::repair::{self, Budget, Control, OnDisk, RepairError, Repaired, proof_damage};
+use crate::repair::{self, Budget, Control, OnDisk, RepairError, proof_damage};
 use crate::vendor::core::{FileMeta, NzbFile};
 use crate::vendor::yenc::crc32;
 
@@ -90,10 +90,9 @@ pub async fn settle(
     )
     .await;
     match repaired {
-        Ok(repaired) => {
-            let slices = repaired.slices;
+        Ok(slices) => {
             let (plan, paths) = (plan.clone(), paths.clone());
-            tokio::task::spawn_blocking(move || still_damaged(&plan, &paths, &repaired))
+            tokio::task::spawn_blocking(move || still_damaged(&plan, &paths))
                 .await
                 .map_err(|e| Failure::io("verifying", e))?
                 .map_err(|e| Failure::io("verifying", e))?
@@ -113,11 +112,7 @@ pub async fn settle(
     }
 }
 
-fn still_damaged(
-    plan: &Plan,
-    paths: &[PathBuf],
-    repaired: &Repaired,
-) -> std::io::Result<Option<String>> {
+fn still_damaged(plan: &Plan, paths: &[PathBuf]) -> std::io::Result<Option<String>> {
     for (output, path) in plan.outputs.iter().zip(paths) {
         let FileMeta::Nzb(NzbFile {
             proof: Some(proof), ..
@@ -125,7 +120,7 @@ fn still_damaged(
         else {
             continue;
         };
-        if !repaired.by_other_set.contains(path) && !proof_damage(path, proof)?.is_empty() {
+        if !proof_damage(path, proof)?.is_empty() {
             return Ok(Some(output.path.clone()));
         }
     }

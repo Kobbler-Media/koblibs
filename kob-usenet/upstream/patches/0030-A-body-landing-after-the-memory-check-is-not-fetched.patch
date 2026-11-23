@@ -1,0 +1,67 @@
+From 1d10a433283b3730438f201d956b6e422bdd835b Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 20:42:16 +1100
+Subject: [PATCH] A body landing after the memory check is not fetched again
+
+---
+ crates/stream/src/cache.rs | 30 +++++++++++++++++++++++++++++-
+ 1 file changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/crates/stream/src/cache.rs b/crates/stream/src/cache.rs
+index 71ccc371..13fd7763 100644
+--- a/crates/stream/src/cache.rs
++++ b/crates/stream/src/cache.rs
+@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
+ use std::time::Duration;
+ 
+ use bytes::Bytes;
+-use futures_util::future::{BoxFuture, Either, FutureExt, Shared, WeakShared, select};
++use futures_util::future::{BoxFuture, Either, FutureExt, Shared, WeakShared, ready, select};
+ use infinidysk_core::trace::{Event, Probe, Step, Tier};
+ use infinidysk_core::wait::Wait;
+ use infinidysk_nntp::{BodyExpectation, Client, Error, Progress, Workload};
+@@ -376,6 +376,13 @@ impl Cache {
+             }
+             return (flight, true);
+         }
++        // A fetch inserts before it leaves the map, so one that landed since the caller's
++        // memory check is found here.
++        if self.enabled.load(Ordering::Relaxed)
++            && let Some(data) = self.memory.get(message_id)
++        {
++            return (ready(Ok((data, false))).boxed().shared(), true);
++        }
+         inflight.generation += 1;
+         let generation = inflight.generation;
+         // Every traced flight gets a wait, so playback can tell whether a background
+@@ -487,6 +494,27 @@ mod tests {
+ 
+     use super::*;
+ 
++    #[test]
++    fn a_body_landing_after_the_memory_check_is_not_fetched_again() {
++        let client = Arc::new(Client::new([]));
++        let cache = Arc::new(Cache::new(true, 1 << 20));
++        cache.insert("landed@test", Bytes::from_static(b"body"));
++        for workload in [Workload::Stream, Workload::Cache, Workload::Queue] {
++            let (flight, joined) = cache.flight(
++                &client,
++                "landed@test",
++                workload,
++                BodyExpectation::NONE,
++                None,
++                None,
++            );
++            assert!(joined, "{workload:?}");
++            let (data, from_disk) = flight.now_or_never().unwrap().unwrap();
++            assert_eq!((&data[..], from_disk), (&b"body"[..], false));
++        }
++        assert_eq!(cache.stats().misses, 0);
++    }
++
+     #[test]
+     fn replacing_background_flights_preserves_sharing_and_cleanup() {
+         for background in [Workload::Health, Workload::Queue] {
+-- 
+2.56.1
+

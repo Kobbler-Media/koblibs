@@ -14,7 +14,6 @@ const COMPARE: usize = 1 << 20;
 
 type Move = (PathBuf, PathBuf);
 type GroupKey = (Option<(u8, String)>, OsString);
-type Entry = (OsString, OsString);
 
 // The plan is journaled because a volume set must land under one number: re-planning after a
 // crash would see its own half-moved volumes as a collision and split the set.
@@ -96,26 +95,25 @@ fn plan(
         .map(|e| e.map(|e| e.file_name()))
         .collect::<io::Result<HashSet<OsString>>>()?;
     let mut planned = HashSet::new();
-    let mut groups: BTreeMap<GroupKey, Vec<Entry>> = BTreeMap::new();
+    let mut groups: BTreeMap<GroupKey, Vec<OsString>> = BTreeMap::new();
     let mut entries = fs::read_dir(from)?.collect::<io::Result<Vec<_>>>()?;
     entries.sort_by_key(fs::DirEntry::file_name);
     for entry in entries {
-        let source = entry.file_name();
-        let name = scan::unreserved(&source);
+        let name = entry.file_name();
         if !entry.file_type()?.is_dir() {
             let key = match set_of(&name) {
                 Some(set) => (Some(set), OsString::new()),
                 None => (None, name.clone()),
             };
-            groups.entry(key).or_default().push((source, name));
+            groups.entry(key).or_default().push(name);
             continue;
         }
         let resident = into.join(&name);
         if fs::symlink_metadata(&resident).is_ok_and(|m| m.is_dir()) {
             plan(
-                &from.join(&source),
+                &from.join(&name),
                 &resident,
-                &from_rel.join(&source),
+                &from_rel.join(&name),
                 &into_rel.join(&name),
                 moves,
             )?;
@@ -125,24 +123,19 @@ fn plan(
             .map(|n| numbered(&name, n))
             .find(|t| !present.contains(t) && !planned.contains(t))
             .expect("some number is free");
-        moves.push((from_rel.join(&source), into_rel.join(&target)));
+        moves.push((from_rel.join(&name), into_rel.join(&target)));
         planned.insert(target);
     }
     for group in groups.into_values() {
         let targets = (0..)
-            .map(|n| {
-                group
-                    .iter()
-                    .map(|(_, name)| named(name, n))
-                    .collect::<Vec<_>>()
-            })
+            .map(|n| group.iter().map(|name| named(name, n)).collect::<Vec<_>>())
             .find_map(|targets| {
                 fits(&group, &targets, from, into, &present, &planned)
                     .map(|fit| fit.then_some(targets))
                     .transpose()
             })
             .expect("some number is free")?;
-        for ((source, _), target) in group.iter().zip(targets) {
+        for (source, target) in group.iter().zip(targets) {
             moves.push((from_rel.join(source), into_rel.join(&target)));
             planned.insert(target);
         }
@@ -151,7 +144,7 @@ fn plan(
 }
 
 fn fits(
-    group: &[Entry],
+    group: &[OsString],
     targets: &[OsString],
     from: &Path,
     into: &Path,
@@ -159,8 +152,7 @@ fn fits(
     planned: &HashSet<OsString>,
 ) -> io::Result<bool> {
     let set = set_of(&targets[0]);
-    if targets.iter().any(|t| set_of(t) != set) || (set.is_some() != set_of(&group[0].1).is_some())
-    {
+    if targets.iter().any(|t| set_of(t) != set) || (set.is_some() != set_of(&group[0]).is_some()) {
         return Ok(false);
     }
     if set.is_some()
@@ -171,7 +163,7 @@ fn fits(
     {
         return Ok(false);
     }
-    for ((source, _), target) in group.iter().zip(targets) {
+    for (source, target) in group.iter().zip(targets) {
         if planned.contains(target) {
             return Ok(false);
         }
@@ -208,7 +200,7 @@ fn named(name: &OsStr, n: u32) -> OsString {
     }
 }
 
-fn numbered(name: &OsStr, n: u32) -> OsString {
+pub fn numbered(name: &OsStr, n: u32) -> OsString {
     if n == 0 {
         return name.to_owned();
     }
@@ -349,6 +341,7 @@ mod tests {
         }
         scan::sweep(dir.path()).unwrap();
         assert!(landing.join(".extract-held/kept").exists());
+        crate::unpack::tree::unreserve(&landing).unwrap();
         adopt(&landing, dir.path()).ok().unwrap();
         scan::sweep(dir.path()).unwrap();
         assert!(scan::landed(dir.path()).unwrap().is_empty());

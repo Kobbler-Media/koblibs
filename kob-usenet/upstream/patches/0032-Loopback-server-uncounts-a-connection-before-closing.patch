@@ -1,0 +1,76 @@
+From 9f1c43d0463e58e69f5d56d7955d3a8c8e924f41 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 20:42:16 +1100
+Subject: [PATCH] Loopback server uncounts a connection before closing it
+
+---
+ crates/testkit/src/server.rs | 37 +++++++++++++++++++++++++++---------
+ 1 file changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/crates/testkit/src/server.rs b/crates/testkit/src/server.rs
+index 81815d6a..7f9af094 100644
+--- a/crates/testkit/src/server.rs
++++ b/crates/testkit/src/server.rs
+@@ -98,7 +98,7 @@ impl Acceptor {
+                 let tls = self.tls.clone();
+                 let now = self.open.fetch_add(1, Ordering::SeqCst) + 1;
+                 self.peak.fetch_max(now, Ordering::SeqCst);
+-                let open_count = Arc::clone(&self.open);
++                let counted = Counted(Arc::clone(&self.open));
+                 let limit = Limit {
+                     behavior: self.behavior,
+                     rejected: now > self.behavior.max_connections,
+@@ -108,16 +108,14 @@ impl Acceptor {
+                 };
+                 // A failed connection only affects the test that owns it.
+                 tokio::spawn(async move {
+-                    let result = async {
+-                        stream.set_nodelay(true)?;
+-                        match tls {
+-                            None => serve(stream, articles, limit).await,
+-                            Some(tls) => serve(tls.accept(stream).await?, articles, limit).await,
++                    stream.set_nodelay(true)?;
++                    match tls {
++                        None => serve_counted(stream, articles, limit, counted).await,
++                        Some(tls) => {
++                            let stream = tls.accept(stream).await?;
++                            serve_counted(stream, articles, limit, counted).await
+                         }
+                     }
+-                    .await;
+-                    open_count.fetch_sub(1, Ordering::SeqCst);
+-                    result
+                 });
+             }
+         })
+@@ -381,6 +379,27 @@ async fn delay(duration: Duration) {
+     }
+ }
+ 
++struct Counted(Arc<AtomicUsize>);
++
++impl Drop for Counted {
++    fn drop(&mut self) {
++        self.0.fetch_sub(1, Ordering::SeqCst);
++    }
++}
++
++// Uncounts before the socket closes: a client that saw the close may connect again at once,
++// and must not be counted alongside the connection it replaced.
++async fn serve_counted<S: AsyncRead + AsyncWrite + Unpin>(
++    mut stream: S,
++    articles: Arc<HashMap<String, Vec<u8>>>,
++    limit: Limit,
++    counted: Counted,
++) -> io::Result<()> {
++    let result = serve(&mut stream, articles, limit).await;
++    drop(counted);
++    result
++}
++
+ async fn serve<S: AsyncRead + AsyncWrite>(
+     stream: S,
+     articles: Arc<HashMap<String, Vec<u8>>>,
+-- 
+2.56.1
+

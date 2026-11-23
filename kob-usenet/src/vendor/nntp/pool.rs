@@ -7,7 +7,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use crate::vendor::core::trace::{Outcome, Probe, Reason, Step};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::vendor::nntp::article::Body;
@@ -976,7 +976,7 @@ impl Pool {
                     Err(Failure::Request(Error::Unavailable))
                 };
             };
-            let conn = match Connection::connect_staged_until(&endpoint, until).await {
+            let mut conn = match Connection::connect_staged_until(&endpoint, until).await {
                 Ok(conn) => conn,
                 Err((stage, error)) => {
                     stats.connect_failed();
@@ -1067,6 +1067,7 @@ impl Pool {
                     return result;
                 }
             };
+            conn.hold(permit);
             let (tx, rx) = mpsc::channel(config.pipeline_depth);
             let load = Arc::new(AtomicUsize::new(0));
             let acquired = Load::watched(&load, &connecting.changed);
@@ -1079,7 +1080,6 @@ impl Pool {
                 Live::acquire(&live),
                 usage,
                 endpoint.host().to_owned(),
-                permit,
             ));
             let mut state = connecting.lock();
             if let Some(backoff) = state.backoff.take() {
@@ -1267,7 +1267,6 @@ async fn run(
     mut live: Live,
     usage: Option<Arc<Usage>>,
     host: String,
-    _account: OwnedSemaphorePermit,
 ) {
     let mut in_flight = VecDeque::with_capacity(config.pipeline_depth);
     loop {
@@ -1288,6 +1287,8 @@ async fn run(
                         config.min_connections
                     }) =>
                 {
+                    drop(rx);
+                    conn.quit().await;
                     return;
                 }
                 Err(_) => {
@@ -1471,6 +1472,164 @@ mod tests {
         assert_eq!(server.peak_connections(), 1);
         drop(load);
         pool.abort();
+    }
+
+    struct ReleaseWatch {
+        ports: (u16, u16),
+        open_at_release: OnceLock<bool>,
+    }
+
+    impl std::task::Wake for ReleaseWatch {
+        fn wake(self: Arc<Self>) {
+            let _ = self.open_at_release.set(established(self.ports));
+        }
+    }
+
+    fn established((local, remote): (u16, u16)) -> bool {
+        let table = std::fs::read_to_string("/proc/self/net/tcp").unwrap();
+        table.lines().skip(1).any(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            fields[1].ends_with(&format!(":{local:04X}"))
+                && fields[2].ends_with(&format!(":{remote:04X}"))
+                && fields[3] == "01"
+        })
+    }
+
+    struct Scripted {
+        pool: Pool,
+        account: Arc<Semaphore>,
+        server: tokio::io::BufReader<tokio::net::TcpStream>,
+        ports: (u16, u16),
+    }
+
+    async fn scripted(idle_timeout: Duration) -> Scripted {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let endpoint = Endpoint::new(
+            "127.0.0.1",
+            port,
+            crate::vendor::nntp::TlsMode::Plain,
+            None,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let config = PoolConfig {
+            max_connections: 1,
+            pipeline_depth: 1,
+            idle_timeout,
+            min_connections: 0,
+        };
+        let account = Arc::new(Semaphore::new(1));
+        let pool = Pool::new(endpoint, config, Downloads::new(4))
+            .unwrap()
+            .with_account(Arc::clone(&account));
+        let accept = async {
+            let (mut stream, peer) = listener.accept().await.unwrap();
+            stream.write_all(b"200 ready\r\n").await.unwrap();
+            (stream, peer.port())
+        };
+        let ((stream, client), opened) =
+            tokio::join!(accept, pool.worker(Workload::Stream, false, None, None));
+        let Ok((_, load, _, _)) = opened else {
+            panic!("the connection opens");
+        };
+        drop(load);
+        Scripted {
+            pool,
+            account,
+            server: tokio::io::BufReader::new(stream),
+            ports: (client, port),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_account_permit_outlives_a_socket_closed_without_quit() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        for broken in [false, true] {
+            let Scripted {
+                pool,
+                account,
+                mut server,
+                ports,
+            } = scripted(Duration::from_secs(60)).await;
+            let watch = Arc::new(ReleaseWatch {
+                ports,
+                open_at_release: OnceLock::new(),
+            });
+            let waker = std::task::Waker::from(Arc::clone(&watch));
+            let mut waiter = Box::pin(Arc::clone(&account).acquire_owned());
+            assert!(
+                waiter
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let request = broken.then(|| {
+                let pool = pool.clone();
+                tokio::spawn(async move { pool.body("gone@test").await.map(|_| ()) })
+            });
+            if broken {
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                server.get_mut().write_all(b"400 bye\r\n").await.unwrap();
+            } else {
+                pool.abort();
+            }
+            timeout(Duration::from_secs(5), async {
+                while watch.open_at_release.get().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the permit comes back");
+            assert_eq!(
+                watch.open_at_release.get(),
+                Some(&false),
+                "broken={broken}: the permit was released while the socket was open"
+            );
+            drop(waiter);
+            if let Some(request) = request {
+                request.abort();
+            }
+            pool.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_account_permit_is_held_until_the_provider_closes_a_retired_or_idle_connection() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        for (idle_timeout, retire) in [
+            (Duration::from_secs(60), true),
+            (Duration::from_millis(20), false),
+        ] {
+            let mut scripted = scripted(idle_timeout).await;
+            if retire {
+                scripted.pool.retire();
+            }
+            let mut line = String::new();
+            timeout(Duration::from_secs(5), scripted.server.read_line(&mut line))
+                .await
+                .expect("the connection says goodbye")
+                .unwrap();
+            assert_eq!(line.trim(), "QUIT", "retire={retire}");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert_eq!(scripted.account.available_permits(), 0, "retire={retire}");
+            scripted
+                .server
+                .get_mut()
+                .write_all(b"205 bye\r\n")
+                .await
+                .unwrap();
+            drop(scripted.server);
+            timeout(Duration::from_secs(5), async {
+                while scripted.account.available_permits() == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the permit comes back once the provider closed");
+        }
     }
 
     async fn loopback_pool(

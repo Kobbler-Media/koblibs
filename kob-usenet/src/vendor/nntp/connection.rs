@@ -13,6 +13,7 @@ use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf,
 };
 use tokio::net::TcpStream;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -395,6 +396,9 @@ pub struct Connection {
     timeout: Duration,
     timing: Timing,
     bandwidth: Option<Arc<Bandwidth>>,
+    // After `stream`: fields drop in order in every task state, so the socket is closed
+    // before the account can hand this permit to another connection.
+    _account: Option<OwnedSemaphorePermit>,
 }
 
 /// Where the last body read spent its time.
@@ -409,6 +413,10 @@ impl Connection {
     #[must_use]
     pub const fn timing(&self) -> Timing {
         self.timing
+    }
+
+    pub(crate) fn hold(&mut self, permit: OwnedSemaphorePermit) {
+        self._account = Some(permit);
     }
 
     pub(crate) fn link(&self) -> &Arc<Link> {
@@ -499,6 +507,7 @@ impl Connection {
             timing: Timing::default(),
             // Set after login, so the connect deadline never covers a local limit wait.
             bandwidth: None,
+            _account: None,
         };
         *stage = Stage::Greeting;
         match conn.read_status().await? {

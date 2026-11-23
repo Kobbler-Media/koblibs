@@ -1,0 +1,91 @@
+From 192177ffa4a254a015085ac2df862a527190e07c Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 20:49:45 +1100
+Subject: [PATCH] A refusing loopback server keeps its port
+
+---
+ crates/nntp/tests/pool.rs    | 10 ++++++++++
+ crates/testkit/src/server.rs | 17 ++++++++++++++++-
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/crates/nntp/tests/pool.rs b/crates/nntp/tests/pool.rs
+index 38c92ff6..8e842029 100644
+--- a/crates/nntp/tests/pool.rs
++++ b/crates/nntp/tests/pool.rs
+@@ -312,3 +312,13 @@ async fn cold_start_requests_wait_for_their_own_connection_rather_than_queue() {
+         started.elapsed()
+     );
+ }
++
++#[tokio::test]
++async fn a_refusing_loopback_server_keeps_its_port_until_it_resumes() {
++    let server = LoopbackServer::start(Vec::new()).await.unwrap();
++    server.refuse().await;
++    assert!(tokio::net::TcpListener::bind(server.addr()).await.is_err());
++    assert!(tokio::net::TcpStream::connect(server.addr()).await.is_err());
++    server.resume().await.unwrap();
++    assert!(tokio::net::TcpStream::connect(server.addr()).await.is_ok());
++}
+diff --git a/crates/testkit/src/server.rs b/crates/testkit/src/server.rs
+index 7f9af094..d29fb9bf 100644
+--- a/crates/testkit/src/server.rs
++++ b/crates/testkit/src/server.rs
+@@ -9,7 +9,7 @@ use rustls::ServerConfig;
+ use rustls::crypto::aws_lc_rs;
+ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+-use tokio::net::TcpListener;
++use tokio::net::{TcpListener, TcpSocket};
+ use tokio::sync::oneshot;
+ use tokio::task::JoinHandle;
+ use tokio::time::{Instant, sleep, sleep_until};
+@@ -62,6 +62,7 @@ impl Default for Behavior {
+ pub struct LoopbackServer {
+     addr: SocketAddr,
+     accept: Mutex<Option<JoinHandle<()>>>,
++    refusing: Mutex<Option<TcpSocket>>,
+     acceptor: Acceptor,
+     open: Arc<AtomicUsize>,
+     peak: Arc<AtomicUsize>,
+@@ -255,6 +256,7 @@ impl LoopbackServer {
+         Ok(Self {
+             addr,
+             accept: Mutex::new(Some(acceptor.clone().spawn(listener))),
++            refusing: Mutex::default(),
+             open: Arc::clone(&acceptor.open),
+             peak: Arc::clone(&acceptor.peak),
+             bodies: Arc::clone(&acceptor.bodies),
+@@ -273,10 +275,12 @@ impl LoopbackServer {
+             accept.abort();
+             let _ = accept.await;
+         }
++        *self.refusing.lock().unwrap_or_else(PoisonError::into_inner) = reserve(self.addr).ok();
+     }
+ 
+     /// Listens again on the same port after [`refuse`](Self::refuse).
+     pub async fn resume(&self) -> io::Result<()> {
++        drop(self.refusing.lock().unwrap_or_else(PoisonError::into_inner).take());
+         let listener = TcpListener::bind(self.addr).await?;
+         let accept = self.acceptor.clone().spawn(listener);
+         if let Some(old) = self
+@@ -379,6 +383,17 @@ async fn delay(duration: Duration) {
+     }
+ }
+ 
++// Bound but not listening, so connects are refused and no other server is handed the port.
++// Address reuse is on only for the bind, past connections on the port; left on, another
++// socket could share the port.
++fn reserve(addr: SocketAddr) -> io::Result<TcpSocket> {
++    let socket = TcpSocket::new_v4()?;
++    socket.set_reuseaddr(true)?;
++    socket.bind(addr)?;
++    socket.set_reuseaddr(false)?;
++    Ok(socket)
++}
++
+ struct Counted(Arc<AtomicUsize>);
+ 
+ impl Drop for Counted {
+-- 
+2.56.1
+

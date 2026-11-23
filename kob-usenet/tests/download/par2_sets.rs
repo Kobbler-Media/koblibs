@@ -164,3 +164,46 @@ async fn a_damaged_archive_member_with_no_par2_fails_the_job() {
     let engine = rig.engine().await;
     failed(&run_job(&rig, &engine, "Movie", &[&volume]).await);
 }
+
+#[tokio::test]
+async fn sets_describing_different_bytes_for_a_damaged_file_fail_the_job() {
+    for (fill, real_recovers, decoy_first) in [
+        (0xAB, false, false),
+        (0xAB, false, true),
+        (0xAB, true, false),
+        (0xAB, true, true),
+        (0x00, false, false),
+        (0x00, false, true),
+        (0x00, true, true),
+    ] {
+        let (a, b) = season();
+        let mut other = b.data.clone();
+        other[b.range(2)].fill(fill);
+        let decoy_file = Posted::new("decoy", &b.name, other);
+        let (pa, pb, decoy) = (
+            par2_set(&[&a], "A", SLICE, 100),
+            par2_set(&[&b], "B", SLICE, 100),
+            par2_set(&[&decoy_file], "Decoy", FINE, 60),
+        );
+        let real: &[Posted] = if real_recovers { &pb } else { &pb[..1] };
+        let mut posts = vec![&a, &b];
+        posts.extend(&pa);
+        if decoy_first {
+            posts.extend(&decoy);
+            posts.extend(real);
+        } else {
+            posts.extend(real);
+            posts.extend(&decoy);
+        }
+        let gone = b.id(2).to_owned();
+        let rig = Rig::new(articles_without(&posts, &[&gone])).await;
+        let engine = rig.engine().await;
+        let status = run_job(&rig, &engine, "Show", &posts).await;
+        assert!(
+            status.error.is_some(),
+            "fill={fill} real_recovers={real_recovers} decoy_first={decoy_first}: {:?}",
+            status.state
+        );
+        failed(&status);
+    }
+}

@@ -87,3 +87,69 @@ async fn a_restart_after_the_final_move_reports_the_moved_folder() {
     assert_eq!(listing(rig.dest.path()), [format!("Show/{}", post.name)]);
     assert_eq!(rig.bodies(&post.articles), 0, "nothing is downloaded again");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_keeps_members_nested_under_reserved_folder_names() {
+    if !extractor_on_path() {
+        return;
+    }
+    let members = [
+        ("Sub/.extract-x/keep.bin", 111),
+        ("Sub/.unpacked-y/held.bin", 112),
+        ("Sub/Deep/.extract-z/.unpacked-w/deep.bin", 113),
+    ];
+    let work = tempfile::tempdir().unwrap();
+    for (path, seed) in members {
+        let at = work.path().join(path);
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::fs::write(at, video(ARTICLE + 7, seed)).unwrap();
+    }
+    sevenzip(work.path(), &["a", "-t7z", "-mx=1", "a.7z", "Sub"]);
+    std::fs::write(work.path().join("later.bin"), video(ARTICLE, 114)).unwrap();
+    sevenzip(work.path(), &["a", "-t7z", "-mx=1", "b.7z", "later.bin"]);
+    let read = |name: &str| std::fs::read(work.path().join(name)).unwrap();
+    let (a, b) = (
+        Posted::new("a", "a.7z", read("a.7z")),
+        Posted::new("b", "b.7z", read("b.7z")),
+    );
+    let rig = Rig::new(a.articles.iter().chain(&b.articles).cloned().collect()).await;
+    let mark = work.path().join("hung");
+    let hanging = script(
+        work.path(),
+        "7z-hangs-on-b",
+        &format!(
+            "case \"$*\" in *b.7z*) touch '{}'; exec sleep 60;; esac\nexec 7z \"$@\"",
+            mark.display()
+        ),
+    );
+    let spec = rig.spec("Nested", nzb::of(&[&a, &b]), None);
+    let id = spec.id.clone();
+    {
+        let engine = rig
+            .engine_with(|c| {
+                c.download.unrar = "/nonexistent/unrar".into();
+                c.download.sevenzip = hanging.clone();
+            })
+            .await;
+        engine.add_job(spec).await.unwrap();
+        while !mark.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    let engine = rig.engine().await;
+    let dir = completed(&finish(&engine, &id).await);
+    let names = listing(&dir);
+    for (path, seed) in members {
+        let leaf = path.rsplit('/').next().unwrap();
+        let found = names
+            .iter()
+            .find(|n| n.ends_with(&format!("/{leaf}")))
+            .unwrap_or_else(|| panic!("{leaf} was lost: {names:?}"));
+        assert_eq!(
+            std::fs::read(dir.join(found)).unwrap(),
+            video(ARTICLE + 7, seed),
+            "{found}"
+        );
+    }
+}

@@ -39,8 +39,9 @@ impl Unpack<'_> {
             }
             for set in sets {
                 let key = {
-                    let (root, volumes) = (dir.to_path_buf(), set.volumes.clone());
-                    off_runtime(&set.name, move || scan::identity(&root, &volumes)).await?
+                    let (root, family, volumes) =
+                        (dir.to_path_buf(), set.family, set.volumes.clone());
+                    off_runtime(&set.name, move || scan::identity(&root, family, &volumes)).await?
                 };
                 let parent = set.volumes[0].parent().unwrap_or(dir);
                 let landing = scan::landing(parent, &key);
@@ -145,7 +146,7 @@ async fn adopt_orphans(dir: &Path) -> Result<(), Failure> {
         }
         let live = scan::sets(&root)?
             .iter()
-            .map(|set| scan::identity(&root, &set.volumes))
+            .map(|set| scan::identity(&root, set.family, &set.volumes))
             .collect::<std::io::Result<Vec<_>>>()?;
         Ok((landed, live))
     })
@@ -177,6 +178,8 @@ async fn off_runtime<T: Send + 'static>(
 
 fn seal(into: &Path, landing: &Path) -> Result<(), Failure> {
     tree::confined(into)?;
+    tree::unreserve(into)
+        .map_err(|e| Failure::io(&format!("naming files in {}", into.display()), e))?;
     fs::rename(into, landing)
         .map_err(|e| Failure::io(&format!("moving to {}", landing.display()), e))
 }
@@ -322,7 +325,7 @@ mod tests {
     async fn a_key_already_recorded_is_not_extracted_again() {
         let dir = tempfile::tempdir().unwrap();
         let first = archive(dir.path(), "a.7z", "movie.bin");
-        let key = scan::identity(dir.path(), &[first]).unwrap();
+        let key = scan::identity(dir.path(), Family::SevenZip, &[first]).unwrap();
         run(dir.path(), vec![key], 0).await.ok().unwrap();
         assert!(names(dir.path()).is_empty());
     }

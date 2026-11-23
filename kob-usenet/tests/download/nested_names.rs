@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::post::{ARTICLE, Posted, noise};
+use crate::post::{ARTICLE, Posted, noise, video};
 use crate::support::{Rig, assert_file, completed, extractor_on_path, listing, run_job, sevenzip};
 
 #[tokio::test]
@@ -137,4 +137,49 @@ async fn archives_extracting_identical_bytes_keep_one_copy() {
     let dir = completed(&run_job(&rig, &engine, "Same", &[&one, &two]).await);
     assert_eq!(listing(&dir), ["movie.bin", "x.bin", "y.bin"]);
     assert_file(&dir, "movie.bin", &same);
+}
+
+#[tokio::test]
+async fn identical_volumes_under_different_names_keep_every_output() {
+    if !extractor_on_path() {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let joined = video(3 * ARTICLE, 51);
+    let (head, tail) = joined.split_at(2 * ARTICLE);
+    let pad = noise(ARTICLE, 52);
+    let outer = packed(
+        work.path(),
+        "outer.7z",
+        &[
+            ("m.mkv.001", head),
+            ("m.mkv.002", tail),
+            ("n.mkv.001", head),
+            ("n.mkv.002", tail),
+            ("pad.bin", &pad),
+        ],
+    );
+    let post = Posted::new("outer", "outer.7z", outer);
+    let rig = Rig::new(post.articles.clone()).await;
+    let engine = rig.engine().await;
+    let dir = completed(&run_job(&rig, &engine, "Split", &[&post]).await);
+    let names = listing(&dir);
+    let joins = names.iter().filter(|n| n.ends_with(".mkv")).count();
+    assert_eq!(joins, 2, "{names:?}");
+    assert!(!names.iter().any(|n| n.contains(".mkv.00")), "{names:?}");
+    for name in names.iter().filter(|n| n.ends_with(".mkv")) {
+        assert_file(&dir, name, &joined);
+    }
+
+    let member = noise(2 * ARTICLE, 53);
+    let archive = packed(work.path(), "x.7z", &[("member.bin", &member)]);
+    let (x, y) = (
+        Posted::new("x", "x.7z", archive.clone()),
+        Posted::new("y", "y.7z", archive),
+    );
+    let rig = Rig::new(x.articles.iter().chain(&y.articles).cloned().collect()).await;
+    let engine = rig.engine().await;
+    let dir = completed(&run_job(&rig, &engine, "Twin", &[&x, &y]).await);
+    assert_eq!(listing(&dir), ["member.bin"]);
+    assert_file(&dir, "member.bin", &member);
 }

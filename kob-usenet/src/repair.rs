@@ -2,11 +2,12 @@ mod check;
 mod control;
 mod field;
 pub(crate) mod recovery;
+mod rivals;
 mod sets;
 mod solve;
 mod spool;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -20,7 +21,7 @@ pub use control::Control;
 use control::Ticket;
 use recovery::{Collected, Par2s};
 pub use sets::described;
-use sets::{covered, covering, position, sources, usable};
+use sets::{covered, covering, disputed, position, sources, usable};
 use solve::solve;
 pub use spool::Spool;
 
@@ -80,12 +81,6 @@ struct Source {
     trusted: bool,
 }
 
-#[derive(Debug, Default)]
-pub struct Repaired {
-    pub slices: usize,
-    pub by_other_set: HashSet<PathBuf>,
-}
-
 enum SetOutcome {
     Agrees,
     Solved(usize),
@@ -105,7 +100,7 @@ pub async fn repair(
     staging: &Path,
     budget: Budget,
     control: &Control,
-) -> Result<Repaired, RepairError> {
+) -> Result<usize, RepairError> {
     let mut collected = par2
         .index(fetcher, nzb, Spool::on_disk(staging)?, |reader| {
             covered(reader, files)
@@ -116,27 +111,43 @@ pub async fn repair(
     if order.is_empty() {
         return Err(RepairError::NoPar2);
     }
+    let rivals = rivals::contested(collected.spool().critical(), files);
+    if !rivals.is_empty() {
+        let ticket = control.ticket();
+        if let Some(name) = blocking(move || rivals::undecidable(&rivals, &ticket)).await?? {
+            return Err(RepairError::Failed(format!(
+                "PAR2 sets describe different content for {name}"
+            )));
+        }
+    }
     let mut open: HashSet<usize> = (0..files.len()).filter(|&i| files[i].damaged).collect();
     let (mut agreed, mut failed) = (HashSet::new(), HashSet::new());
     let mut first_error = None;
-    let mut repaired = Repaired::default();
+    let mut repaired = 0;
+    let mut pinned: HashMap<usize, Id> = files
+        .iter()
+        .enumerate()
+        .filter_map(|(at, file)| Some((at, file.hash?)))
+        .collect();
     for set in order {
         let Some(plan) = usable(collected.spool().critical(), set) else {
             continue;
         };
-        let targets: Vec<(usize, Id)> = plan
+        let targets: Vec<usize> = plan
             .sources()
             .iter()
-            .filter_map(|s| {
-                let at = position(&s.file, files)?;
-                open.contains(&at).then_some((at, s.file.hash))
-            })
+            .filter_map(|s| position(&s.file, files).filter(|at| open.contains(at)))
             .collect();
         if targets.is_empty() {
             continue;
         }
         let slice_size = plan.slice_size();
-        let sources = sources(&plan, files, staging, budget.absent_ok);
+        let sources = match disputed(&plan, files, &mut pinned) {
+            Some(name) => Err(RepairError::Failed(format!(
+                "PAR2 sets disagree about the content of {name}"
+            ))),
+            None => sources(&plan, files, staging, budget.absent_ok),
+        };
         drop(plan);
         let outcome = match sources {
             Ok(sources) => {
@@ -155,15 +166,12 @@ pub async fn repair(
             Err(error) => Err(error),
         };
         match outcome {
-            Ok(SetOutcome::Agrees) => agreed.extend(targets.iter().map(|&(at, _)| at)),
+            Ok(SetOutcome::Agrees) => agreed.extend(targets),
             Ok(SetOutcome::Solved(slices)) => {
-                repaired.slices += slices;
-                for (at, hash) in targets {
+                repaired += slices;
+                for at in targets {
                     open.remove(&at);
                     failed.remove(&at);
-                    if files[at].hash != Some(hash) {
-                        repaired.by_other_set.insert(files[at].path.clone());
-                    }
                 }
             }
             Err(
@@ -172,7 +180,7 @@ pub async fn repair(
                 | RepairError::Dependent
                 | RepairError::Failed(_)),
             ) => {
-                failed.extend(targets.iter().map(|&(at, _)| at));
+                failed.extend(targets);
                 first_error.get_or_insert(error);
             }
             Err(error) => return Err(error),

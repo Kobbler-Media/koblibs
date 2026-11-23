@@ -9,7 +9,7 @@ use rustls::ServerConfig;
 use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until};
@@ -62,6 +62,7 @@ impl Default for Behavior {
 pub struct LoopbackServer {
     addr: SocketAddr,
     accept: Mutex<Option<JoinHandle<()>>>,
+    refusing: Mutex<Option<TcpSocket>>,
     acceptor: Acceptor,
     open: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
@@ -98,7 +99,7 @@ impl Acceptor {
                 let tls = self.tls.clone();
                 let now = self.open.fetch_add(1, Ordering::SeqCst) + 1;
                 self.peak.fetch_max(now, Ordering::SeqCst);
-                let open_count = Arc::clone(&self.open);
+                let counted = Counted(Arc::clone(&self.open));
                 let limit = Limit {
                     behavior: self.behavior,
                     rejected: now > self.behavior.max_connections,
@@ -108,16 +109,14 @@ impl Acceptor {
                 };
                 // A failed connection only affects the test that owns it.
                 tokio::spawn(async move {
-                    let result = async {
-                        stream.set_nodelay(true)?;
-                        match tls {
-                            None => serve(stream, articles, limit).await,
-                            Some(tls) => serve(tls.accept(stream).await?, articles, limit).await,
+                    stream.set_nodelay(true)?;
+                    match tls {
+                        None => serve_counted(stream, articles, limit, counted).await,
+                        Some(tls) => {
+                            let stream = tls.accept(stream).await?;
+                            serve_counted(stream, articles, limit, counted).await
                         }
                     }
-                    .await;
-                    open_count.fetch_sub(1, Ordering::SeqCst);
-                    result
                 });
             }
         })
@@ -257,6 +256,7 @@ impl LoopbackServer {
         Ok(Self {
             addr,
             accept: Mutex::new(Some(acceptor.clone().spawn(listener))),
+            refusing: Mutex::default(),
             open: Arc::clone(&acceptor.open),
             peak: Arc::clone(&acceptor.peak),
             bodies: Arc::clone(&acceptor.bodies),
@@ -275,10 +275,17 @@ impl LoopbackServer {
             accept.abort();
             let _ = accept.await;
         }
+        *self.refusing.lock().unwrap_or_else(PoisonError::into_inner) = reserve(self.addr).ok();
     }
 
     /// Listens again on the same port after [`refuse`](Self::refuse).
     pub async fn resume(&self) -> io::Result<()> {
+        drop(
+            self.refusing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
         let listener = TcpListener::bind(self.addr).await?;
         let accept = self.acceptor.clone().spawn(listener);
         if let Some(old) = self
@@ -379,6 +386,38 @@ async fn delay(duration: Duration) {
     if !duration.is_zero() {
         sleep(duration).await;
     }
+}
+
+// Bound but not listening, so connects are refused and no other server is handed the port.
+// Address reuse is on only for the bind, past connections on the port; left on, another
+// socket could share the port.
+fn reserve(addr: SocketAddr) -> io::Result<TcpSocket> {
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.set_reuseaddr(false)?;
+    Ok(socket)
+}
+
+struct Counted(Arc<AtomicUsize>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+// Uncounts before the socket closes: a client that saw the close may connect again at once,
+// and must not be counted alongside the connection it replaced.
+async fn serve_counted<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    articles: Arc<HashMap<String, Vec<u8>>>,
+    limit: Limit,
+    counted: Counted,
+) -> io::Result<()> {
+    let result = serve(&mut stream, articles, limit).await;
+    drop(counted);
+    result
 }
 
 async fn serve<S: AsyncRead + AsyncWrite>(

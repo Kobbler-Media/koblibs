@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::repair::spool::MAX_SLICE;
@@ -40,6 +40,28 @@ pub fn position(file: &par2::File, files: &[OnDisk]) -> Option<usize> {
         .iter()
         .position(|d| d.id == Some(file.id))
         .or_else(|| files.iter().position(|d| d.name == file.name))
+}
+
+// A file's proof pins its content, and the first set to reach a file without one pins it, so a
+// later set describing other bytes for that name can never rewrite it.
+pub fn disputed(
+    plan: &par2::RepairSet<'_>,
+    files: &[OnDisk],
+    pinned: &mut HashMap<usize, Id>,
+) -> Option<String> {
+    let described: Vec<(usize, &par2::File)> = plan
+        .sources()
+        .iter()
+        .filter_map(|s| Some((position(&s.file, files)?, &s.file)))
+        .collect();
+    if let Some((_, file)) = described
+        .iter()
+        .find(|(at, file)| pinned.get(at).is_some_and(|hash| *hash != file.hash))
+    {
+        return Some(file.name.clone());
+    }
+    pinned.extend(described.iter().map(|(at, file)| (*at, file.hash)));
+    None
 }
 
 pub fn covered(reader: &Reader, files: &[OnDisk]) -> bool {

@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::jobs::failure::Failure;
+use crate::unpack::{adopt, scan};
 
 pub fn size(dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -57,6 +58,27 @@ fn check(root: &Path, dir: &Path) -> Result<(), Failure> {
             return Err(Failure::Content(format!(
                 "the archive holds a special file ({named}); refusing to unpack it"
             )));
+        }
+    }
+    Ok(())
+}
+
+pub fn unreserve(dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()? {
+        let name = entry.file_name();
+        let free = scan::unreserved(&name);
+        let path = if free == name {
+            entry.path()
+        } else {
+            let target = (0..)
+                .map(|n| dir.join(adopt::numbered(&free, n)))
+                .find(|t| fs::symlink_metadata(t).is_err())
+                .expect("some number is free");
+            fs::rename(entry.path(), &target)?;
+            target
+        };
+        if entry.file_type()?.is_dir() {
+            unreserve(&path)?;
         }
     }
     Ok(())
