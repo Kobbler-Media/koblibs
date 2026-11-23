@@ -1,6 +1,7 @@
 pub(crate) mod failure;
 pub(crate) mod fetch;
 mod finish;
+mod headless;
 mod plan;
 mod probe;
 mod raw;

@@ -4,6 +4,7 @@ use futures_util::{StreamExt, stream};
 
 use crate::jobs::failure::Failure;
 use crate::jobs::fetch::{Fetcher, Outcome};
+use crate::jobs::headless;
 use crate::jobs::store::{Plan, Planned};
 use crate::repair::Spool;
 use crate::repair::recovery::Par2s;
@@ -15,9 +16,9 @@ use crate::vendor::queue::nzb::{File, Nzb};
 
 const FIRSTS: usize = 16;
 
-struct Geometry {
-    part: u64,
-    size: u64,
+pub struct Geometry {
+    pub part: u64,
+    pub size: u64,
 }
 
 pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Failure> {
@@ -43,7 +44,7 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Fai
                 total: u32::try_from(f.segments.len()).ok(),
                 ..BodyExpectation::at(Some(0))
             };
-            (f.segments[0].id.clone(), Some(expected))
+            (f.segments[0].id.clone(), expected)
         }),
     )
     .await?;
@@ -69,32 +70,20 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Fai
         };
         found.push(Some((geometry, matched)));
     }
-    let seconds = bodies(
-        fetcher,
-        data.iter()
-            .zip(&firsts)
-            .filter(|(f, first)| first.is_none() && f.segments.len() > 1)
-            .map(|(f, _)| (f.segments[1].id.clone(), None)),
-    )
-    .await?;
-    let mut seconds = seconds.into_iter();
     for ((file, first), slot) in data.iter().zip(&firsts).zip(&mut found) {
         if first.is_some() {
             continue;
         }
-        let second = if file.segments.len() > 1 {
-            seconds.next().flatten()
-        } else {
-            None
-        };
-        let headless = rebuildable(file, second.as_ref(), &described, &claimed).ok_or_else(|| {
-            Failure::Content(format!(
-                "{}: its first article is missing on every provider and no PAR2 file identifies the volume to rebuild it",
-                file.name()
-            ))
-        })?;
-        claimed.insert(headless.1.id);
-        *slot = Some((headless.0, Some(headless.1)));
+        let later = headless::later(fetcher, file).await?;
+        let (geometry, matched) = headless::identify(file, later.as_ref(), &described, &claimed)
+            .ok_or_else(|| {
+                Failure::Content(format!(
+                    "{}: its first article is missing on every provider and no PAR2 file identifies the volume to rebuild it",
+                    file.name()
+                ))
+            })?;
+        claimed.insert(matched.id);
+        *slot = Some((geometry, Some(matched)));
     }
     let mut taken = HashSet::new();
     let mut outputs = Vec::new();
@@ -124,17 +113,12 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Fai
 
 async fn bodies(
     fetcher: &Fetcher,
-    ids: impl Iterator<Item = (String, Option<BodyExpectation>)>,
+    ids: impl Iterator<Item = (String, BodyExpectation)>,
 ) -> Result<Vec<Option<crate::vendor::nntp::Body>>, Failure> {
     let requests: Vec<_> = ids
         .map(|(id, expected)| {
             let fetcher = fetcher.clone();
-            async move {
-                match expected {
-                    Some(expected) => fetcher.first(&id, expected).await,
-                    None => fetcher.body(&id).await,
-                }
-            }
+            async move { fetcher.first(&id, expected).await }
         })
         .collect();
     let answers: Vec<_> = stream::iter(requests).buffered(FIRSTS).collect().await;
@@ -145,44 +129,6 @@ async fn bodies(
             Outcome::Missing | Outcome::Corrupt => Ok(None),
         })
         .collect()
-}
-
-fn rebuildable<'a>(
-    file: &File,
-    second: Option<&crate::vendor::nntp::Body>,
-    described: &[&'a par2::File],
-    claimed: &HashSet<par2::Id>,
-) -> Option<(Geometry, &'a par2::File)> {
-    let free = || {
-        described
-            .iter()
-            .copied()
-            .filter(|f| !claimed.contains(&f.id))
-    };
-    let by_name = free().find(|f| f.name == file.name());
-    let Some(second) = second else {
-        let only = by_name.filter(|_| file.segments.len() == 1)?;
-        return Some((
-            Geometry {
-                part: only.length,
-                size: only.length,
-            },
-            only,
-        ));
-    };
-    let sized = |f: &&par2::File| f.length == second.file_size;
-    let matched = by_name.filter(sized).or_else(|| {
-        let mut candidates = free().filter(sized);
-        let one = candidates.next()?;
-        candidates.next().is_none().then_some(one)
-    })?;
-    Some((
-        Geometry {
-            part: second.offset,
-            size: second.file_size,
-        },
-        matched,
-    ))
 }
 
 fn uniform(file: &File, geometry: &Geometry) -> Result<Segments, String> {
