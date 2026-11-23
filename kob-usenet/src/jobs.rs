@@ -11,6 +11,9 @@ mod store;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+#[cfg(feature = "testkit")]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
@@ -103,6 +106,7 @@ struct Shared {
     slots: Arc<Semaphore>,
     status: Mutex<HashMap<String, (u64, JobStatus)>>,
     tasks: Mutex<HashMap<String, JoinHandle<()>>>,
+    solving: Arc<AtomicUsize>,
 }
 
 impl Shared {
@@ -149,6 +153,7 @@ impl Jobs {
             slots,
             status: Mutex::default(),
             tasks: Mutex::default(),
+            solving: Arc::default(),
         });
         let mut loaded = shared.store.load()?;
         loaded.sort_by_key(|(spec, _)| spec.seq);
@@ -248,6 +253,11 @@ impl Jobs {
         self.shared.gate.paused()
     }
 
+    #[cfg(feature = "testkit")]
+    pub fn repairs_running(&self) -> usize {
+        self.shared.solving.load(Ordering::Acquire)
+    }
+
     fn spawn(&self, spec: StoredSpec) {
         let shared = Arc::clone(&self.shared);
         let id = spec.id.clone();
@@ -277,8 +287,12 @@ async fn work(shared: &Shared, spec: &StoredSpec) {
             let Ok(slot) = Arc::clone(&shared.slots).acquire_owned().await else {
                 return;
             };
+            let slot = Arc::new(slot);
             let last_try = attempt >= shared.config.retry_attempts.max(1);
-            if matches!(run::run(shared, spec, last_try).await, run::Ended::Finished) {
+            if matches!(
+                run::run(shared, spec, last_try, &slot).await,
+                run::Ended::Finished
+            ) {
                 return;
             }
             drop(slot);

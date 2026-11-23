@@ -17,12 +17,11 @@ pub fn size(dir: &Path) -> u64 {
         .sum()
 }
 
-pub fn adopt(from: &Path, into: &Path) -> Result<(), Failure> {
+pub fn confined(from: &Path) -> Result<(), Failure> {
     let root = from
         .canonicalize()
         .map_err(|e| Failure::io(&format!("reading {}", from.display()), e))?;
-    check(&root, &root)?;
-    merge(&root, into).map_err(|e| Failure::io(&format!("moving into {}", into.display()), e))
+    check(&root, &root)
 }
 
 fn check(root: &Path, dir: &Path) -> Result<(), Failure> {
@@ -63,33 +62,13 @@ fn check(root: &Path, dir: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
-fn merge(from: &Path, into: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let target: PathBuf = into.join(entry.file_name());
-        let is_dir = entry.file_type()?.is_dir();
-        match fs::symlink_metadata(&target) {
-            Ok(existing) if is_dir && existing.is_dir() => {
-                merge(&entry.path(), &target)?;
-                continue;
-            }
-            Ok(existing) if existing.is_dir() => fs::remove_dir_all(&target)?,
-            Ok(_) => fs::remove_file(&target)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        fs::rename(entry.path(), &target)?;
-    }
-    Ok(())
-}
-
-pub fn join(dir: &Path, set: &str, parts: &[PathBuf]) -> io::Result<()> {
+pub fn join(into: &Path, set: &str, parts: &[PathBuf]) -> io::Result<()> {
     let name = parts[0]
         .file_name()
         .and_then(|n| n.to_str())
         .and_then(|n| n.rsplit_once('.'))
         .map_or_else(|| set.to_owned(), |(stem, _)| stem.to_owned());
-    let mut out = File::create(dir.join(name))?;
+    let mut out = File::create(into.join(name))?;
     for part in parts {
         io::copy(&mut File::open(part)?, &mut out)?;
     }

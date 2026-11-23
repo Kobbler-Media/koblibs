@@ -26,6 +26,27 @@ async fn the_queue_pauses_below_the_free_space_floor_and_resumes_when_space_retu
     assert_file(&dir, &post.name, &post.data);
 }
 
+#[tokio::test]
+async fn removing_the_only_paused_job_clears_the_pause() {
+    let post = Posted::new("ep", "Show.mkv", video(4 * ARTICLE, 51));
+    let rig = Rig::new(post.articles.clone()).await;
+    rig.space.0.store(1000, Ordering::SeqCst);
+    let engine = rig.engine().await;
+    let spec = rig.spec("Show", nzb::of(&[&post]), None);
+    let id = spec.id.clone();
+    engine.add_job(spec).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !engine.paused_for_space() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    engine.remove_job(&id, true).await.unwrap();
+    assert!(!engine.paused_for_space(), "no job is waiting for space");
+}
+
 struct Allocated {
     dir: std::path::PathBuf,
     budget: std::sync::atomic::AtomicU64,

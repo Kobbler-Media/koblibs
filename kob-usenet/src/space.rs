@@ -1,7 +1,7 @@
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub trait FreeSpace: Send + Sync {
     fn available(&self, path: &Path) -> io::Result<u64>;
@@ -19,7 +19,7 @@ impl FreeSpace for Statvfs {
 pub struct SpaceGate {
     source: Arc<dyn FreeSpace>,
     floor: u64,
-    paused: AtomicBool,
+    waiting: AtomicUsize,
 }
 
 impl SpaceGate {
@@ -27,12 +27,12 @@ impl SpaceGate {
         Self {
             source,
             floor,
-            paused: AtomicBool::new(false),
+            waiting: AtomicUsize::new(0),
         }
     }
 
     pub fn paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
+        self.waiting.load(Ordering::Acquire) > 0
     }
 
     pub fn free(&self, path: &Path) -> Option<u64> {
@@ -60,15 +60,24 @@ impl SpaceGate {
             return true;
         };
         // Bytes this job already reserved may dip into the floor, never into the write itself.
-        let admitted = free >= need && free >= self.floor.saturating_sub(credit);
-        if admitted {
-            if self.paused.swap(false, Ordering::Relaxed) {
-                tracing::info!("resuming downloads: disk space returned");
-            }
-        } else if !self.paused.swap(true, Ordering::Relaxed) {
-            tracing::warn!(free, floor = self.floor, path = %path.display(), "pausing downloads: low disk space");
+        free >= need && free >= self.floor.saturating_sub(credit)
+    }
+
+    pub fn wait(&self) -> Waiting<'_> {
+        if self.waiting.fetch_add(1, Ordering::AcqRel) == 0 {
+            tracing::warn!(floor = self.floor, "pausing downloads: low disk space");
         }
-        admitted
+        Waiting(self)
+    }
+}
+
+pub struct Waiting<'a>(&'a SpaceGate);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        if self.0.waiting.fetch_sub(1, Ordering::AcqRel) == 1 {
+            tracing::info!("resuming downloads: no job is waiting for disk space");
+        }
     }
 }
 

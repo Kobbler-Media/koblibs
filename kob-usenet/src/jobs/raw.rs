@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use futures_util::{StreamExt, stream};
 
@@ -7,8 +7,8 @@ use crate::jobs::failure::Failure;
 use crate::jobs::fetch::{Fetcher, First};
 use crate::jobs::headless;
 use crate::jobs::store::{Plan, Planned};
-use crate::repair::Spool;
 use crate::repair::recovery::Par2s;
+use crate::repair::{self, Spool};
 use crate::vendor::core::{FileMeta, NzbFile, Par2Proof, Segment, Segments};
 use crate::vendor::nntp::{Body, BodyExpectation};
 use crate::vendor::par2::{self, hash_16k};
@@ -23,13 +23,6 @@ pub struct Geometry {
 }
 
 pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Failure> {
-    let index = par2
-        .index(fetcher, nzb, Spool::default())
-        .await
-        .map_err(|e| Failure::providers(&e))?;
-    let described = index.map(|r| r.spool().critical().index());
-    let slice_size = described.as_ref().map_or(0, |i| i.slice_size);
-    let described: Vec<&par2::File> = described.iter().flat_map(|i| &i.files).collect();
     let data: Vec<Cow<'_, File>> = nzb
         .files
         .iter()
@@ -37,6 +30,15 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Fai
         .filter(|&(i, f)| !par2.contains(i) && names::classify(f.name()) != Kind::Par2)
         .map(|(_, f)| numbered(f))
         .collect();
+    let index = par2
+        .index(fetcher, nzb, Spool::default(), |reader| {
+            repair::described(reader).len() >= data.len()
+        })
+        .await
+        .map_err(|e| Failure::providers(&e))?;
+    let sized = index.map_or_else(Vec::new, |r| repair::described(r.spool().critical()));
+    let slice_sizes: HashMap<par2::Id, u64> = sized.iter().map(|(f, s)| (f.id, *s)).collect();
+    let described: Vec<&par2::File> = sized.iter().map(|(f, _)| f).collect();
     let firsts = bodies(
         fetcher,
         data.iter().map(|f| {
@@ -50,44 +52,71 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Fai
         &described,
     )
     .await?;
-    let mut claimed = HashSet::new();
-    let mut found: Vec<Option<(Geometry, Option<&par2::File>)>> = Vec::new();
-    for (file, first) in data.iter().zip(&firsts) {
-        let Some(first) = first else {
-            found.push(None);
-            continue;
-        };
-        if first.offset != 0 {
-            return Err(Failure::Content(uneven(file)));
-        }
-        let matched = described.iter().copied().find(|f| describes(f, first));
-        claimed.extend(matched.map(|f| f.id));
-        let geometry = Geometry {
-            part: first.data.len() as u64,
-            size: first.file_size,
-        };
-        found.push(Some((geometry, matched)));
+    if let Some((file, _)) = data
+        .iter()
+        .zip(&firsts)
+        .find(|(_, first)| first.as_ref().is_some_and(|b| b.offset != 0))
+    {
+        return Err(Failure::Content(uneven(file)));
     }
+    let (matches, mut claimed) = claim(&data, &firsts, &described);
+    let displaced: Vec<bool> = firsts
+        .iter()
+        .zip(&matches)
+        .map(|(first, matched)| {
+            matched.is_none()
+                && first
+                    .as_ref()
+                    .is_some_and(|b| described.iter().any(|f| describes(f, b)))
+        })
+        .collect();
+    let mut found: Vec<Option<(Geometry, Option<&par2::File>)>> = firsts
+        .iter()
+        .zip(&matches)
+        .zip(&displaced)
+        .map(|((first, &matched), &displaced)| {
+            first.as_ref().filter(|_| !displaced).map(|first| {
+                let geometry = Geometry {
+                    part: first.data.len() as u64,
+                    size: first.file_size,
+                };
+                (geometry, matched)
+            })
+        })
+        .collect();
     for ((file, first), slot) in data.iter().zip(&firsts).zip(&mut found) {
-        if first.is_some() {
+        if slot.is_some() {
             continue;
         }
         let later = headless::later(fetcher, file).await?;
-        let (geometry, matched) = headless::identify(file, later.as_ref(), &described, &claimed)
-            .ok_or_else(|| {
-                Failure::Content(format!(
+        let identified = headless::identify(file, later.as_ref(), &described, &claimed);
+        *slot = Some(match (identified, first) {
+            (Some((geometry, matched)), _) => {
+                claimed.insert(matched.id);
+                (geometry, Some(matched))
+            }
+            (None, Some(first)) => (
+                Geometry {
+                    part: first.data.len() as u64,
+                    size: first.file_size,
+                },
+                None,
+            ),
+            (None, None) => {
+                return Err(Failure::Content(format!(
                     "{}: its first article is missing on every provider and no PAR2 file identifies the volume to rebuild it",
                     file.name()
-                ))
-            })?;
-        claimed.insert(matched.id);
-        *slot = Some((geometry, Some(matched)));
+                )));
+            }
+        });
     }
     let mut taken = HashSet::new();
     let mut outputs = Vec::new();
-    for ((file, slot), first) in data.into_iter().zip(found).zip(&firsts) {
+    for (((file, slot), first), displaced) in
+        data.into_iter().zip(found).zip(&firsts).zip(displaced)
+    {
         let (geometry, matched) = slot.expect("every volume was described above");
-        let file = match (matched, first) {
+        let file = match (matched, first.as_ref().filter(|_| !displaced)) {
             (Some(_), Some(first)) => as_posted(file, first, &geometry),
             _ => file,
         };
@@ -100,7 +129,7 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Fai
             ),
             meta: FileMeta::Nzb(NzbFile {
                 segments,
-                proof: matched.and_then(|f| proof(slice_size, f)),
+                proof: matched.and_then(|f| proof(slice_sizes.get(&f.id).copied()?, f)),
             }),
             crc32: None,
             member: false,
@@ -111,6 +140,34 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Fai
         probed: false,
         outputs,
     })
+}
+
+// A file whose NZB name is the described name claims it first, so an article reposted under
+// another file cannot take that entry from its real owner.
+fn claim<'a>(
+    data: &[Cow<'_, File>],
+    firsts: &[Option<Body>],
+    described: &[&'a par2::File],
+) -> (Vec<Option<&'a par2::File>>, HashSet<par2::Id>) {
+    let mut matches = vec![None; data.len()];
+    let mut claimed = HashSet::new();
+    for by_name in [true, false] {
+        for (at, (file, first)) in data.iter().zip(firsts).enumerate() {
+            let Some(first) = first.as_ref().filter(|_| matches[at].is_none()) else {
+                continue;
+            };
+            let found = described.iter().copied().find(|f| {
+                !claimed.contains(&f.id)
+                    && (!by_name || f.name == file.name())
+                    && describes(f, first)
+            });
+            if let Some(found) = found {
+                claimed.insert(found.id);
+                matches[at] = Some(found);
+            }
+        }
+    }
+    (matches, claimed)
 }
 
 async fn bodies(
@@ -145,9 +202,12 @@ fn describes(file: &par2::File, first: &Body) -> bool {
 /// A PAR2-proven volume listed with more or fewer entries than its evenly split post:
 /// entries past the post are dropped and parts the NZB lacks are left for PAR2.
 fn as_posted<'a>(file: Cow<'a, File>, first: &Body, geometry: &Geometry) -> Cow<'a, File> {
+    if geometry.part == 0 {
+        return file;
+    }
     let parts = geometry.size.div_ceil(geometry.part);
     let listed = file.segments.len() as u64;
-    if listed == parts || first.total.map(u64::from) != Some(parts) {
+    if listed == parts || first.total.map(u64::from) != Some(parts) || parts > 2 * listed {
         return file;
     }
     let mut file = file.into_owned();
@@ -205,8 +265,9 @@ fn numbered(file: &File) -> Cow<'_, File> {
 fn uniform(file: &File, geometry: &Geometry) -> Result<Segments, String> {
     let count = file.segments.len() as u64;
     let Geometry { part, size } = *geometry;
-    let last = size
-        .checked_sub(part * (count - 1))
+    let last = part
+        .checked_mul(count - 1)
+        .and_then(|whole| size.checked_sub(whole))
         .filter(|&last| last > 0 && last <= part)
         .ok_or_else(|| uneven(file))?;
     Ok(Segments {
@@ -253,4 +314,62 @@ fn unique(taken: &mut HashSet<String>, name: String) -> String {
         n += 1;
     }
     candidate
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listed(parts: usize) -> File {
+        File {
+            subject: "\"a.bin\" yEnc (1/1)".to_owned(),
+            date: None,
+            segments: (0..parts)
+                .map(|n| nzb::Segment {
+                    id: format!("{n}@x"),
+                    bytes: 100,
+                    number: n as i64 + 1,
+                })
+                .collect(),
+            gap: false,
+        }
+    }
+
+    fn first(total: u32) -> Body {
+        Body {
+            data: bytes::Bytes::from_static(&[1; 4]),
+            offset: 0,
+            file_size: 0,
+            part: Some(1),
+            total: Some(total),
+        }
+    }
+
+    #[test]
+    fn a_claimed_part_count_far_past_the_listing_adds_no_segments() {
+        let file = listed(3);
+        let geometry = Geometry {
+            part: 1,
+            size: u64::from(u32::MAX),
+        };
+        let posted = as_posted(Cow::Borrowed(&file), &first(u32::MAX), &geometry);
+        assert_eq!(posted.segments.len(), 3);
+    }
+
+    #[test]
+    fn an_empty_first_article_has_no_part_count() {
+        let file = listed(3);
+        let geometry = Geometry { part: 0, size: 9 };
+        let posted = as_posted(Cow::Borrowed(&file), &first(3), &geometry);
+        assert_eq!(posted.segments.len(), 3);
+    }
+
+    #[test]
+    fn a_part_size_that_overflows_the_file_is_uneven() {
+        let geometry = Geometry {
+            part: u64::MAX / 2,
+            size: 9,
+        };
+        assert!(uniform(&listed(4), &geometry).is_err());
+    }
 }

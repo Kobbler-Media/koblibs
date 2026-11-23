@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
+use tokio::runtime::Handle;
+
 use crate::config::ServerConfig;
 use crate::providers::{Accounts, Shape};
 use crate::store::Store;
@@ -14,6 +16,7 @@ pub struct Providers {
     shape: Shape,
     built: Mutex<Vec<String>>,
     applying: Mutex<()>,
+    runtime: Handle,
 }
 
 impl Providers {
@@ -29,6 +32,7 @@ impl Providers {
             shape,
             built: Mutex::new(built),
             applying: Mutex::new(()),
+            runtime: Handle::current(),
         })
     }
 
@@ -38,6 +42,7 @@ impl Providers {
     }
 
     fn apply(&self, servers: Vec<ServerConfig>) -> Result<(), Error> {
+        let _runtime = self.runtime.enter();
         let providers = self.accounts.build(&servers, &self.shape)?;
         let built = providers.iter().map(|p| p.key.clone()).collect();
         self.client.replace(providers);

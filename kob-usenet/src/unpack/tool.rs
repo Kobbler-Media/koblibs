@@ -15,6 +15,7 @@ use crate::unpack::tree;
 const TAIL: usize = 400;
 const KEEP: usize = 64 << 10;
 const TICK: Duration = Duration::from_millis(100);
+const OUTPUT_ONLY_STALLS: u32 = 12;
 const WRONG_PASSWORD: [&str; 5] = [
     "incorrect password",
     "the specified password is incorrect",
@@ -133,17 +134,19 @@ async fn watch(child: &mut Child, into: &Path, stall: Duration) -> Result<Finish
     let (mut out_open, mut err_open) = (true, true);
     // Apart: a tool's progress on one stream can land inside an error on the other.
     let (mut said_out, mut said_err) = (Vec::new(), Vec::new());
-    let mut last = Instant::now();
+    let mut heard = Instant::now();
+    let mut grew = Instant::now();
+    let mut measured = Instant::now();
     let mut size = tree::size(into);
     loop {
         tokio::select! {
             read = stdout.read(&mut out_buf), if out_open => match read.map_err(Run::Io)? {
                 0 => out_open = false,
-                n => { keep(&mut said_out, &out_buf[..n]); last = Instant::now(); }
+                n => { keep(&mut said_out, &out_buf[..n]); heard = Instant::now(); }
             },
             read = stderr.read(&mut err_buf), if err_open => match read.map_err(Run::Io)? {
                 0 => err_open = false,
-                n => { keep(&mut said_err, &err_buf[..n]); last = Instant::now(); }
+                n => { keep(&mut said_err, &err_buf[..n]); heard = Instant::now(); }
             },
             status = child.wait(), if !out_open && !err_open => {
                 return Ok(Finished {
@@ -152,16 +155,20 @@ async fn watch(child: &mut Child, into: &Path, stall: Duration) -> Result<Finish
                     stderr: said_err,
                 });
             }
-            () = tokio::time::sleep(TICK) => {
-                let now = tree::size(into);
-                if now != size {
-                    size = now;
-                    last = Instant::now();
-                }
-                if last.elapsed() >= stall {
-                    let _ = child.kill().await;
-                    return Err(Run::Stalled(stall));
-                }
+            () = tokio::time::sleep(TICK) => {}
+        }
+        // Checked on every wake: a tool printing faster than the tick never lets the sleep win.
+        if measured.elapsed() >= TICK {
+            measured = Instant::now();
+            let now = tree::size(into);
+            if now != size {
+                size = now;
+                grew = Instant::now();
+            }
+            let silent = heard.max(grew).elapsed() >= stall;
+            if silent || grew.elapsed() >= stall.saturating_mul(OUTPUT_ONLY_STALLS) {
+                let _ = child.kill().await;
+                return Err(Run::Stalled(stall));
             }
         }
     }
@@ -191,7 +198,7 @@ fn judge(
         }
         Err(Run::Stalled(after)) => {
             return Attempt::Failed(Failure::Infrastructure(format!(
-                "{} stalled unpacking {name}: no output or progress for {after:?}",
+                "{} stalled unpacking {name}: no progress for {after:?}",
                 program.display()
             )));
         }

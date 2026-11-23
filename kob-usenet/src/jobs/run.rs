@@ -1,5 +1,8 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::jobs::failure::Failure;
 use crate::jobs::fetch::Fetcher;
@@ -27,10 +30,16 @@ pub struct Job<'a> {
     pub nzb: &'a Nzb,
     pub par2: &'a Par2s,
     pub staging: &'a Path,
+    pub slot: &'a Arc<OwnedSemaphorePermit>,
 }
 
-pub async fn run(shared: &Shared, spec: &StoredSpec, last_try: bool) -> Ended {
-    let outcome = execute(shared, spec).await;
+pub async fn run(
+    shared: &Shared,
+    spec: &StoredSpec,
+    last_try: bool,
+    slot: &Arc<OwnedSemaphorePermit>,
+) -> Ended {
+    let outcome = execute(shared, spec, slot).await;
     let ended = match &outcome {
         Err(Failure::Infrastructure(_)) if !last_try => Ended::Retry,
         _ => Ended::Finished,
@@ -64,7 +73,11 @@ pub async fn run(shared: &Shared, spec: &StoredSpec, last_try: bool) -> Ended {
     ended
 }
 
-async fn execute(shared: &Shared, spec: &StoredSpec) -> Result<PathBuf, Failure> {
+async fn execute(
+    shared: &Shared,
+    spec: &StoredSpec,
+    slot: &Arc<OwnedSemaphorePermit>,
+) -> Result<PathBuf, Failure> {
     let staging = spec.staging();
     let phase = stored(shared.store.phase(&spec.id))?;
     if let Phase::Moving(target) = &phase {
@@ -89,6 +102,7 @@ async fn execute(shared: &Shared, spec: &StoredSpec) -> Result<PathBuf, Failure>
             nzb: &nzb,
             par2: &par2,
             staging: &staging,
+            slot,
         };
         let plan = match stored(shared.store.plan(&spec.id))? {
             Some(plan) => plan,
@@ -124,6 +138,7 @@ async fn execute(shared: &Shared, spec: &StoredSpec) -> Result<PathBuf, Failure>
         nzb: &nzb,
         par2: &par2,
         staging: &staging,
+        slot,
     };
     let extracted = match phase {
         Phase::Downloading => {

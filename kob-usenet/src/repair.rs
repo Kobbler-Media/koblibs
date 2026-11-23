@@ -1,19 +1,26 @@
 mod check;
+mod control;
 mod field;
 pub(crate) mod recovery;
+mod sets;
 mod solve;
 mod spool;
 
+use std::collections::HashSet;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use crate::jobs::fetch::Fetcher;
 use crate::vendor::nntp;
-use crate::vendor::par2::{self, Id, Reader};
+use crate::vendor::par2::{self, Id};
 use crate::vendor::queue::nzb::Nzb;
 pub use check::{damaged_slices, proof_damage};
-use recovery::Par2s;
+pub use control::Control;
+use control::Ticket;
+use recovery::{Collected, Par2s};
+pub use sets::described;
+use sets::{covered, covering, position, sources, usable};
 use solve::solve;
 pub use spool::Spool;
 
@@ -21,8 +28,10 @@ const DEPENDENT_ROWS: usize = 3;
 
 pub struct OnDisk {
     pub id: Option<Id>,
+    pub hash: Option<Id>,
     pub name: String,
     pub path: PathBuf,
+    pub damaged: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +54,8 @@ pub enum RepairError {
         required: usize,
         limit: usize,
     },
+    #[error("the repair was cancelled")]
+    Cancelled,
     #[error("PAR2 repair: {0}")]
     Io(#[from] io::Error),
     #[error("providers unavailable: {0}")]
@@ -66,6 +77,24 @@ struct Source {
     slices: Range<usize>,
     path: PathBuf,
     present: bool,
+    trusted: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct Repaired {
+    pub slices: usize,
+    pub by_other_set: HashSet<PathBuf>,
+}
+
+enum SetOutcome {
+    Agrees,
+    Solved(usize),
+}
+
+#[derive(Clone, Copy)]
+pub struct Budget {
+    pub memory: usize,
+    pub absent_ok: bool,
 }
 
 pub async fn repair(
@@ -74,18 +103,109 @@ pub async fn repair(
     par2: &Par2s,
     files: &[OnDisk],
     staging: &Path,
-    absent_ok: bool,
-    memory: usize,
-) -> Result<usize, RepairError> {
+    budget: Budget,
+    control: &Control,
+) -> Result<Repaired, RepairError> {
     let mut collected = par2
-        .index(fetcher, nzb, Spool::on_disk(staging)?)
+        .index(fetcher, nzb, Spool::on_disk(staging)?, |reader| {
+            covered(reader, files)
+        })
         .await?
         .ok_or(RepairError::NoPar2)?;
-    let (set, slice_size, sources) =
-        sources(collected.spool().critical(), files, staging, absent_ok)?;
-    let (missing, sources) = blocking(move || missing_slices(slice_size, sources)).await??;
+    let order = covering(collected.spool().critical(), files);
+    if order.is_empty() {
+        return Err(RepairError::NoPar2);
+    }
+    let mut open: HashSet<usize> = (0..files.len()).filter(|&i| files[i].damaged).collect();
+    let (mut agreed, mut failed) = (HashSet::new(), HashSet::new());
+    let mut first_error = None;
+    let mut repaired = Repaired::default();
+    for set in order {
+        let Some(plan) = usable(collected.spool().critical(), set) else {
+            continue;
+        };
+        let targets: Vec<(usize, Id)> = plan
+            .sources()
+            .iter()
+            .filter_map(|s| {
+                let at = position(&s.file, files)?;
+                open.contains(&at).then_some((at, s.file.hash))
+            })
+            .collect();
+        if targets.is_empty() {
+            continue;
+        }
+        let slice_size = plan.slice_size();
+        let sources = sources(&plan, files, staging, budget.absent_ok);
+        drop(plan);
+        let outcome = match sources {
+            Ok(sources) => {
+                repair_set(
+                    fetcher,
+                    nzb,
+                    par2,
+                    &mut collected,
+                    (set, slice_size),
+                    sources,
+                    budget.memory,
+                    control,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(SetOutcome::Agrees) => agreed.extend(targets.iter().map(|&(at, _)| at)),
+            Ok(SetOutcome::Solved(slices)) => {
+                repaired.slices += slices;
+                for (at, hash) in targets {
+                    open.remove(&at);
+                    failed.remove(&at);
+                    if files[at].hash != Some(hash) {
+                        repaired.by_other_set.insert(files[at].path.clone());
+                    }
+                }
+            }
+            Err(
+                error @ (RepairError::Uncovered(_)
+                | RepairError::Insufficient { .. }
+                | RepairError::Dependent
+                | RepairError::Failed(_)),
+            ) => {
+                failed.extend(targets.iter().map(|&(at, _)| at));
+                first_error.get_or_insert(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if open
+        .iter()
+        .any(|at| failed.contains(at) || !agreed.contains(at))
+    {
+        return Err(first_error.unwrap_or(RepairError::NoPar2));
+    }
+    Ok(repaired)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one set's repair needs the whole job context"
+)]
+async fn repair_set(
+    fetcher: &Fetcher,
+    nzb: &Nzb,
+    par2: &Par2s,
+    collected: &mut Collected,
+    (set, slice_size): (Id, usize),
+    sources: Vec<Source>,
+    memory: usize,
+    control: &Control,
+) -> Result<SetOutcome, RepairError> {
+    let ticket = control.ticket();
+    let (missing, sources) =
+        blocking(move || missing_slices(slice_size, sources, &ticket)).await??;
     if missing.is_empty() {
-        return Ok(0);
+        return Ok(SetOutcome::Agrees);
     }
     let volumes = par2.volumes(nzb, slice_size);
     let mut need = missing.len();
@@ -102,8 +222,10 @@ pub async fn repair(
         let rows = collected.spool().rows(set, slice_size, need);
         let (back, solved) = {
             let (missing, sources) = (missing.clone(), sources.clone());
+            let held = std::mem::take(collected);
+            let ticket = control.ticket();
             blocking(move || {
-                let spool = collected.spool();
+                let spool = held.spool();
                 let solved = solve(
                     spool.critical(),
                     set,
@@ -112,72 +234,29 @@ pub async fn repair(
                     &missing,
                     &sources,
                     memory,
+                    &|| ticket.cancelled(),
                 );
-                (collected, solved)
+                drop(ticket);
+                (held, solved)
             })
             .await?
         };
-        collected = back;
+        *collected = back;
         match solved {
             Err(RepairError::Dependent) if need < missing.len() + DEPENDENT_ROWS => {
                 need += 1;
             }
             Err(error) => return Err(error),
-            Ok(()) => return Ok(missing.len()),
+            Ok(()) => return Ok(SetOutcome::Solved(missing.len())),
         }
     }
-}
-
-fn sources(
-    reader: &Reader,
-    files: &[OnDisk],
-    staging: &Path,
-    absent_ok: bool,
-) -> Result<(Id, usize, Vec<Source>), RepairError> {
-    for set in reader.sets() {
-        let Ok(plan) = reader.verification_set(set) else {
-            continue;
-        };
-        let ours = |file: &par2::File| {
-            files
-                .iter()
-                .find(|d| d.id == Some(file.id))
-                .or_else(|| files.iter().find(|d| d.name == file.name))
-        };
-        if !plan.sources().iter().any(|s| ours(&s.file).is_some()) {
-            continue;
-        }
-        let mut sources = Vec::new();
-        for source in plan.sources() {
-            let found = ours(&source.file);
-            let path = found.map_or_else(
-                || {
-                    staging.join(
-                        crate::vendor::queue::names::sanitize(&source.file.name)
-                            .unwrap_or_default(),
-                    )
-                },
-                |d| d.path.clone(),
-            );
-            if found.is_none() && !absent_ok {
-                return Err(RepairError::Uncovered(source.file.name.clone()));
-            }
-            sources.push(Source {
-                file: source.file.clone(),
-                slices: source.slices.clone(),
-                present: found.is_some(),
-                path,
-            });
-        }
-        return Ok((set, plan.slice_size(), sources));
-    }
-    Err(RepairError::NoPar2)
 }
 
 fn missing_slices(
     slice_size: usize,
     sources: Vec<Source>,
-) -> io::Result<(Vec<usize>, Vec<Source>)> {
+    ticket: &Ticket,
+) -> Result<(Vec<usize>, Vec<Source>), RepairError> {
     let mut missing = Vec::new();
     for source in &sources {
         if source.present {
@@ -187,7 +266,18 @@ fn missing_slices(
                 slice_size as u64,
                 &source.file.slices,
                 &source.file.hash,
-            )?;
+                &|| ticket.cancelled(),
+            )
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::Interrupted => RepairError::Cancelled,
+                _ => RepairError::Io(e),
+            })?;
+            if source.trusted && !bad.is_empty() {
+                return Err(RepairError::Failed(format!(
+                    "a PAR2 set disagrees with the verified file {}",
+                    source.file.name
+                )));
+            }
             missing.extend(bad.into_iter().map(|i| source.slices.start + i));
         } else {
             missing.extend(source.slices.clone());

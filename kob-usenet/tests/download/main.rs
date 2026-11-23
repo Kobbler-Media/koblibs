@@ -1,13 +1,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod cancel;
 mod clean;
 mod compressed;
+mod described;
 mod durable;
 mod firsts;
 mod headless;
 mod hedge;
 mod hopeless;
+mod hostile;
 mod nested;
+mod nested_names;
 #[allow(dead_code)]
 #[path = "../common/nzb.rs"]
 mod nzb;
@@ -16,6 +20,7 @@ mod outage;
 #[allow(dead_code)]
 #[path = "../common/par2.rs"]
 mod par2;
+mod par2_sets;
 mod par2cmdline;
 mod passwords;
 #[allow(dead_code)]

@@ -2,6 +2,7 @@ use std::sync::LazyLock;
 
 const ORDER: usize = 65_535;
 const POLYNOMIAL: u32 = 0x1_100b;
+const TABLED: usize = 2048;
 
 pub static FIELD: LazyLock<Field> = LazyLock::new(Field::new);
 
@@ -63,6 +64,27 @@ impl Field {
                     *out ^= byte;
                 }
             }
+            _ if source.len() >= TABLED => {
+                let mut low = [0u16; 256];
+                let mut high = [0u16; 256];
+                for byte in 0..=255u8 {
+                    low[usize::from(byte)] = self.mul(u16::from(byte), coefficient);
+                    high[usize::from(byte)] = self.mul(u16::from(byte) << 8, coefficient);
+                }
+                let (words, tail) = source.as_chunks::<2>();
+                let (outs, _) = destination.as_chunks_mut::<2>();
+                for (out, &[bottom, top]) in outs.iter_mut().zip(words) {
+                    let product = low[usize::from(bottom)] ^ high[usize::from(top)];
+                    let product = product.to_le_bytes();
+                    out[0] ^= product[0];
+                    out[1] ^= product[1];
+                }
+                if let (Some(out), Some(&bottom)) = (outs.get_mut(words.len()), tail.first()) {
+                    let product = low[usize::from(bottom)].to_le_bytes();
+                    out[0] ^= product[0];
+                    out[1] ^= product[1];
+                }
+            }
             _ => {
                 for (out, input) in destination
                     .as_chunks_mut::<2>()
@@ -83,6 +105,24 @@ impl Field {
 #[cfg(test)]
 mod tests {
     use super::FIELD;
+
+    #[test]
+    fn the_table_path_multiplies_like_the_log_path() {
+        let source: Vec<u8> = (0..8191u32).map(|i| (i * 31 % 251) as u8).collect();
+        for coefficient in [2u16, 3, 255, 256, 1025, 32_768, u16::MAX] {
+            let even = source.len().next_multiple_of(2);
+            let mut tabled = vec![0xa5; even];
+            FIELD.add_scaled(&mut tabled, &source, coefficient);
+            let mut expected = vec![0xa5; even];
+            for (at, input) in source.chunks(2).enumerate() {
+                let word = u16::from_le_bytes([input[0], input.get(1).copied().unwrap_or(0)]);
+                let product = FIELD.mul(word, coefficient).to_le_bytes();
+                expected[2 * at] ^= product[0];
+                expected[2 * at + 1] ^= product[1];
+            }
+            assert!(tabled == expected, "{coefficient}");
+        }
+    }
 
     #[test]
     fn matches_polynomial_arithmetic_and_the_par2_input_constants() {

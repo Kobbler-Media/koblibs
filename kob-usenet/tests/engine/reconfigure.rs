@@ -160,3 +160,24 @@ async fn a_removed_server_added_back_shares_its_cap_with_the_draining_pool() {
     let _ = tokio::time::timeout(Duration::from_secs(20), draining).await;
     assert!(peak <= 2, "{peak} connections on an account of 2");
 }
+
+#[test]
+fn shrinking_connections_from_a_plain_thread_does_not_panic() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, nntp) = runtime.block_on(async {
+        let nntp = LoopbackServer::start(Vec::new()).await.unwrap();
+        (engine(dir.path(), vec![server("a", &nntp, 0)]).await, nntp)
+    });
+    let mut smaller = server("a", &nntp, 0);
+    smaller.connections -= 1;
+    let shared = &engine;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || shared.reconfigure(vec![smaller]))
+            .join()
+            .expect("reconfigure must not panic")
+            .unwrap();
+    });
+    runtime.block_on(async move { drop(engine) });
+}

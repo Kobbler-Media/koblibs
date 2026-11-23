@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::post::Posted;
 use kob_usenet::vendor::testkit::{Article, LoopbackServer};
 use kob_usenet::{
     DownloadConfig, Engine, EngineConfig, FreeSpace, IpPreference, JobFailure, JobSpec, JobState,
@@ -239,6 +240,55 @@ pub fn extractor_on_path() -> bool {
 // unpacks RAR with unrar, so tests of multi-volume RAR unpacking need it.
 pub fn unrar_on_path() -> bool {
     tools_on_path(&["unrar"])
+}
+
+pub fn par2_set(files: &[&Posted], base: &str, slice: usize, redundancy: u32) -> Vec<Posted> {
+    let dir = tempfile::tempdir().unwrap();
+    for file in files {
+        std::fs::write(dir.path().join(&file.name), &file.data).unwrap();
+    }
+    let status = std::process::Command::new("par2")
+        .current_dir(dir.path())
+        .args(["create", "-q", "-q", "-n2"])
+        .arg(format!("-r{redundancy}"))
+        .arg(format!("-s{slice}"))
+        .arg(format!("{base}.par2"))
+        .args(files.iter().map(|f| &f.name))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".par2"))
+        .collect();
+    names.sort();
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            Posted::new(
+                &format!("{base}{i}"),
+                name,
+                std::fs::read(dir.path().join(name)).unwrap(),
+            )
+        })
+        .collect()
+}
+
+pub async fn run_job(rig: &Rig, engine: &Engine, name: &str, posts: &[&Posted]) -> JobStatus {
+    let spec = rig.spec(name, crate::nzb::of(posts), None);
+    let id = spec.id.clone();
+    engine.add_job(spec).await.unwrap();
+    finish(engine, &id).await
+}
+
+pub fn articles_without(posts: &[&Posted], gone: &[&str]) -> Vec<Article> {
+    posts
+        .iter()
+        .flat_map(|p| p.articles.iter().cloned())
+        .filter(|a| !gone.contains(&a.message_id.as_str()))
+        .collect()
 }
 
 pub fn crc_of(dir: &Path, name: &str) -> (usize, u32) {

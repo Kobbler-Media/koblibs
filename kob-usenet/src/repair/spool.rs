@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -13,6 +13,12 @@ pub const RECOVERY: &[u8; 16] = b"PAR 2.0\0RecvSlic";
 pub const HEADER: usize = 64;
 const MAX_CRITICAL: usize = 16 << 20;
 const MAX_RECOVERY: usize = 256 << 20;
+const RECOVERY_OVERHEAD: u64 = HEADER as u64 + 4;
+pub const MAX_SLICE: u64 = MAX_RECOVERY as u64 - RECOVERY_OVERHEAD;
+const MAIN: &[u8; 16] = b"PAR 2.0\0Main\0\0\0\0";
+const WASTE_PER_BYTE: usize = 4;
+const MAX_CRITICAL_TOTAL: usize = 128 << 20;
+const MAX_SETS: usize = 256;
 
 struct Stored {
     set: Id,
@@ -35,6 +41,10 @@ pub struct Spool {
     exponents: HashSet<(Id, u32, usize)>,
     carry: Vec<u8>,
     critical: Reader,
+    slice_sizes: HashMap<Id, u64>,
+    known_sets: HashSet<Id>,
+    #[cfg(test)]
+    wasted: usize,
 }
 
 impl Spool {
@@ -62,8 +72,15 @@ impl Spool {
         self.carry.len()
     }
 
+    #[cfg(test)]
+    pub const fn wasted(&self) -> usize {
+        self.wasted
+    }
+
     pub fn feed(&mut self, data: &[u8]) -> io::Result<()> {
         self.carry.extend_from_slice(data);
+        let budget = self.carry.len().saturating_mul(WASTE_PER_BYTE);
+        let mut spent = 0usize;
         let mut at = 0;
         loop {
             let Some(start) = self.carry[at..]
@@ -88,20 +105,52 @@ impl Spool {
                 at += 1;
                 continue;
             }
+            let set: Id = header[32..48].try_into().expect("16-byte field");
+            if recovery
+                && self
+                    .slice_sizes
+                    .get(&set)
+                    .is_some_and(|&slice| slice.checked_add(RECOVERY_OVERHEAD) != Some(len as u64))
+            {
+                at += 1;
+                continue;
+            }
             let Some(packet) = self.carry.get(at..at + len) else {
                 break;
             };
+            // Every fake header costs a hash of its claimed length. Dropping the carry once the
+            // budget is gone makes a flood resend those bytes to buy more hashing.
+            if spent > budget {
+                at = self.carry.len();
+                break;
+            }
             if <[u8; 16]>::from(Md5::digest(&packet[32..])) != packet[16..32] {
+                spent += len;
+                #[cfg(test)]
+                {
+                    self.wasted += len;
+                }
                 at += 1;
                 continue;
+            }
+            if &packet[48..64] == MAIN
+                && let Some(size) = packet.get(64..72)
+            {
+                let size = u64::from_le_bytes(size.try_into().expect("8-byte field"));
+                self.slice_sizes.entry(set).or_insert(size);
             }
             if recovery {
                 let packet = packet.to_vec();
                 self.store(&packet)?;
             } else {
                 let packet = packet.to_vec();
-                self.critical.push(&packet);
-                self.critical.end_volume();
+                // Plans rescan every packet per set, so both counts bound hostile metadata.
+                if (self.known_sets.contains(&set) || self.known_sets.len() < MAX_SETS)
+                    && self.critical.push_bounded(&packet, MAX_CRITICAL_TOTAL)
+                {
+                    self.known_sets.insert(set);
+                    self.critical.end_volume();
+                }
             }
             at += len;
         }
@@ -206,6 +255,70 @@ mod tests {
         spool.read(rows[2], 100, &mut stripe).unwrap();
         assert_eq!(stripe, [2; 8]);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    fn fake(set: [u8; 16], claimed: u64) -> Vec<u8> {
+        [
+            MAGIC.as_slice(),
+            &claimed.to_le_bytes(),
+            &[0x5a; 16],
+            &set,
+            RECOVERY,
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn once_main_is_known_a_recovery_header_of_the_wrong_length_is_never_hashed() {
+        let mut spool = Spool::default();
+        let set = [3; 16];
+        let main = [64u64.to_le_bytes().as_slice(), &0u32.to_le_bytes()].concat();
+        spool.feed(&packet(set, MAIN, &main)).unwrap();
+        let flood: Vec<u8> = (0..1000).flat_map(|_| fake(set, 128)).collect();
+        spool.feed(&flood).unwrap();
+        assert_eq!(spool.wasted(), 0);
+    }
+
+    #[test]
+    fn hashing_of_fake_headers_is_bounded_by_the_bytes_received() {
+        let mut spool = Spool::default();
+        let claimed = 1u64 << 20;
+        let flood: Vec<u8> = (0..(8 << 20) / HEADER)
+            .flat_map(|_| fake([9; 16], claimed))
+            .collect();
+        spool.feed(&flood).unwrap();
+        let limit = WASTE_PER_BYTE * flood.len() + claimed as usize;
+        assert!(spool.wasted() <= limit, "hashed {} bytes", spool.wasted());
+    }
+
+    #[test]
+    fn metadata_for_more_sets_than_the_cap_is_ignored() {
+        let mut spool = Spool::default();
+        for n in 0..MAX_SETS as u32 + 10 {
+            let mut set = [0; 16];
+            set[..4].copy_from_slice(&n.to_le_bytes());
+            let main = [4u64.to_le_bytes().as_slice(), &0u32.to_le_bytes()].concat();
+            spool.feed(&packet(set, MAIN, &main)).unwrap();
+        }
+        assert_eq!(spool.critical().sets().len(), MAX_SETS);
+    }
+
+    #[test]
+    fn a_real_packet_after_a_flood_in_a_later_article_still_lands() {
+        let mut spool = Spool::default();
+        let set = [4; 16];
+        let flood: Vec<u8> = (0..(8 << 20) / HEADER)
+            .flat_map(|_| fake([9; 16], 1 << 20))
+            .collect();
+        spool.feed(&flood).unwrap();
+        spool.gap();
+        let real = packet(
+            set,
+            RECOVERY,
+            &[0u32.to_le_bytes().as_slice(), &[1; 8]].concat(),
+        );
+        spool.feed(&real).unwrap();
+        assert_eq!(spool.count(set, 8), 1);
     }
 
     #[test]

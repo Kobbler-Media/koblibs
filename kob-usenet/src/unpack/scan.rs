@@ -1,8 +1,12 @@
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use crate::vendor::archive::rar::{Scanner, Step};
 use crate::vendor::archive::{self, Format};
@@ -87,6 +91,75 @@ pub fn sets(dir: &Path) -> io::Result<Vec<Set>> {
 }
 
 const EXTRACTING: &str = ".extract-";
+const LANDED: &str = ".unpacked-";
+pub const JOURNAL: &str = ".plan";
+const IDENTITY_READ: usize = 1 << 20;
+
+pub fn landing(parent: &Path, key: &str) -> PathBuf {
+    parent.join(format!("{LANDED}{key}"))
+}
+
+// Sweeps delete and resumes adopt these prefixes, so an archive member must not keep them.
+pub fn unreserved(name: &OsStr) -> OsString {
+    let bytes = name.as_bytes();
+    if bytes.starts_with(EXTRACTING.as_bytes()) || bytes.starts_with(LANDED.as_bytes()) {
+        OsStr::from_bytes(&bytes[1..]).to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+pub fn landed(dir: &Path) -> io::Result<Vec<(PathBuf, String)>> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(key) = name.strip_prefix(LANDED) {
+            if !key.ends_with(JOURNAL) {
+                found.push((entry.path(), key.to_owned()));
+            }
+        } else if !name.starts_with(EXTRACTING) {
+            found.extend(landed(&entry.path())?);
+        }
+    }
+    Ok(found)
+}
+
+// Every byte counts: a recorded key skips extraction, so two archives may share one only if
+// they are the same archive in the same folder.
+pub fn identity(root: &Path, volumes: &[PathBuf]) -> io::Result<String> {
+    let mut hash = Sha256::new();
+    let parent = volumes[0].parent().unwrap_or(root);
+    let folder = parent.strip_prefix(root).unwrap_or(parent);
+    hash.update(folder.as_os_str().as_bytes());
+    let mut buf = vec![0; IDENTITY_READ];
+    for volume in volumes {
+        hash.update([0]);
+        hash.update(fs::metadata(volume)?.len().to_le_bytes());
+        let mut file = File::open(volume)?;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buf[..n]);
+        }
+    }
+    Ok(crate::release::hex(&hash.finalize()))
+}
+
+fn free_stem(parent: &Path, from: usize, parts: usize) -> usize {
+    (from..)
+        .find(|n| (1..=parts).all(|k| !parent.join(volume_name(*n, k)).exists()))
+        .expect("some number is free")
+}
+
+fn volume_name(n: usize, part: usize) -> String {
+    format!(".obfuscated-{n}.part{part:03}.rar")
+}
 
 pub fn sweep(dir: &Path) -> io::Result<()> {
     if !dir.is_dir() {
@@ -97,9 +170,11 @@ pub fn sweep(dir: &Path) -> io::Result<()> {
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        if entry.file_name().to_string_lossy().starts_with(EXTRACTING) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(EXTRACTING) {
             fs::remove_dir_all(entry.path())?;
-        } else {
+        } else if !name.starts_with(LANDED) {
             sweep(&entry.path())?;
         }
     }
@@ -115,7 +190,9 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
         let entry = entry?;
         let path = entry.path();
         let kind = entry.file_type()?;
-        let hidden = entry.file_name().to_string_lossy().starts_with(EXTRACTING);
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let hidden = name.starts_with(EXTRACTING) || name.starts_with(LANDED);
         if kind.is_dir() && !hidden {
             walk(&path, out)?;
         } else if kind.is_file() {
@@ -180,7 +257,8 @@ fn chain(parent: &Path, mut volumes: Vec<(PathBuf, RarVolume)>) -> io::Result<Ve
     let firsts: Vec<usize> = (0..volumes.len())
         .filter(|&i| volumes[i].1.first || volumes[i].1.number == Some(0))
         .collect();
-    for (n, &first) in firsts.iter().enumerate() {
+    let mut next = 0;
+    for &first in &firsts {
         taken[first] = true;
         let mut order = vec![first];
         loop {
@@ -205,10 +283,12 @@ fn chain(parent: &Path, mut volumes: Vec<(PathBuf, RarVolume)>) -> io::Result<Ve
             taken[i] = true;
             order.push(i);
         }
+        let n = free_stem(parent, next, order.len());
+        next = n + 1;
         let name = format!(".obfuscated-{n}");
         let mut paths = Vec::new();
         for (k, &i) in order.iter().enumerate() {
-            let renamed = parent.join(format!("{name}.part{:03}.rar", k + 1));
+            let renamed = parent.join(volume_name(n, k + 1));
             fs::rename(&volumes[i].0, &renamed)?;
             paths.push(renamed);
         }
@@ -228,4 +308,18 @@ fn chain(parent: &Path, mut volumes: Vec<(PathBuf, RarVolume)>) -> io::Result<Ve
         }
     }
     Ok(sets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_obfuscated_set_never_takes_a_name_already_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(free_stem(dir.path(), 0, 2), 0);
+        fs::write(dir.path().join(volume_name(0, 2)), b"resident").unwrap();
+        assert_eq!(free_stem(dir.path(), 0, 2), 1);
+        assert_eq!(free_stem(dir.path(), 0, 1), 0);
+    }
 }

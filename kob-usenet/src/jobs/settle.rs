@@ -1,12 +1,13 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::jobs::JobState;
 use crate::jobs::failure::Failure;
 use crate::jobs::run::Job;
 use crate::jobs::store::Plan;
-use crate::repair::{self, OnDisk, RepairError, proof_damage};
-use crate::vendor::core::FileMeta;
+use crate::repair::{self, Budget, Control, OnDisk, RepairError, Repaired, proof_damage};
+use crate::vendor::core::{FileMeta, NzbFile};
 use crate::vendor::yenc::crc32;
 
 pub enum Settled {
@@ -61,28 +62,46 @@ pub async fn settle(
     let files: Vec<OnDisk> = plan
         .outputs
         .iter()
-        .zip(paths)
-        .filter_map(|(o, path)| match &o.meta {
+        .zip(&paths)
+        .zip(&checks)
+        .filter_map(|((o, path), check)| match &o.meta {
             FileMeta::Nzb(f) => Some(OnDisk {
                 id: f.proof.as_ref().map(|p| p.file_id),
+                hash: f.proof.as_ref().map(|p| p.file_md5),
                 name: o.path.rsplit('/').next().unwrap_or(&o.path).to_owned(),
-                path,
+                path: path.clone(),
+                damaged: matches!(check, Check::Repairable),
             }),
             FileMeta::Multipart(_) => None,
         })
         .collect();
+    let control = Control::new(Arc::clone(&shared.solving), Arc::clone(job.slot));
     let repaired = repair::repair(
         job.fetcher,
         job.nzb,
         job.par2,
         &files,
         staging,
-        plan.raw,
-        shared.config.repair_memory_bytes,
+        Budget {
+            memory: shared.config.repair_memory_bytes,
+            absent_ok: plan.raw,
+        },
+        &control,
     )
     .await;
     match repaired {
-        Ok(slices) => {
+        Ok(repaired) => {
+            let slices = repaired.slices;
+            let (plan, paths) = (plan.clone(), paths.clone());
+            tokio::task::spawn_blocking(move || still_damaged(&plan, &paths, &repaired))
+                .await
+                .map_err(|e| Failure::io("verifying", e))?
+                .map_err(|e| Failure::io("verifying", e))?
+                .map_or(Ok(()), |name| {
+                    Err(Failure::Content(format!(
+                        "{name} is still damaged after PAR2 repair"
+                    )))
+                })?;
             tracing::info!(job = %spec.id, slices, "repaired with PAR2");
             Ok(Settled::Clean)
         }
@@ -94,10 +113,29 @@ pub async fn settle(
     }
 }
 
+fn still_damaged(
+    plan: &Plan,
+    paths: &[PathBuf],
+    repaired: &Repaired,
+) -> std::io::Result<Option<String>> {
+    for (output, path) in plan.outputs.iter().zip(paths) {
+        let FileMeta::Nzb(NzbFile {
+            proof: Some(proof), ..
+        }) = &output.meta
+        else {
+            continue;
+        };
+        if !repaired.by_other_set.contains(path) && !proof_damage(path, proof)?.is_empty() {
+            return Ok(Some(output.path.clone()));
+        }
+    }
+    Ok(None)
+}
+
 fn repair_failure(error: RepairError) -> Failure {
     match error {
         RepairError::Providers(error) => Failure::providers(&error),
-        error @ (RepairError::Io(_) | RepairError::Memory { .. }) => {
+        error @ (RepairError::Io(_) | RepairError::Memory { .. } | RepairError::Cancelled) => {
             Failure::Infrastructure(error.to_string())
         }
         error @ (RepairError::NoPar2
@@ -141,11 +179,13 @@ fn check(
                 return Ok(Check::Clean);
             }
             if let Some(proof) = proof {
-                return Ok(if proof_damage(path, proof)?.is_empty() {
-                    Check::Clean
-                } else {
-                    Check::Repairable
-                });
+                return Ok(
+                    if damaged.is_empty() && proof_damage(path, proof)?.is_empty() {
+                        Check::Clean
+                    } else {
+                        Check::Repairable
+                    },
+                );
             }
             Ok(if damaged.is_empty() {
                 Check::Clean

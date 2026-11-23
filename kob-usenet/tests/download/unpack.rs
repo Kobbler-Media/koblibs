@@ -304,3 +304,33 @@ async fn each_extractor_unpacks_a_rar_on_its_own() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_hung_tool_that_only_prints_is_stopped() {
+    let tools = tempfile::tempdir().unwrap();
+    let tool = script(
+        tools.path(),
+        "unrar",
+        "while :; do echo working; sleep 0.01; done",
+    );
+    let rar = Posted::new(
+        "r",
+        "R.rar",
+        include_bytes!("../vendor/fixtures/archive/Rar.rar").to_vec(),
+    );
+    let rig = Rig::new(rar.articles.clone()).await;
+    let engine = rig
+        .engine_with(|c| {
+            c.download.unrar = tool;
+            c.download.unpack_stall = Duration::from_millis(100);
+            c.download.retry_after = Duration::from_secs(60);
+        })
+        .await;
+    let spec = rig.spec("R", nzb::of(&[&rar]), None);
+    let id = spec.id.clone();
+    engine.add_job(spec).await.unwrap();
+    let status = waiting(&engine, &id).await;
+    assert_eq!(status.state, JobState::Queued, "{status:?}");
+    let error = status.error.unwrap_or_default();
+    assert!(error.contains("stalled"), "{error}");
+}

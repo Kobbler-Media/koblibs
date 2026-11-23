@@ -125,6 +125,7 @@ impl Writer<'_> {
         let mut synced = Instant::now();
         let mut written = Vec::new();
         let mut last_written = Instant::now();
+        let mut waiting = None;
         let attempt = |key: (usize, usize), lane: Lane, outputs: &[Output], delay: Duration| {
             let output = &outputs[key.0];
             let piece = output.pieces[key.1].clone();
@@ -140,10 +141,17 @@ impl Writer<'_> {
         while !queue.is_empty() || !flying.is_empty() {
             while flying.len() < self.window.max(1)
                 && let Some(&key) = queue.front()
-                && (outputs[key.0].reserved
-                    || self
-                        .gate
-                        .admits(&dest, credit, outputs[key.0].pieces[key.1].len()))
+                && (outputs[key.0].reserved || {
+                    let admitted =
+                        self.gate
+                            .admits(&dest, credit, outputs[key.0].pieces[key.1].len());
+                    if admitted {
+                        waiting = None;
+                    } else if waiting.is_none() {
+                        waiting = Some(self.gate.wait());
+                    }
+                    admitted
+                })
             {
                 queue.pop_front();
                 flying.insert(

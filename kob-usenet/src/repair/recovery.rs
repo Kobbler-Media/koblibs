@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use futures_util::{StreamExt, stream};
@@ -7,7 +7,7 @@ use regex::Regex;
 use crate::jobs::fetch::{Fetcher, First, Outcome};
 use crate::repair::spool::{HEADER, MAGIC, RECOVERY, Spool};
 use crate::vendor::nntp::{self, BodyExpectation};
-use crate::vendor::par2::Id;
+use crate::vendor::par2::{Id, Reader};
 use crate::vendor::queue::names::{self, Kind};
 use crate::vendor::queue::nzb::{File, Nzb};
 
@@ -45,13 +45,16 @@ pub struct Par2s {
 pub struct Volume<'a> {
     pub blocks: usize,
     index: usize,
+    stem: String,
     file: &'a File,
 }
 
+#[derive(Default)]
 pub struct Collected {
     spool: Spool,
     cursors: HashMap<usize, usize>,
     current: Option<usize>,
+    stems: HashMap<String, HashSet<Id>>,
 }
 
 impl Par2s {
@@ -126,6 +129,7 @@ impl Par2s {
                 (blocks > 0).then_some(Volume {
                     blocks,
                     index: p.index,
+                    stem: stem(file.name()),
                     file,
                 })
             })
@@ -140,29 +144,48 @@ impl Par2s {
         &self,
         fetcher: &Fetcher,
         nzb: &Nzb,
-        mut spool: Spool,
+        spool: Spool,
+        enough: impl Fn(&Reader) -> bool,
     ) -> Result<Option<Collected>, nntp::Error> {
         let mut candidates: Vec<&Par2File> = self.files.iter().collect();
         candidates.sort_by_key(|p| {
             let file = &nzb.files[p.index];
             (p.blocks(file, 1) > 0, file.segments.len())
         });
+        let mut collected = Collected {
+            spool,
+            ..Collected::default()
+        };
+        let mut read = HashSet::new();
+        let mut satisfied = false;
         for candidate in candidates {
             let file = &nzb.files[candidate.index];
-            let mut collected = Collected {
-                spool,
-                cursors: HashMap::new(),
-                current: None,
-            };
+            let stem = stem(file.name());
+            let critical = collected.spool.critical();
+            if candidate.blocks(file, 1) > 0
+                && !critical.sets().is_empty()
+                && (read.contains(&stem) || satisfied)
+            {
+                continue;
+            }
+            let before: HashSet<Id> = critical.sets().into_iter().collect();
             collected
                 .pull(fetcher, candidate.index, file, |_| usize::MAX, 1)
                 .await?;
-            if !collected.spool.critical().sets().is_empty() {
-                return Ok(Some(collected));
+            let found: Vec<Id> = collected
+                .spool
+                .critical()
+                .sets()
+                .into_iter()
+                .filter(|set| !before.contains(set))
+                .collect();
+            if !found.is_empty() {
+                read.insert(stem.clone());
+                collected.stems.entry(stem).or_default().extend(found);
+                satisfied = enough(collected.spool.critical());
             }
-            spool = collected.spool;
         }
-        Ok(None)
+        Ok((!collected.spool.critical().sets().is_empty()).then_some(collected))
     }
 }
 
@@ -203,10 +226,14 @@ impl Collected {
         need: usize,
     ) -> Result<usize, nntp::Error> {
         let have = |spool: &Spool| spool.count(set, slice_size);
-        let mut order: Vec<&Volume<'_>> = volumes.iter().collect();
-        order.sort_by_key(|v| std::cmp::Reverse(v.blocks));
+        let holds = |v: &Volume<'_>| self.stems.get(&v.stem).map(|sets| sets.contains(&set));
+        let mut order: Vec<&Volume<'_>> =
+            volumes.iter().filter(|v| holds(v) != Some(false)).collect();
+        order.sort_by_key(|v| (holds(v) != Some(true), std::cmp::Reverse(v.blocks)));
+        let known = order.iter().filter(|v| holds(v) == Some(true)).count();
+        let window = if known > 0 { known } else { order.len() };
         let wanted = need.saturating_sub(have(&self.spool));
-        if let Some(at) = order.iter().rposition(|v| v.blocks >= wanted) {
+        if let Some(at) = order[..window].iter().rposition(|v| v.blocks >= wanted) {
             let best = order.remove(at);
             order.insert(0, best);
         }
@@ -265,7 +292,15 @@ impl Collected {
             for answer in answers {
                 match answer? {
                     Outcome::Body(body) => {
-                        self.spool.feed(&body.data).map_err(nntp::Error::Io)?;
+                        let mut spool = std::mem::take(&mut self.spool);
+                        let (spool, fed) = tokio::task::spawn_blocking(move || {
+                            let fed = spool.feed(&body.data);
+                            (spool, fed)
+                        })
+                        .await
+                        .map_err(|e| nntp::Error::Io(std::io::Error::other(e)))?;
+                        self.spool = spool;
+                        fed.map_err(nntp::Error::Io)?;
                     }
                     Outcome::Missing | Outcome::Corrupt => self.spool.gap(),
                 }
@@ -289,6 +324,16 @@ fn worth_reading(file: &File) -> bool {
     }
 }
 
+fn stem(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let end = VOLUME
+        .find(&lower)
+        .map(|m| m.start())
+        .or_else(|| lower.strip_suffix(".par2").map(str::len))
+        .unwrap_or(lower.len());
+    lower[..end].to_owned()
+}
+
 fn volume_blocks(name: &str) -> Option<usize> {
     VOLUME
         .captures(name)
@@ -296,8 +341,8 @@ fn volume_blocks(name: &str) -> Option<usize> {
 }
 
 fn first_recovery(data: &[u8]) -> Option<u64> {
-    let mut at = 0;
-    while let Some(header) = data.get(at..at + HEADER) {
+    let mut at = 0usize;
+    while let Some(header) = data.get(at..at.checked_add(HEADER)?) {
         if &header[..8] != MAGIC {
             return None;
         }
@@ -305,7 +350,32 @@ fn first_recovery(data: &[u8]) -> Option<u64> {
         if &header[48..64] == RECOVERY {
             return Some(len);
         }
+        if len < HEADER as u64 {
+            return None;
+        }
         at = at.checked_add(usize::try_from(len).ok()?)?;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(len: u64) -> Vec<u8> {
+        [
+            MAGIC.as_slice(),
+            &len.to_le_bytes(),
+            &[0; 32],
+            b"PAR 2.0\0Main\0\0\0\0",
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn a_packet_length_that_cannot_advance_or_overflows_ends_the_walk() {
+        for len in [0, 1, 63, u64::MAX, u64::MAX - 8] {
+            assert_eq!(first_recovery(&header(len)), None, "{len}");
+        }
+    }
 }

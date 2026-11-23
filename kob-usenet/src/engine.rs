@@ -250,6 +250,11 @@ impl Engine {
     }
 
     #[must_use]
+    #[cfg(feature = "testkit")]
+    pub fn repairs_running(&self) -> usize {
+        self.jobs.repairs_running()
+    }
+
     pub fn paused_for_space(&self) -> bool {
         self.jobs.paused_for_space()
     }
