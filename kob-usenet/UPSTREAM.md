@@ -52,8 +52,9 @@ which drives upstream's database-backed queue service.
 | 18 | `Workload::Cache` above downloads, ranked background admission, import workload in `Rules`, warming any reader | ours |
 | 19 | Stream-first bound reserve from the connections playback holds, full background depth | ours, reworks 5 |
 | 20 | Warn on the part-1 fallback of 8; idle-relative seek gate in the loopback test | ours |
+| 21 | Cache-first bound: work below cache leaves an active cache reader its connections plus a spare, a headroom slot from 16 connections, cache pipelining capped at the depth | ours, extends 18 and 19 |
 
-Patches 5–20 are candidates to offer upstream.
+Patches 5–21 are candidates to offer upstream.
 
 ## Monthly sync
 

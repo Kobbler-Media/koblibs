@@ -1,0 +1,354 @@
+From 5d20d44403cc1c803a730e0777e5cbf1cef730d1 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 14:12:53 +1100
+Subject: [PATCH] Cache-first bound: work below cache leaves a cache reader
+ connections
+
+A cache reader runs in its own lane and never pipelines behind downloads, so
+under a saturating download it waited for a connection's whole pipeline to
+drain, then stacked its entire read-ahead on that one connection, sharing the
+provider with every download connection. With the playback bound on, cache
+reads counted as background work and could not take the connections playback
+left free at all. Cache readers waited seconds between segments.
+
+Now an active or lingering cache reader bounds the work below it like playback
+does: that work leaves it the connections it holds plus four, up to three
+quarters of the limit, and from 16 connections up it keeps a second headroom
+slot so a cache reader's first read finds an idle connection. A cache request
+pipelines on its own connection only up to the pipeline depth; past that it
+waits, which makes work below it yield and spreads the read-ahead.
+---
+ crates/nntp/src/pool.rs     | 164 +++++++++++++++++++++++++++---------
+ crates/nntp/tests/client.rs |   9 +-
+ 2 files changed, 132 insertions(+), 41 deletions(-)
+
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index f209e2de..cb898a4b 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -1,7 +1,7 @@
+ use std::collections::VecDeque;
+ use std::future::{Future, poll_fn};
+ use std::pin::{Pin, pin};
+-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+ use std::task::Poll;
+ use std::time::{Duration, Instant};
+@@ -39,12 +39,20 @@ const STREAM_WAIT: Duration = Duration::from_secs(30);
+ const STREAM_CONNECT_WAIT: Duration = Duration::from_secs(3);
+ /// From this effective limit up, background work leaves one connection slot for playback.
+ const STREAM_HEADROOM_MIN_CONNECTIONS: usize = 4;
++/// From this effective limit up, work below cache leaves another slot for a cache reader,
++/// whose first read would otherwise wait for a full pipeline to drain.
++const CACHE_HEADROOM_MIN_CONNECTIONS: usize = 16;
+ /// Background work stays bounded this long after the last playback request: reads and
+ /// seeks come in bursts.
+ const STREAM_LINGER: Duration = Duration::from_secs(2);
+ /// While bounded, background work leaves playback the connections it holds plus this
+ /// many, a seek's first reads, up to a quarter of the limit.
+ const STREAM_SPARE: usize = 4;
++/// While a cache reader is active or lingering, work below it leaves it the connections
++/// it holds plus this many, up to three quarters of the limit: lane isolation keeps cache
++/// reads from pipelining behind downloads, so without idle connections they wait for
++/// whole pipelines to drain.
++const CACHE_SPARE: usize = 4;
+ 
+ #[derive(Debug, Clone, Copy)]
+ pub struct PoolConfig {
+@@ -110,10 +118,10 @@ struct State {
+     /// Why that connect failed; cleared once one succeeds.
+     connect_error: Option<Arc<str>>,
+     connected: bool,
+-    /// Playback requests in [`Pool::fetch`].
+-    streams: usize,
+-    /// Background work stays bounded until then.
+-    stream_until: Option<Instant>,
++    /// Playback requests in [`Pool::fetch`]; background work is bounded meanwhile.
++    streams: Presence,
++    /// [`Workload::Cache`] requests in [`Pool::fetch`]; work below them is bounded meanwhile.
++    caches: Presence,
+     /// Replaced: takes no new requests and closes each connection once it drains.
+     retired: bool,
+ }
+@@ -126,6 +134,14 @@ struct Backoff {
+ }
+ 
+ impl State {
++    const fn presence(&mut self, cache: bool) -> &mut Presence {
++        if cache {
++            &mut self.caches
++        } else {
++            &mut self.streams
++        }
++    }
++
+     /// Until when new connects wait; never while nothing is open, so an outage still
+     /// gets noticed.
+     fn held(&self, open: usize) -> Option<Instant> {
+@@ -179,6 +195,8 @@ pub(crate) enum Failure {
+ 
+ struct Worker {
+     lane: AtomicU64,
++    /// The lane belongs to a [`Workload::Cache`] reader.
++    cached: AtomicBool,
+     tx: mpsc::Sender<Request>,
+     load: Arc<AtomicUsize>,
+     task: tokio::task::AbortHandle,
+@@ -461,7 +479,7 @@ impl Pool {
+             reserved
+         };
+         // Dropping a new connection's load leaves it idle in the pool.
+-        join_all((0..reserved).map(|_| self.open(self.connecting(), None, None))).await;
++        join_all((0..reserved).map(|_| self.open(self.connecting(), None, None, false))).await;
+     }
+ 
+     /// Ends every connection now, abandoning the requests on them.
+@@ -623,7 +641,11 @@ impl Pool {
+         let stream = tag.workload == Workload::Stream;
+         // Shared by retries; only admission waits spend it, not transfers.
+         let mut budget = self.stream_wait;
+-        let _streaming = stream.then(|| Streaming::start(&self.state));
++        let _present = match tag.workload {
++            Workload::Stream => Some(Present::start(&self.state, false)),
++            Workload::Cache => Some(Present::start(&self.state, true)),
++            _ => None,
++        };
+         let lane = if stream {
+             tag.lane.or(Some(Lane::STREAM))
+         } else {
+@@ -711,7 +733,8 @@ impl Pool {
+     /// playback and waits for pending connections before pipelining. While playback is
+     /// active or lingering, background work leaves playback the connections it holds plus
+     /// [`STREAM_SPARE`], never pipelines behind playback, and takes no connection at all
+-    /// while playback waits for one.
++    /// while playback waits for one. Work below cache is bounded the same way by an active
++    /// cache reader, with [`CACHE_SPARE`], and leaves it a headroom slot of its own.
+     /// Past the admission `deadline` it fails as [`Error::Unavailable`], except that a
+     /// cold connect it started itself runs on, so a hung provider is blamed for it.
+     async fn worker(
+@@ -723,6 +746,7 @@ impl Pool {
+     ) -> Result<(mpsc::Sender<Request>, Load, usize, u32), Failure> {
+         let stream = workload == Workload::Stream;
+         let outranked = workload.rank().is_some_and(|rank| rank > 0);
++        let cached = workload == Workload::Cache && lane.is_some();
+         let (mut impatient, mut first) = (false, true);
+         loop {
+             // A spent budget still takes a connection that is free right away.
+@@ -742,38 +766,61 @@ impl Pool {
+                 let open = state.workers.len() + state.connecting;
+                 let limit = self.limit(&state);
+                 let held = state.held(open);
+-                let hold_headroom = !stream && limit >= STREAM_HEADROOM_MIN_CONNECTIONS && {
++                let headroom = match workload.rank() {
++                    None => 0,
++                    Some(_) if limit < STREAM_HEADROOM_MIN_CONNECTIONS => 0,
++                    Some(rank) if rank > 0 && limit >= CACHE_HEADROOM_MIN_CONNECTIONS => 2,
++                    Some(_) => 1,
++                };
++                let hold_headroom = headroom > 0 && {
+                     let idle = state
+                         .workers
+                         .iter()
+                         .filter(|worker| worker.load.load(Ordering::Relaxed) == 0)
+                         .count();
+-                    idle + limit.saturating_sub(open) <= 1
++                    idle + limit.saturating_sub(open) <= headroom
+                 };
+-                let linger = state
+-                    .stream_until
+-                    .filter(|&until| !stream && Instant::now() < until);
+-                let bounded = !stream && (state.streams > 0 || linger.is_some());
++                let now = Instant::now();
++                let streaming = !stream && state.streams.active(now);
++                let caching = outranked && state.caches.active(now);
++                let linger = [
++                    state.streams.lingering(now).filter(|_| !stream),
++                    state.caches.lingering(now).filter(|_| outranked),
++                ]
++                .into_iter()
++                .flatten()
++                .min();
++                let bounded = streaming || caching;
++                let busy = |worker: &Worker| worker.load.load(Ordering::Relaxed) > 0;
++                let playing =
++                    |worker: &Worker| worker.lane.load(Ordering::Relaxed) == Lane::STREAM.0;
++                let caches = |worker: &Worker| worker.cached.load(Ordering::Relaxed);
+                 let background = |worker: &&Worker| {
+-                    worker.load.load(Ordering::Relaxed) > 0
+-                        && worker.lane.load(Ordering::Relaxed) != Lane::STREAM.0
++                    busy(worker) && !playing(worker) && !(caching && caches(worker))
+                 };
+-                // Connections background work holds, and may hold besides the reserve.
++                // Connections this work holds, and may hold besides the reserves above it.
+                 let share = bounded.then(|| {
+-                    let playing = state
+-                        .workers
+-                        .iter()
+-                        .filter(|w| {
+-                            w.load.load(Ordering::Relaxed) > 0
+-                                && w.lane.load(Ordering::Relaxed) == Lane::STREAM.0
+-                        })
+-                        .count();
+-                    let reserve = (playing + STREAM_SPARE).min(limit / 4);
++                    let held = |class: &dyn Fn(&Worker) -> bool| {
++                        state.workers.iter().filter(|w| busy(w) && class(w)).count()
++                    };
++                    let stream_reserve = if streaming {
++                        (held(&playing) + STREAM_SPARE).min(limit / 4)
++                    } else {
++                        0
++                    };
++                    let cache_reserve = if caching {
++                        (held(&caches) + CACHE_SPARE).min(limit * 3 / 4)
++                    } else {
++                        usize::from(outranked && limit >= CACHE_HEADROOM_MIN_CONNECTIONS)
++                    };
+                     let busy = state.workers.iter().filter(background).count();
+-                    (busy + state.connecting, limit.saturating_sub(reserve))
++                    (
++                        busy + state.connecting,
++                        limit.saturating_sub(stream_reserve + cache_reserve),
++                    )
+                 });
+                 // Over its share, background work lets connections drain for playback.
+-                let starved = bounded && self.stream_parked.load(Ordering::Relaxed) > 0
++                let starved = streaming && self.stream_parked.load(Ordering::Relaxed) > 0
+                     || share.is_some_and(|(busy, room)| busy > room);
+                 // Below cache work, background work lets connections drain for a waiting
+                 // cache request, which never pipelines behind it.
+@@ -794,6 +841,12 @@ impl Pool {
+                                 && background(worker))
+                     })
+                     .filter(|_| !yielding)
++                    // A cache reader past a full pipeline parks instead, so work below it
++                    // yields connections and its read-ahead spreads over them.
++                    .filter(|worker| {
++                        workload != Workload::Cache
++                            || worker.load.load(Ordering::Relaxed) < self.config.pipeline_depth
++                    })
+                     .filter(|worker| !hold_headroom || worker.load.load(Ordering::Relaxed) > 0)
+                     .filter(|worker| {
+                         lane.is_none_or(|lane| {
+@@ -815,6 +868,7 @@ impl Pool {
+                         if ahead == 0 || lane.is_none() {
+                             w.lane
+                                 .store(lane.map_or(0, |lane| lane.0), Ordering::Relaxed);
++                            w.cached.store(cached, Ordering::Relaxed);
+                         }
+                         return Ok((
+                             w.tx.clone(),
+@@ -851,7 +905,7 @@ impl Pool {
+                 let until = deadline
+                     .filter(|_| !(stream && live))
+                     .map(|deadline| deadline.max(now + STREAM_CONNECT_WAIT));
+-                let mut open = Box::pin(self.open(self.connecting(), until, lane));
++                let mut open = Box::pin(self.open(self.connecting(), until, lane, cached));
+                 let opened = if stream && live {
+                     let mut patience = now + STREAM_CONNECT_WAIT.min(self.endpoint.timeout() / 2);
+                     if let Some(deadline) = deadline {
+@@ -897,6 +951,7 @@ impl Pool {
+         connecting: Connecting,
+         until: Option<tokio::time::Instant>,
+         lane: Option<Lane>,
++        cached: bool,
+     ) -> impl Future<Output = Result<Option<(mpsc::Sender<Request>, Load, u32)>, Failure>> + Send + 'static
+     {
+         let (endpoint, config) = (self.endpoint.clone(), self.config);
+@@ -1043,6 +1098,7 @@ impl Pool {
+             if !state.retired {
+                 state.workers.push(Worker {
+                     lane: AtomicU64::new(lane.map_or(0, |lane| lane.0)),
++                    cached: AtomicBool::new(cached),
+                     tx: tx.clone(),
+                     load,
+                     task: task.abort_handle(),
+@@ -1095,21 +1151,51 @@ async fn dispatch(tx: &mpsc::Sender<Request>, mut request: Request) -> Option<Re
+     response.await.ok()
+ }
+ 
+-/// Counts one playback request for the bound on background work, which lingers after it.
+-struct Streaming(Arc<Mutex<State>>);
++/// Requests of one ranked workload in [`Pool::fetch`]; the bound on work below them
++/// lingers [`STREAM_LINGER`] after the last.
++#[derive(Default)]
++struct Presence {
++    requests: usize,
++    until: Option<Instant>,
++}
++
++impl Presence {
++    fn lingering(&self, now: Instant) -> Option<Instant> {
++        self.until.filter(|&until| now < until)
++    }
++
++    fn active(&self, now: Instant) -> bool {
++        self.requests > 0 || self.lingering(now).is_some()
++    }
++
++    const fn leave(&mut self, until: Instant) {
++        self.requests -= 1;
++        self.until = Some(until);
++    }
++}
+ 
+-impl Streaming {
+-    fn start(state: &Arc<Mutex<State>>) -> Self {
+-        state.lock().unwrap_or_else(PoisonError::into_inner).streams += 1;
+-        Self(Arc::clone(state))
++/// Counts one playback (or, with `.1`, cache) request in its [`Presence`].
++struct Present(Arc<Mutex<State>>, bool);
++
++impl Present {
++    fn start(state: &Arc<Mutex<State>>, cache: bool) -> Self {
++        state
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .presence(cache)
++            .requests += 1;
++        Self(Arc::clone(state), cache)
+     }
+ }
+ 
+-impl Drop for Streaming {
++impl Drop for Present {
+     fn drop(&mut self) {
+-        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+-        state.streams -= 1;
+-        state.stream_until = Some(Instant::now() + STREAM_LINGER);
++        let until = Instant::now() + STREAM_LINGER;
++        self.0
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .presence(self.1)
++            .leave(until);
+     }
+ }
+ 
+diff --git a/crates/nntp/tests/client.rs b/crates/nntp/tests/client.rs
+index c6177de5..ce5b92be 100644
+--- a/crates/nntp/tests/client.rs
++++ b/crates/nntp/tests/client.rs
+@@ -1032,7 +1032,12 @@ async fn a_large_article_takes_a_whole_depth_of_permits() {
+ async fn playback_finds_a_connection_imports_leave_free() {
+     let large = Corpus::generate(1025, 1, 4_000_000);
+     let small = Corpus::generate(1025, 1, ARTICLE_SIZE);
+-    for (max_connections, workload) in [(4, Workload::Queue), (10, Workload::Health)] {
++    for (max_connections, workload, opened) in [
++        (4, Workload::Queue, 3),
++        (10, Workload::Health, 9),
++        (16, Workload::Queue, 14),
++        (16, Workload::Cache, 15),
++    ] {
+         let ids: Vec<_> = (0..max_connections + 2)
+             .map(|index| format!("background-{index}@loopback"))
+             .collect();
+@@ -1096,7 +1101,7 @@ async fn playback_finds_a_connection_imports_leave_free() {
+             "playback queued behind background BODYs: {elapsed:?}"
+         );
+         assert_eq!(received.data, small.data);
+-        assert_eq!(background_connections, max_connections - 1);
++        assert_eq!(background_connections, opened);
+         tokio::time::timeout(Duration::from_secs(15), async {
+             while let Some(task) = busy.join_next().await {
+                 task.unwrap().unwrap();

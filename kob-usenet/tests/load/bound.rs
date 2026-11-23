@@ -6,40 +6,14 @@ use kob_usenet::vendor::testkit::post;
 use kob_usenet::{Engine, ImportMode, JobState, Purpose};
 use tokio::io::AsyncReadExt;
 
-use crate::rig::Loaded;
-use crate::support::{ARTICLE, POSTED, quoted};
+use crate::rig::{Loaded, media, single_nzb};
+use crate::support::ARTICLE;
 
 const CONNECTIONS: usize = 8;
 const STREAM_ARTICLES: usize = 600;
 // About 5 Mbit/s, read ahead by 2 MB: playback in its steady state.
 const PACE: Duration = Duration::from_millis(100);
 const READ_AHEAD: u64 = 2 << 20;
-
-fn stream_nzb() -> Vec<u8> {
-    let mut xml = String::from(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
-    );
-    xml.push_str(&format!(
-        "<file poster=\"p\" date=\"{POSTED}\" subject=\"{}\"><groups><group>a.b</group></groups><segments>\n",
-        quoted("Film.2026.mkv", 1, 1).replace('"', "&quot;")
-    ));
-    for part in 0..STREAM_ARTICLES {
-        xml.push_str(&format!(
-            "<segment bytes=\"{ARTICLE}\" number=\"{}\">film-{part}@loopback</segment>\n",
-            part + 1
-        ));
-    }
-    xml.push_str("</segments></file>\n</nzb>\n");
-    xml.into_bytes()
-}
-
-fn film() -> Vec<u8> {
-    let mut data: Vec<u8> = (0..STREAM_ARTICLES * ARTICLE)
-        .map(|i| (i % 239) as u8)
-        .collect();
-    data[..4].copy_from_slice(&[0x1A, 0x45, 0xDF, 0xA3]);
-    data
-}
 
 async fn download_time(rig: &Loaded, engine: &Engine) -> Duration {
     let started = Instant::now();
@@ -55,10 +29,27 @@ async fn download_time(rig: &Loaded, engine: &Engine) -> Duration {
 }
 
 async fn queue_time(playing: bool) -> Duration {
-    let rig = Loaded::new(post("film", "Film.2026.mkv", &film(), ARTICLE)).await;
+    let rig = Loaded::new(post(
+        "film",
+        "Film.2026.mkv",
+        &media(STREAM_ARTICLES * ARTICLE, 239),
+        ARTICLE,
+    ))
+    .await;
     let engine = Arc::new(rig.engine_reading_ahead(CONNECTIONS, READ_AHEAD).await);
     let release = engine
-        .import(Some(&stream_nzb()), None, "Film", None, ImportMode::Stream)
+        .import(
+            Some(&single_nzb(
+                "film",
+                "Film.2026.mkv",
+                STREAM_ARTICLES,
+                ARTICLE,
+            )),
+            None,
+            "Film",
+            None,
+            ImportMode::Stream,
+        )
         .await
         .unwrap();
     let done = Arc::new(AtomicBool::new(false));

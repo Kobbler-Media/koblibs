@@ -1037,7 +1037,12 @@ async fn a_large_article_takes_a_whole_depth_of_permits() {
 async fn playback_finds_a_connection_imports_leave_free() {
     let large = Corpus::generate(1025, 1, 4_000_000);
     let small = Corpus::generate(1025, 1, ARTICLE_SIZE);
-    for (max_connections, workload) in [(4, Workload::Queue), (10, Workload::Health)] {
+    for (max_connections, workload, opened) in [
+        (4, Workload::Queue, 3),
+        (10, Workload::Health, 9),
+        (16, Workload::Queue, 14),
+        (16, Workload::Cache, 15),
+    ] {
         let ids: Vec<_> = (0..max_connections + 2)
             .map(|index| format!("background-{index}@loopback"))
             .collect();
@@ -1101,7 +1106,7 @@ async fn playback_finds_a_connection_imports_leave_free() {
             "playback queued behind background BODYs: {elapsed:?}"
         );
         assert_eq!(received.data, small.data);
-        assert_eq!(background_connections, max_connections - 1);
+        assert_eq!(background_connections, opened);
         tokio::time::timeout(Duration::from_secs(15), async {
             while let Some(task) = busy.join_next().await {
                 task.unwrap().unwrap();

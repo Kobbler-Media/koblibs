@@ -6,6 +6,8 @@ use kob_usenet::{Engine, EngineConfig, JobSpec, JobState, ServerConfig};
 use crate::support::{ARTICLE, Fixture, POSTED, engine, quoted, server};
 
 const LIBRARY_ARTICLES: usize = 1500;
+const LATENCY: Duration = Duration::from_millis(20);
+const BANDWIDTH: u64 = 1_000_000;
 // Connections drain their pipelined download requests before a higher lane gets them.
 // Timing tests share the machine with nothing but each other, one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -21,25 +23,27 @@ pub struct Loaded {
     pub nntp: LoopbackServer,
     backup: Option<LoopbackServer>,
     library: Vec<u8>,
+    article: usize,
     _dir: tempfile::TempDir,
     dest: tempfile::TempDir,
 }
 
 impl Loaded {
     pub async fn new(extra: Vec<Article>) -> Self {
+        Self::sized(extra, ARTICLE, LIBRARY_ARTICLES).await
+    }
+
+    pub async fn sized(extra: Vec<Article>, article: usize, library_articles: usize) -> Self {
         let fixture = Fixture::season();
-        let mut library: Vec<u8> = (0..LIBRARY_ARTICLES * ARTICLE)
-            .map(|i| (i % 251) as u8)
-            .collect();
-        library[..4].copy_from_slice(&[0x1A, 0x45, 0xDF, 0xA3]);
+        let library = media(library_articles * article, 251);
         let mut articles = fixture.articles();
-        articles.extend(post("lib", "Library.2026.mkv", &library, ARTICLE));
+        articles.extend(post("lib", "Library.2026.mkv", &library, article));
         articles.extend(extra);
         let nntp = LoopbackServer::start_impaired(
             articles,
             Impairment {
-                response_delay: Duration::from_millis(20),
-                bandwidth: Some(1_000_000),
+                response_delay: LATENCY,
+                bandwidth: Some(BANDWIDTH),
                 ..Impairment::default()
             },
         )
@@ -50,6 +54,7 @@ impl Loaded {
             nntp,
             backup: None,
             library,
+            article,
             _dir: tempfile::tempdir().unwrap(),
             dest: tempfile::tempdir().unwrap(),
         }
@@ -57,7 +62,7 @@ impl Loaded {
 
     pub async fn with_backup(mut self) -> Self {
         let mut articles = self.fixture.articles();
-        articles.extend(post("lib", "Library.2026.mkv", &self.library, ARTICLE));
+        articles.extend(post("lib", "Library.2026.mkv", &self.library, self.article));
         self.backup = Some(LoopbackServer::start(articles).await.unwrap());
         self
     }
@@ -93,28 +98,28 @@ impl Loaded {
     }
 
     pub async fn engine_reading_ahead(&self, connections: usize, read_ahead: u64) -> Engine {
+        self.engine_configured(connections, |config| config.read_ahead_bytes = read_ahead)
+            .await
+    }
+
+    pub async fn engine_configured(
+        &self,
+        connections: usize,
+        edit: impl FnOnce(&mut EngineConfig),
+    ) -> Engine {
         let mut config =
             EngineConfig::new(self._dir.path().to_path_buf(), self.servers(connections));
-        config.read_ahead_bytes = read_ahead;
+        edit(&mut config);
         Engine::new(config).await.unwrap()
     }
 
     fn library_nzb(&self) -> Vec<u8> {
-        let mut xml = String::from(
-            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
-        );
-        xml.push_str(&format!(
-            "<file poster=\"p\" date=\"{POSTED}\" subject=\"{}\"><groups><group>a.b</group></groups><segments>\n",
-            quoted("Library.2026.mkv", 1, 1).replace('"', "&quot;")
-        ));
-        for part in 0..self.library.len().div_ceil(ARTICLE) {
-            xml.push_str(&format!(
-                "<segment bytes=\"{ARTICLE}\" number=\"{}\">lib-{part}@loopback</segment>\n",
-                part + 1
-            ));
-        }
-        xml.push_str("</segments></file>\n</nzb>\n");
-        xml.into_bytes()
+        single_nzb(
+            "lib",
+            "Library.2026.mkv",
+            self.library.len().div_ceil(self.article),
+            self.article,
+        )
     }
 
     pub async fn start_download(&self, engine: &Engine) {
@@ -165,4 +170,33 @@ pub async fn within<T>(what: &str, work: impl Future<Output = T>) -> T {
 
 pub fn downloading(engine: &Engine) -> bool {
     engine.job("library").unwrap().state == JobState::Downloading
+}
+
+/// One article's delivery on an idle connection of the rig's server.
+pub fn article_time(article: usize) -> Duration {
+    LATENCY + Duration::from_secs_f64(article as f64 / BANDWIDTH as f64)
+}
+
+pub fn media(len: usize, modulus: usize) -> Vec<u8> {
+    let mut data: Vec<u8> = (0..len).map(|i| (i % modulus) as u8).collect();
+    data[..4].copy_from_slice(&[0x1A, 0x45, 0xDF, 0xA3]);
+    data
+}
+
+pub fn single_nzb(prefix: &str, name: &str, parts: usize, article: usize) -> Vec<u8> {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    xml.push_str(&format!(
+        "<file poster=\"p\" date=\"{POSTED}\" subject=\"{}\"><groups><group>a.b</group></groups><segments>\n",
+        quoted(name, 1, 1).replace('"', "&quot;")
+    ));
+    for part in 0..parts {
+        xml.push_str(&format!(
+            "<segment bytes=\"{article}\" number=\"{}\">{prefix}-{part}@loopback</segment>\n",
+            part + 1
+        ));
+    }
+    xml.push_str("</segments></file>\n</nzb>\n");
+    xml.into_bytes()
 }
