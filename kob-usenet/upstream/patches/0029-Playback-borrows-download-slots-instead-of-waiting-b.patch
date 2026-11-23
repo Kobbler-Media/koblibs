@@ -1,0 +1,148 @@
+From 542a1521c2b633b084cb388ec30a9a41d2d2fbb5 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 19:38:42 +1100
+Subject: [PATCH] Playback borrows download slots instead of waiting behind
+ parked background requests
+
+---
+ crates/nntp/src/client.rs    |  2 +-
+ crates/nntp/src/downloads.rs | 66 +++++++++++++++++++++++++++++-------
+ 2 files changed, 54 insertions(+), 14 deletions(-)
+
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index 60cc83ab..27fa24ad 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -1165,7 +1165,7 @@ mod tests {
+                 .unwrap();
+             let own = Downloads::new(4);
+             let held = if scenario == Primary::Saturated {
+-                own.acquire(false, 4).await
++                Some((own.acquire(false, 4).await, own.acquire(true, 1).await))
+             } else {
+                 None
+             };
+diff --git a/crates/nntp/src/downloads.rs b/crates/nntp/src/downloads.rs
+index 6d765a67..a9798644 100644
+--- a/crates/nntp/src/downloads.rs
++++ b/crates/nntp/src/downloads.rs
+@@ -16,6 +16,8 @@ pub struct Downloads {
+     lanes: Mutex<Lanes>,
+ }
+ 
++const BORROW_DIVISOR: usize = 4;
++
+ /// Slots wanted, the reader asking (`0`: none of its own), and where to send the permit.
+ type Waiter = (usize, u64, oneshot::Sender<Permit>);
+ 
+@@ -27,7 +29,8 @@ struct Lanes {
+     background: [VecDeque<Waiter>; RANKS],
+     /// Slots each reader's admitted playback requests hold.
+     held: HashMap<u64, usize>,
+-    /// Slots held beyond a lowered total; released slots pay this off first.
++    /// Slots held beyond the total, by a lowered total or playback borrowing; released
++    /// slots pay this off first.
+     owed: usize,
+ }
+ 
+@@ -55,6 +58,20 @@ impl Lanes {
+                 .is_some_and(|rank| self.background[..=rank].iter().any(|l| !l.is_empty()))
+     }
+ 
++    /// Background requests keep their slots while parked for a connection, so with every
++    /// slot taken a seek would wait for a transfer to finish even with a connection idle.
++    /// Playback may borrow up to a quarter of the total past it; connection limits still hold.
++    const fn fits(&self, playback: bool, weight: usize) -> bool {
++        self.free >= weight
++            || playback && weight - self.free + self.owed <= self.total / BORROW_DIVISOR
++    }
++
++    const fn take(&mut self, weight: usize) {
++        let paid = if weight < self.free { weight } else { self.free };
++        self.free -= paid;
++        self.owed += weight - paid;
++    }
++
+     /// The playback waiter to admit next: the oldest of the reader holding fewest slots.
+     fn next_urgent(&self) -> Option<usize> {
+         self.urgent
+@@ -142,7 +159,7 @@ impl Downloads {
+     pub(crate) fn can_acquire(&self, workload: Workload, weight: usize) -> bool {
+         let lanes = self.lock();
+         let weight = weight.clamp(1, lanes.total.max(1));
+-        !lanes.queued(workload) && lanes.free >= weight
++        !lanes.queued(workload) && lanes.fits(workload.rank().is_none(), weight)
+     }
+ 
+     /// Waits for `weight` slots (capped at the total); `urgent` waiters are served
+@@ -170,8 +187,8 @@ impl Downloads {
+         let rx = {
+             let mut lanes = self.lock();
+             let weight = weight.clamp(1, lanes.total.max(1));
+-            if !lanes.queued(workload) && lanes.free >= weight {
+-                lanes.free -= weight;
++            if !lanes.queued(workload) && lanes.fits(workload.rank().is_none(), weight) {
++                lanes.take(weight);
+                 lanes.hold(reader, weight);
+                 return Some(Permit(Some(Arc::clone(self)), weight, reader));
+             }
+@@ -204,17 +221,21 @@ impl Downloads {
+                     lane.pop_front();
+                 }
+             }
+-            let (lane, at) = match lanes.next_urgent() {
+-                Some(at) => (&mut lanes.urgent, at),
+-                None => match lanes.background.iter_mut().find(|lane| !lane.is_empty()) {
+-                    Some(lane) => (lane, 0),
+-                    None => return,
+-                },
++            let urgent = lanes.next_urgent();
++            let rank = lanes.background.iter().position(|lane| !lane.is_empty());
++            let (at, wanted) = match (urgent, rank) {
++                (Some(at), _) => (at, lanes.urgent[at].0),
++                (None, Some(rank)) => (0, lanes.background[rank][0].0),
++                (None, None) => return,
+             };
+-            match lane.get(at) {
+-                Some(&(next, _, _)) if next <= lanes.free => lanes.free -= next,
+-                _ => return,
++            if !lanes.fits(urgent.is_some(), wanted) {
++                return;
+             }
++            lanes.take(wanted);
++            let lane = match (urgent, rank) {
++                (None, Some(rank)) => &mut lanes.background[rank],
++                _ => &mut lanes.urgent,
++            };
+             let (next, waiter_reader, waiter) = lane.remove(at).expect("index was just checked");
+             lanes.hold(waiter_reader, next);
+             drop(guard);
+@@ -238,6 +259,25 @@ impl Downloads {
+ mod tests {
+     use super::*;
+ 
++    #[tokio::test]
++    async fn playback_borrows_a_quarter_past_a_full_total_and_repays_it_first() {
++        let downloads = Downloads::new(8);
++        let mut queue = Vec::new();
++        for _ in 0..8 {
++            queue.push(downloads.acquire(false, 1).await.unwrap());
++        }
++        let first = downloads.acquire(true, 1).await.unwrap();
++        let second = downloads.acquire(true, 1).await.unwrap();
++        assert!(!downloads.can_acquire(Workload::Stream, 1));
++        assert!(!downloads.can_acquire(Workload::Cache, 1));
++        drop((first, second));
++        assert_eq!(downloads.available_permits(), 0);
++        assert!(downloads.can_acquire(Workload::Stream, 2));
++        assert!(!downloads.can_acquire(Workload::Queue, 1));
++        queue.pop();
++        assert_eq!(downloads.available_permits(), 1);
++    }
++
+     #[tokio::test]
+     async fn background_waiters_are_served_by_rank() {
+         let downloads = Downloads::new(1);
+-- 
+2.56.1
+

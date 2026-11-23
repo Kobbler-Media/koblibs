@@ -4,6 +4,7 @@ mod bound;
 mod cache;
 mod lanes;
 mod rig;
+mod seek;
 mod stall;
 #[allow(dead_code)]
 #[path = "../engine/support.rs"]

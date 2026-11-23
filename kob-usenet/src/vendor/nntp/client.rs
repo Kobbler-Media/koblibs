@@ -1167,7 +1167,7 @@ mod tests {
                 .unwrap();
             let own = Downloads::new(4);
             let held = if scenario == Primary::Saturated {
-                own.acquire(false, 4).await
+                Some((own.acquire(false, 4).await, own.acquire(true, 1).await))
             } else {
                 None
             };

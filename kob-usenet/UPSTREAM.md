@@ -60,8 +60,9 @@ which drives upstream's database-backed queue service.
 | 26 | Hedged requests counted in provider stats | ours |
 | 27 | Coverage for the cache-first bound's second headroom slot and yield | ours, test only |
 | 28 | Extreme NZB segment numbers count as a gap instead of overflowing | ours |
+| 29 | Playback borrows up to a quarter of the download slots instead of waiting behind parked background requests | ours |
 
-Patches 5–28 are candidates to offer upstream.
+Patches 5–29 are candidates to offer upstream.
 
 ## Monthly sync
 
