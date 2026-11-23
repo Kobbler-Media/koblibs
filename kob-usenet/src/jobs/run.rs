@@ -98,7 +98,9 @@ async fn execute(shared: &Shared, spec: &StoredSpec) -> Result<PathBuf, Failure>
                 Next::Plan(plan) => save(shared, spec, plan)?,
                 Next::Raw => go_raw(&job).await?,
                 Next::Nested(_) if nested >= NESTED => {
-                    return Err("The download holds NZBs nested too deep.".to_owned().into());
+                    return Err(Failure::Content(
+                        "The download holds NZBs nested too deep.".to_owned(),
+                    ));
                 }
                 Next::Nested(inner) => {
                     nested += 1;
@@ -183,8 +185,9 @@ fn stored_nzb(shared: &Shared, spec: &StoredSpec) -> Result<Nzb, Failure> {
         .store
         .nzb(&spec.id)
         .map_err(|e| Failure::io("reading the stored NZB", e))?;
-    let xml = nzb::decompress(&raw).map_err(|e| format!("invalid NZB: {e}"))?;
-    Ok(nzb::parse(&xml).map_err(|e| format!("invalid NZB: {e}"))?)
+    let invalid = |e: String| Failure::Content(format!("invalid NZB: {e}"));
+    let xml = nzb::decompress(&raw).map_err(|e| invalid(e.to_string()))?;
+    nzb::parse(&xml).map_err(|e| invalid(e.to_string()))
 }
 
 fn passwords(spec: &StoredSpec, nzb: &Nzb) -> Vec<String> {
@@ -231,16 +234,18 @@ pub fn stored<T>(result: Result<T, crate::Error>) -> Result<T, Failure> {
 
 async fn write(job: &Job<'_>, plan: &Plan) -> Result<Vec<Vec<Range<u64>>>, Failure> {
     let shared = job.shared;
-    let targets: Vec<Target<'_>> = plan
+    let targets = plan
         .outputs
         .iter()
         .enumerate()
-        .map(|(i, o)| Target {
-            file: job.staging.join(&o.path),
-            meta: &o.meta,
-            map: shared.store.map(&job.spec.id, i),
+        .map(|(i, o)| {
+            Ok(Target {
+                file: o.under(job.staging)?,
+                meta: &o.meta,
+                map: shared.store.map(&job.spec.id, i),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<Target<'_>>, Failure>>()?;
     let connections = shared.client.max_connections().max(1);
     let writer = Writer {
         fetcher: job.fetcher,

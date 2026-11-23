@@ -719,9 +719,11 @@ mod tests {
                 date: None,
                 segments: posted
                     .iter()
-                    .map(|a| Segment {
+                    .zip(1..)
+                    .map(|(a, number)| Segment {
                         id: a.message_id.clone(),
                         bytes: 1000,
+                        number,
                     })
                     .collect(),
                 gap: false,
@@ -840,9 +842,11 @@ mod tests {
                 date: None,
                 segments: posted
                     .iter()
-                    .map(|article| Segment {
+                    .zip(1..)
+                    .map(|(article, number)| Segment {
                         id: article.message_id.clone(),
                         bytes: u32::try_from(xml.len()).unwrap(),
+                        number,
                     })
                     .collect(),
                 gap: false,

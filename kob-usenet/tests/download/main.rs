@@ -16,6 +16,7 @@ mod outage;
 #[allow(dead_code)]
 #[path = "../common/par2.rs"]
 mod par2;
+mod par2cmdline;
 mod passwords;
 #[allow(dead_code)]
 #[path = "../common/post.rs"]

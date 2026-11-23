@@ -1,20 +1,20 @@
 mod check;
+mod field;
 pub(crate) mod recovery;
+mod solve;
 mod spool;
 
-use std::collections::BTreeSet;
-use std::fs::{File, OpenOptions};
 use std::io;
 use std::ops::Range;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::jobs::fetch::Fetcher;
 use crate::vendor::nntp;
-use crate::vendor::par2::{self, Id, Reader, Recovery, Repair};
+use crate::vendor::par2::{self, Id, Reader};
 use crate::vendor::queue::nzb::Nzb;
 pub use check::{damaged_slices, proof_damage};
 use recovery::Par2s;
+use solve::solve;
 pub use spool::Spool;
 
 const DEPENDENT_ROWS: usize = 3;
@@ -55,11 +55,6 @@ impl From<par2::Error> for RepairError {
     fn from(error: par2::Error) -> Self {
         match error {
             par2::Error::InsufficientRecovery => Self::Dependent,
-            par2::Error::Memory { required, limit } => Self::Memory {
-                need: 0,
-                required,
-                limit,
-            },
             other => Self::Failed(other.to_string()),
         }
     }
@@ -92,14 +87,6 @@ pub async fn repair(
     if missing.is_empty() {
         return Ok(0);
     }
-    let loaded = missing.len().saturating_mul(slice_size + spool::HEADER + 4);
-    if loaded > memory / 2 {
-        return Err(RepairError::Memory {
-            need: missing.len(),
-            required: loaded.saturating_mul(2),
-            limit: memory,
-        });
-    }
     let volumes = par2.volumes(nzb, slice_size);
     let mut need = missing.len();
     loop {
@@ -112,18 +99,19 @@ pub async fn repair(
                 have,
             });
         }
-        let packets = collected.spool().load(set, slice_size, need)?;
-        let workspace = memory.saturating_sub(loaded);
+        let rows = collected.spool().rows(set, slice_size, need);
         let (back, solved) = {
             let (missing, sources) = (missing.clone(), sources.clone());
             blocking(move || {
+                let spool = collected.spool();
                 let solved = solve(
-                    collected.spool().critical(),
+                    spool.critical(),
                     set,
-                    &packets,
+                    spool,
+                    &rows,
                     &missing,
                     &sources,
-                    workspace,
+                    memory,
                 );
                 (collected, solved)
             })
@@ -133,15 +121,6 @@ pub async fn repair(
         match solved {
             Err(RepairError::Dependent) if need < missing.len() + DEPENDENT_ROWS => {
                 need += 1;
-            }
-            Err(RepairError::Memory {
-                required, limit, ..
-            }) => {
-                return Err(RepairError::Memory {
-                    need: missing.len(),
-                    required,
-                    limit,
-                });
             }
             Err(error) => return Err(error),
             Ok(()) => return Ok(missing.len()),
@@ -215,73 +194,6 @@ fn missing_slices(
         }
     }
     Ok((missing, sources))
-}
-
-fn solve(
-    reader: &Reader,
-    set: Id,
-    packets: &[Vec<u8>],
-    missing: &[usize],
-    sources: &[Source],
-    memory: usize,
-) -> Result<(), RepairError> {
-    let plan = reader.repair_set(set)?;
-    let recovery = packets
-        .iter()
-        .map(|p| Recovery::read(p, set, plan.slice_size()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let inputs = plan
-        .inputs()
-        .ok_or_else(|| RepairError::Failed("slice checksums are incomplete".to_owned()))?;
-    let mut repair = Repair::new(
-        plan.slice_size(),
-        inputs,
-        missing,
-        &recovery,
-        memory,
-        || false,
-    )?;
-    let lost: BTreeSet<usize> = missing.iter().copied().collect();
-    let mut buf = vec![0; plan.slice_size()];
-    for (source, ours) in plan.sources().iter().zip(sources) {
-        if !ours.present {
-            continue;
-        }
-        let file = File::open(&ours.path)?;
-        for index in source.slices.clone().filter(|i| !lost.contains(i)) {
-            let (_, range) = plan.source(index).expect("index lies in its source");
-            let data = &mut buf[..usize::try_from(range.end - range.start).unwrap_or(0)];
-            file.read_exact_at(data, range.start)?;
-            repair.feed(index, data, || false)?;
-        }
-    }
-    let mut touched = BTreeSet::new();
-    for recovered in repair.finish(|| false)? {
-        let (position, range) = plan
-            .source(recovered.index)
-            .expect("recovered index lies in a source");
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&sources[position].path)?;
-        if file.metadata()?.len() != plan.sources()[position].file.length {
-            file.set_len(plan.sources()[position].file.length)?;
-        }
-        file.write_all_at(&recovered.data, range.start)?;
-        touched.insert(position);
-    }
-    for position in touched {
-        let source = &sources[position];
-        if !damaged_slices(&source.path, source.file.length, 0, &[], &source.file.hash)?.is_empty()
-        {
-            return Err(RepairError::Failed(format!(
-                "{} still fails its checksum after repair",
-                source.file.name
-            )));
-        }
-    }
-    Ok(())
 }
 
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> io::Result<T> {

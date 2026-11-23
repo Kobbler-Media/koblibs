@@ -1,0 +1,84 @@
+From 701aa9f191f254a9869a4e2732f29847e22539fa Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 15:06:43 +1100
+Subject: [PATCH] Test the cache-first bound's second headroom slot and yield
+
+From 16 connections work below cache leaves two slots, and it takes no connection
+while a cache request waits, even with pipeline room inside its share.
+---
+ crates/nntp/src/pool.rs | 62 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 62 insertions(+)
+
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index eeefe2e5..18fcf5fb 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -1543,6 +1543,68 @@ mod tests {
+         pool.abort();
+     }
+ 
++    async fn saturate(pool: &Pool, workload: Workload, lane: Option<Lane>, n: usize) -> Vec<Load> {
++        let mut loads = Vec::new();
++        for _ in 0..n {
++            let Ok((_, load, _, _)) = pool.worker(workload, false, None, lane).await else {
++                panic!("a connection is available");
++            };
++            loads.push(load);
++        }
++        loads
++    }
++
++    #[tokio::test]
++    async fn from_sixteen_connections_work_below_cache_leaves_a_second_idle_slot() {
++        for (limit, workload, opened) in [
++            (15, Workload::Queue, 14),
++            (16, Workload::Queue, 14),
++            (16, Workload::Cache, 15),
++            (24, Workload::Queue, 22),
++        ] {
++            let (pool, _server) = loopback_pool(limit).await;
++            let held = saturate(&pool, workload, None, limit + 2).await;
++            assert_eq!(pool.lock().workers.len(), opened, "{limit} {workload:?}");
++            if workload == Workload::Queue && limit >= CACHE_HEADROOM_MIN_CONNECTIONS {
++                let lane = Some(Lane::reader(1));
++                let Ok((_, cache, ahead, _)) = pool.worker(Workload::Cache, false, None, lane).await
++                else {
++                    panic!("the cache reader gets the slot left for it");
++                };
++                assert_eq!(ahead, 0, "its first read waits behind nothing");
++                drop(cache);
++            }
++            drop(held);
++            pool.abort();
++        }
++    }
++
++    #[tokio::test]
++    async fn work_below_cache_yields_while_a_cache_request_waits() {
++        let (pool, _server) = loopback_pool(16).await;
++        let lane = Lane::reader(1);
++        // Two download connections sit under the share a cache reader leaves them, with
++        // pipeline room, so only the waiting cache request holds them back.
++        let queue = saturate(&pool, Workload::Queue, None, 2).await;
++        let cache = saturate(&pool, Workload::Cache, Some(lane), 26).await;
++        let tag = Tag {
++            workload: Workload::Cache,
++            lane: Some(lane),
++            ..Tag::UNTRACKED
++        };
++        let mut waiting = Box::pin(pool.fetch(Command::Body, "waiting@loopback.invalid", &tag));
++        pending(&mut waiting).await;
++        assert_eq!(pool.cache_parked.load(Ordering::Relaxed), 1);
++        let mut below = Box::pin(pool.worker(Workload::Queue, false, None, None));
++        pending(&mut below).await;
++        drop(waiting);
++        drop(cache);
++        let resumed = timeout(STREAM_LINGER * 3, below).await;
++        assert!(matches!(resumed, Ok(Ok(_))), "work below cache resumes");
++        drop(queue);
++        pool.abort();
++    }
++
+     #[test]
+     fn slow_failing_retries_keep_doubling_the_backoff() {
+         let start = Instant::now();

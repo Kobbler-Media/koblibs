@@ -65,10 +65,12 @@ struct Output {
     reserved: bool,
 }
 
+#[derive(Debug)]
 enum Landed {
     Written,
     Damaged,
     Failed(nntp::Error),
+    Disk(io::Error),
 }
 
 #[derive(Default)]
@@ -138,7 +140,10 @@ impl Writer<'_> {
         while !queue.is_empty() || !flying.is_empty() {
             while flying.len() < self.window.max(1)
                 && let Some(&key) = queue.front()
-                && (outputs[key.0].reserved || self.gate.admits(&dest, credit))
+                && (outputs[key.0].reserved
+                    || self
+                        .gate
+                        .admits(&dest, credit, outputs[key.0].pieces[key.1].len()))
             {
                 queue.pop_front();
                 flying.insert(
@@ -171,6 +176,10 @@ impl Writer<'_> {
                             latency += took;
                             answered += 1;
                             progress(tally);
+                        }
+                        Landed::Disk(error) => {
+                            commit(&mut outputs, &mut written)?;
+                            return Err(WriteError::Io(error));
                         }
                         _ if flight.pending > 0 => {}
                         Landed::Damaged => {
@@ -225,12 +234,14 @@ async fn land(fetcher: &Fetcher, lane: Lane, piece: &Piece, file: Arc<File>) -> 
     if !piece.fits(body.offset, body.data.len()) {
         return Landed::Damaged;
     }
-    let data = body.data.slice(piece.src.clone());
-    let at = piece.dest;
+    store(file, body.data.slice(piece.src.clone()), piece.dest).await
+}
+
+async fn store(file: Arc<File>, data: bytes::Bytes, at: u64) -> Landed {
     match tokio::task::spawn_blocking(move || file.write_all_at(&data, at)).await {
         Ok(Ok(())) => Landed::Written,
-        Ok(Err(error)) => Landed::Failed(nntp::Error::Io(error)),
-        Err(error) => Landed::Failed(nntp::Error::Io(io::Error::other(error))),
+        Ok(Err(error)) => Landed::Disk(error),
+        Err(error) => Landed::Disk(io::Error::other(error)),
     }
 }
 
@@ -303,4 +314,19 @@ fn damaged(output: &Output) -> Vec<Range<u64>> {
         .filter(|&(p, _)| output.map.get(p) == Mark::Damaged)
         .map(|(_, piece)| piece.dest..piece.dest + piece.len())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_full_disk_is_a_disk_failure_not_a_provider_failure() {
+        let full = File::options().write(true).open("/dev/full").unwrap();
+        let landed = store(Arc::new(full), bytes::Bytes::from_static(&[1; 4096]), 0).await;
+        assert!(
+            matches!(&landed, Landed::Disk(e) if e.kind() == io::ErrorKind::StorageFull),
+            "{landed:?}"
+        );
+    }
 }

@@ -74,6 +74,7 @@ pub(crate) struct Stats {
     latency: [[AtomicU64; LATENCY_BUCKETS]; WORKLOADS],
     connect_failures: AtomicU64,
     trips: AtomicU64,
+    hedges: AtomicU64,
     /// Last warning and warnings held back since, by reply code (`None`: malformed).
     unexpected: Mutex<HashMap<Option<u16>, (Instant, u64)>>,
 }
@@ -103,6 +104,14 @@ impl Stats {
 
     pub(crate) fn tripped(&self) {
         self.trips.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn hedged(&self) {
+        self.hedges.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn hedges(&self) -> u64 {
+        self.hedges.load(Ordering::Relaxed)
     }
 
     /// `Some(held back)` when an unexpected reply with this code should be logged now.
@@ -180,6 +189,8 @@ pub struct ProviderStats {
     pub connect_failures: u64,
     /// Times the circuit breaker opened.
     pub trips: u64,
+    /// Duplicate requests raced against a slow playback read.
+    pub hedges: u64,
     /// Cooldown left while the circuit is open.
     pub open_for: Option<Duration>,
     /// A connection opened since the provider was (re)configured.

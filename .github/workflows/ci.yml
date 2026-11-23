@@ -86,11 +86,11 @@ jobs:
         working-directory: kob-usenet
     steps:
       - uses: actions/checkout@v7
-      - name: System build deps (cmake + C++ for rapidyenc, unrar + 7-Zip for extraction tests)
+      - name: System build deps (cmake + C++ for rapidyenc, unrar + 7-Zip + par2 for extraction and repair tests)
         run: |
           sudo add-apt-repository -y multiverse
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake g++ unrar 7zip
+          sudo apt-get install -y --no-install-recommends cmake g++ unrar 7zip par2
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99"

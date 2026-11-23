@@ -72,6 +72,7 @@ impl Unpack<'_> {
             candidates.push(None);
         }
         let mut refused = String::new();
+        let mut maybe_damaged = false;
         for &password in &candidates {
             let into = scan::extracting(parent);
             fs::create_dir(&into)
@@ -92,6 +93,11 @@ impl Unpack<'_> {
                     refused = reason;
                     None
                 }
+                Attempt::DamagedOrWrongPassword(reason) => {
+                    refused = reason;
+                    maybe_damaged = true;
+                    None
+                }
                 Attempt::Failed(failure) => Some(Err(failure)),
             };
             let _ = fs::remove_dir_all(&into);
@@ -100,6 +106,11 @@ impl Unpack<'_> {
             }
         }
         let given = candidates.last().copied().flatten();
+        if maybe_damaged && given.is_some() {
+            return Err(Failure::Content(format!(
+                "{refused} failed its checksum: the archive is damaged or the password is wrong"
+            )));
+        }
         Err(Failure::Content(crate::jobs::password_failure(
             given, &refused,
         )))

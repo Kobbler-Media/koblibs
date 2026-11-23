@@ -1,0 +1,108 @@
+From 774a26272c61f9ce3bb3e4245b2c3885ba3c4fdf Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 15:01:36 +1100
+Subject: [PATCH] NZB segments keep their part number
+
+The parser ordered segments by number and then dropped it, so a caller could
+not tell which part a listed segment is once an entry is missing. Whole-volume
+downloads need it to place pieces and leave unlisted ones for PAR2.
+---
+ crates/queue/src/import/inspect.rs | 8 ++++++--
+ crates/queue/src/nzb.rs            | 9 +++++++--
+ crates/queue/tests/nzb.rs          | 5 +++--
+ 3 files changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/crates/queue/src/import/inspect.rs b/crates/queue/src/import/inspect.rs
+index 13af8063..f8f2790e 100644
+--- a/crates/queue/src/import/inspect.rs
++++ b/crates/queue/src/import/inspect.rs
+@@ -719,9 +719,11 @@ mod tests {
+                 date: None,
+                 segments: posted
+                     .iter()
+-                    .map(|a| Segment {
++                    .zip(1..)
++                    .map(|(a, number)| Segment {
+                         id: a.message_id.clone(),
+                         bytes: 1000,
++                        number,
+                     })
+                     .collect(),
+                 gap: false,
+@@ -838,9 +840,11 @@ mod tests {
+                 date: None,
+                 segments: posted
+                     .iter()
+-                    .map(|article| Segment {
++                    .zip(1..)
++                    .map(|(article, number)| Segment {
+                         id: article.message_id.clone(),
+                         bytes: u32::try_from(xml.len()).unwrap(),
++                        number,
+                     })
+                     .collect(),
+                 gap: false,
+diff --git a/crates/queue/src/nzb.rs b/crates/queue/src/nzb.rs
+index a850bf4d..42ed29b2 100644
+--- a/crates/queue/src/nzb.rs
++++ b/crates/queue/src/nzb.rs
+@@ -35,7 +35,7 @@ pub struct Nzb {
+     pub files: Vec<File>,
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct File {
+     pub subject: String,
+     /// Posting time in Unix seconds, when the NZB carries a valid one.
+@@ -51,6 +51,8 @@ pub struct Segment {
+     /// Message-id without angle brackets.
+     pub id: String,
+     pub bytes: u32,
++    /// The NZB's part number, which places the segment in the file across any gaps.
++    pub number: i64,
+ }
+ 
+ impl Nzb {
+@@ -187,6 +189,7 @@ pub fn parse(xml: &[u8]) -> Result<Nzb, Error> {
+                         segments.entry(number).or_insert_with(|| Segment {
+                             id: id.to_owned(),
+                             bytes,
++                            number,
+                         });
+                     }
+                 }
+@@ -300,9 +303,11 @@ mod tests {
+                     gap: false,
+                     segments: ids
+                         .iter()
+-                        .map(|id| Segment {
++                        .zip(1..)
++                        .map(|(id, number)| Segment {
+                             id: (*id).into(),
+                             bytes: 1,
++                            number,
+                         })
+                         .collect(),
+                 })
+diff --git a/crates/queue/tests/nzb.rs b/crates/queue/tests/nzb.rs
+index 732948a1..fdd960bb 100644
+--- a/crates/queue/tests/nzb.rs
++++ b/crates/queue/tests/nzb.rs
+@@ -43,13 +43,14 @@ fn accepts_what_sabnzbd_accepts() {
+         (video.name(), video.date),
+         ("video.mkv", Some(1_700_000_000))
+     );
+-    let seg = |id: &str, bytes| Segment {
++    let seg = |id: &str, bytes, number| Segment {
+         id: id.to_owned(),
+         bytes,
++        number,
+     };
+     assert_eq!(
+         video.segments,
+-        [seg("a@x", 100), seg("c@x", 300), seg("g@x", 10)]
++        [seg("a@x", 100, 1), seg("c@x", 300, 3), seg("g@x", 10, 7)]
+     );
+     assert_eq!(video.bytes(), 410);
+     assert!(video.gap && !unknown.gap);

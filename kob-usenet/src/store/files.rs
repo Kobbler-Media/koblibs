@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -9,7 +10,11 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!("{TMP}{}", uuid::Uuid::new_v4()));
     let result = (|| {
-        let mut file = fs::File::create(&tmp)?;
+        let mut file = fs::File::options()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&tmp, path)?;

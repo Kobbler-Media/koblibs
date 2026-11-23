@@ -43,13 +43,14 @@ fn accepts_what_sabnzbd_accepts() {
         (video.name(), video.date),
         ("video.mkv", Some(1_700_000_000))
     );
-    let seg = |id: &str, bytes| Segment {
+    let seg = |id: &str, bytes, number| Segment {
         id: id.to_owned(),
         bytes,
+        number,
     };
     assert_eq!(
         video.segments,
-        [seg("a@x", 100), seg("c@x", 300), seg("g@x", 10)]
+        [seg("a@x", 100, 1), seg("c@x", 300, 3), seg("g@x", 10, 7)]
     );
     assert_eq!(video.bytes(), 410);
     assert!(video.gap && !unknown.gap);
@@ -91,5 +92,26 @@ fn sample_nzbs_parse() {
             }
             Err(e) => println!("#{i}: {e}"),
         }
+    }
+}
+
+#[test]
+fn extreme_segment_numbers_count_as_a_gap_without_overflowing() {
+    for (low, high, gap) in [
+        (i64::MIN, i64::MAX, true),
+        (-1, i64::MAX, true),
+        (i64::MIN, 1, true),
+        (i64::MAX - 1, i64::MAX, true),
+        (-1, 0, false),
+    ] {
+        let xml = format!(
+            r#"<nzb><file subject="s"><segments>
+            <segment bytes="1" number="{low}">a@x</segment>
+            <segment bytes="1" number="{high}">b@x</segment>
+            </segments></file></nzb>"#
+        );
+        let nzb = parse(xml.as_bytes()).unwrap();
+        assert_eq!(nzb.files[0].gap, gap, "{low}..{high}");
+        assert_eq!(nzb.files[0].segments.len(), 2);
     }
 }

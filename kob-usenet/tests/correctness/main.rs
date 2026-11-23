@@ -4,8 +4,12 @@ mod archives;
 mod benchmark;
 mod damage;
 mod encrypted;
+mod gaps;
 mod geometry;
 mod harness;
+#[allow(dead_code)]
+#[path = "../download/support.rs"]
+mod jobs;
 #[allow(dead_code)]
 #[path = "../common/nzb.rs"]
 mod nzb;
@@ -22,4 +26,5 @@ mod proxy;
 #[path = "../common/rar.rs"]
 mod rar;
 mod tiers;
+mod tool_output;
 mod warming;

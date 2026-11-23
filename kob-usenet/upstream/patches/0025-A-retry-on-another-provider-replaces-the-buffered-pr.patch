@@ -1,0 +1,61 @@
+From d942ccb28a9df4f759d94c66a6006ac8b8f0864a Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 15:03:44 +1100
+Subject: [PATCH] A retry on another provider replaces the buffered prefix
+
+Streamed bytes of a head fetch were kept when a retry resent from offset 0, so
+the prefix of a copy that failed its CRC could be served in a non-strict read,
+spliced to the replacement's tail. A chunk now replaces what was buffered from
+its offset on.
+---
+ crates/stream/src/lib.rs | 30 ++++++++++++++++++++++--------
+ 1 file changed, 22 insertions(+), 8 deletions(-)
+
+diff --git a/crates/stream/src/lib.rs b/crates/stream/src/lib.rs
+index 607c617e..b4b05a46 100644
+--- a/crates/stream/src/lib.rs
++++ b/crates/stream/src/lib.rs
+@@ -309,14 +309,11 @@ impl Partial {
+     /// Bytes received so far.
+     fn poll(&mut self, cx: &mut Context<'_>) -> &[u8] {
+         while let Poll::Ready(Some((at, chunk))) = self.rx.poll_recv(cx) {
+-            // A retry on another provider resends from offset 0; keep only new bytes.
+-            if let Some(new) = self
+-                .data
+-                .len()
+-                .checked_sub(at)
+-                .and_then(|seen| chunk.get(seen..))
+-            {
+-                self.data.extend_from_slice(new);
++            // A retry on another provider resends from offset 0: the copy that failed
++            // may differ, so none of its unserved bytes may survive.
++            if at <= self.data.len() {
++                self.data.truncate(at);
++                self.data.extend_from_slice(&chunk);
+             }
+         }
+         &self.data
+@@ -1320,6 +1317,23 @@ async fn fetch(
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn a_retry_on_another_provider_replaces_the_buffered_prefix() {
++        for (first, retry) in [(&b"AAAA"[..], &b"BBBBBB"[..]), (b"AAAA", b"BB")] {
++            let (tx, rx) = mpsc::unbounded_channel();
++            let mut partial = Partial {
++                rx,
++                data: Vec::new(),
++                wanted: Arc::new(AtomicBool::new(true)),
++            };
++            let mut cx = Context::from_waker(std::task::Waker::noop());
++            tx.send((0, first.to_vec())).unwrap();
++            assert_eq!(partial.poll(&mut cx), first);
++            tx.send((0, retry.to_vec())).unwrap();
++            assert_eq!(partial.poll(&mut cx), retry);
++        }
++    }
++
+     #[test]
+     fn fills_whole_ts_packets_inside_the_gap_only() {
+         assert_eq!(Filler::for_name("a.MKV").fill(5, 400), vec![0; 400]);

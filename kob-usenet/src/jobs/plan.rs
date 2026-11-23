@@ -8,6 +8,7 @@ use crate::repair::recovery::Par2s;
 use crate::vendor::queue::import::{
     self, Error as ImportError, Imported, NameSource, Progress, Rules,
 };
+use crate::vendor::queue::names;
 use crate::vendor::queue::nzb::Nzb;
 
 pub enum Next {
@@ -29,13 +30,14 @@ pub async fn direct(
         concurrency: ImportMode::Download.concurrency(),
         ..Rules::default()
     };
+    let release = names::sanitize(name).unwrap_or_else(|| "release".to_owned());
     let mut tried = 0;
     let imported = loop {
         let password = passwords.get(tried).map(String::as_str);
         let imported = import::import(
             &fetcher.client,
             nzb,
-            name,
+            &release,
             "",
             &rules,
             password,
@@ -54,10 +56,8 @@ pub async fn direct(
         Ok(Imported::Files { outputs, .. }) if outputs.iter().any(|o| o.meta.encrypted()) => {
             Next::Raw
         }
-        Ok(Imported::Files { outputs, .. }) => Next::Plan(Plan {
-            raw: false,
-            probed: false,
-            outputs: outputs
+        Ok(Imported::Files { outputs, .. }) => {
+            let outputs: Vec<Planned> = outputs
                 .into_iter()
                 .map(|o| Planned {
                     path: o.path.join("/"),
@@ -65,8 +65,16 @@ pub async fn direct(
                     crc32: o.crc32,
                     meta: o.meta,
                 })
-                .collect(),
-        }),
+                .collect();
+            if let Err(failure) = outputs.iter().try_for_each(Planned::contained) {
+                return Next::Fail(failure);
+            }
+            Next::Plan(Plan {
+                raw: false,
+                probed: false,
+                outputs,
+            })
+        }
         Ok(Imported::Nzb(inner)) => Next::Nested(inner),
         Err(ImportError::Password(reason)) => {
             Next::Fail(Failure::Content(password_failure(password, &reason)))

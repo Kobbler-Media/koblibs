@@ -1,0 +1,57 @@
+From 8e2b1235a0c58b36583f44f8b6fd90e1221e8c6e Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 15:12:59 +1100
+Subject: [PATCH] Extreme NZB segment numbers count as a gap instead of
+ overflowing
+
+The gap check subtracted two parsed i64 part numbers, so a hostile NZB panicked
+in checked builds and wrapped in release ones.
+---
+ crates/queue/src/nzb.rs   |  4 +++-
+ crates/queue/tests/nzb.rs | 21 +++++++++++++++++++++
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/crates/queue/src/nzb.rs b/crates/queue/src/nzb.rs
+index 42ed29b2..ec80017e 100644
+--- a/crates/queue/src/nzb.rs
++++ b/crates/queue/src/nzb.rs
+@@ -206,7 +206,9 @@ pub fn parse(xml: &[u8]) -> Result<Nzb, Error> {
+                             (segments.keys().next(), segments.keys().next_back())
+                     {
+                         f.gap = first > 1
+-                            || last - first >= i64::try_from(segments.len()).unwrap_or(i64::MAX);
++                            || last.checked_sub(first).is_none_or(|span| {
++                                span >= i64::try_from(segments.len()).unwrap_or(i64::MAX)
++                            });
+                         f.segments = segments.into_values().collect();
+                         nzb.files.push(f);
+                     }
+diff --git a/crates/queue/tests/nzb.rs b/crates/queue/tests/nzb.rs
+index fdd960bb..ed150076 100644
+--- a/crates/queue/tests/nzb.rs
++++ b/crates/queue/tests/nzb.rs
+@@ -94,3 +94,24 @@ fn sample_nzbs_parse() {
+         }
+     }
+ }
++
++#[test]
++fn extreme_segment_numbers_count_as_a_gap_without_overflowing() {
++    for (low, high, gap) in [
++        (i64::MIN, i64::MAX, true),
++        (-1, i64::MAX, true),
++        (i64::MIN, 1, true),
++        (i64::MAX - 1, i64::MAX, true),
++        (-1, 0, false),
++    ] {
++        let xml = format!(
++            r#"<nzb><file subject="s"><segments>
++            <segment bytes="1" number="{low}">a@x</segment>
++            <segment bytes="1" number="{high}">b@x</segment>
++            </segments></file></nzb>"#
++        );
++        let nzb = parse(xml.as_bytes()).unwrap();
++        assert_eq!(nzb.files[0].gap, gap, "{low}..{high}");
++        assert_eq!(nzb.files[0].segments.len(), 2);
++    }
++}

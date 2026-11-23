@@ -35,6 +35,9 @@ enum Broken {
     DiskFull,
     NotExecutable,
     NoRoomToUnpack,
+    Killed,
+    UnrarExits(u8),
+    SevenZipOutOfMemory,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -44,11 +47,17 @@ async fn unpack_failures_from_the_machine_requeue_as_infrastructure() {
         Broken::DiskFull,
         Broken::NotExecutable,
         Broken::NoRoomToUnpack,
+        Broken::Killed,
+        Broken::UnrarExits(5),
+        Broken::UnrarExits(8),
+        Broken::UnrarExits(9),
+        Broken::SevenZipOutOfMemory,
     ] {
         let rar = Posted::new("rar", "Release.rar", RAR4.to_vec());
         let rig = Rig::new(rar.articles.clone()).await;
         let tools = tempfile::tempdir().unwrap();
-        let tool = match broken {
+        let mut unrar = "/nonexistent/unrar".into();
+        let sevenzip = match broken {
             Broken::Stalls => script(tools.path(), "7z", "exec sleep 60"),
             Broken::DiskFull => script(
                 tools.path(),
@@ -61,14 +70,20 @@ async fn unpack_failures_from_the_machine_requeue_as_infrastructure() {
                 path
             }
             Broken::NoRoomToUnpack => "7z".into(),
+            Broken::Killed => script(tools.path(), "7z", "echo 'Extracting x'; kill -9 $$"),
+            Broken::UnrarExits(code) => {
+                unrar = script(tools.path(), "unrar", &format!("exit {code}"));
+                "/nonexistent/7z".into()
+            }
+            Broken::SevenZipOutOfMemory => script(tools.path(), "7z", "exit 8"),
         };
         if let Broken::NoRoomToUnpack = broken {
             rig.space.0.store((1 << 20) + 1000, Ordering::SeqCst);
         }
         let engine = rig
             .engine_with(|c| {
-                c.download.unrar = "/nonexistent/unrar".into();
-                c.download.sevenzip = tool.clone();
+                c.download.unrar = unrar.clone();
+                c.download.sevenzip = sevenzip.clone();
                 c.download.unpack_stall = Duration::from_millis(300);
                 c.download.retry_after = Duration::from_secs(60);
             })

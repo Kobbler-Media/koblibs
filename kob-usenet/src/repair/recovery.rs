@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 use futures_util::{StreamExt, stream};
 use regex::Regex;
 
-use crate::jobs::fetch::{Fetcher, Outcome};
+use crate::jobs::fetch::{Fetcher, First, Outcome};
 use crate::repair::spool::{HEADER, MAGIC, RECOVERY, Spool};
 use crate::vendor::nntp::{self, BodyExpectation};
 use crate::vendor::par2::Id;
@@ -89,11 +89,13 @@ impl Par2s {
             let file = &nzb.files[index];
             let named = names::classify(file.name()) == Kind::Par2;
             let content = match answer? {
-                Outcome::Body(body) if body.data.starts_with(MAGIC) => Some(Content {
-                    file_size: body.file_size,
-                    packet: first_recovery(&body.data),
-                    whole: body.data.len() as u64 >= body.file_size,
-                }),
+                First::Listed(body) | First::Unproven(body) if body.data.starts_with(MAGIC) => {
+                    Some(Content {
+                        file_size: body.file_size,
+                        packet: first_recovery(&body.data),
+                        whole: body.data.len() as u64 >= body.file_size,
+                    })
+                }
                 _ if named => None,
                 _ => continue,
             };

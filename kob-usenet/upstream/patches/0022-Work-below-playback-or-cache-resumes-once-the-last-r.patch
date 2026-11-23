@@ -1,0 +1,162 @@
+From 744911fdec2147c7a8aef262b0bd5799f18a551a Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 14:48:01 +1100
+Subject: [PATCH] Work below playback or cache resumes once the last reader
+ leaves
+
+A playback or cache request's presence bounds the work below it, and that work
+parks with no timer while the request is present. Leaving never woke it: when
+the last request's connection release woke parked work before the presence
+dropped, the work saw playback still active and re-parked until something
+unrelated woke it, and a playback request that gave up while parked left work
+it starved parked for good. The presence now wakes waiters as it leaves, so
+they wait out the linger on a timer, and a parked playback request wakes them
+when it stops waiting.
+---
+ crates/nntp/src/pool.rs | 101 ++++++++++++++++++++++++++++++++++------
+ 1 file changed, 87 insertions(+), 14 deletions(-)
+
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index cb898a4b..93b4365e 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -642,8 +642,8 @@ impl Pool {
+         // Shared by retries; only admission waits spend it, not transfers.
+         let mut budget = self.stream_wait;
+         let _present = match tag.workload {
+-            Workload::Stream => Some(Present::start(&self.state, false)),
+-            Workload::Cache => Some(Present::start(&self.state, true)),
++            Workload::Stream => Some(Present::start(self, false)),
++            Workload::Cache => Some(Present::start(self, true)),
+             _ => None,
+         };
+         let lane = if stream {
+@@ -669,7 +669,7 @@ impl Pool {
+             .ok_or(Failure::Request(Error::Closed))?;
+             tag.step(Step::Permitted { provider });
+             let parked = match tag.workload {
+-                Workload::Stream => Some(Load::acquire(&self.stream_parked)),
++                Workload::Stream => Some(Load::watched(&self.stream_parked, &self.changed)),
+                 Workload::Cache => Some(Load::watched(&self.cache_parked, &self.changed)),
+                 _ => None,
+             };
+@@ -1174,28 +1174,35 @@ impl Presence {
+     }
+ }
+ 
+-/// Counts one playback (or, with `.1`, cache) request in its [`Presence`].
+-struct Present(Arc<Mutex<State>>, bool);
++/// Counts one playback (or cache) request in its [`Presence`].
++struct Present {
++    state: Arc<Mutex<State>>,
++    changed: Arc<Notify>,
++    cache: bool,
++}
+ 
+ impl Present {
+-    fn start(state: &Arc<Mutex<State>>, cache: bool) -> Self {
+-        state
+-            .lock()
+-            .unwrap_or_else(PoisonError::into_inner)
+-            .presence(cache)
+-            .requests += 1;
+-        Self(Arc::clone(state), cache)
++    fn start(pool: &Pool, cache: bool) -> Self {
++        pool.lock().presence(cache).requests += 1;
++        Self {
++            state: Arc::clone(&pool.state),
++            changed: Arc::clone(&pool.changed),
++            cache,
++        }
+     }
+ }
+ 
+ impl Drop for Present {
+     fn drop(&mut self) {
+         let until = Instant::now() + STREAM_LINGER;
+-        self.0
++        self.state
+             .lock()
+             .unwrap_or_else(PoisonError::into_inner)
+-            .presence(self.1)
++            .presence(self.cache)
+             .leave(until);
++        // Work below parked while this request was present; from now on it waits out the
++        // linger on a timer, but only if it wakes to see it.
++        self.changed.notify_waiters();
+     }
+ }
+ 
+@@ -1465,6 +1472,72 @@ mod tests {
+         pool.abort();
+     }
+ 
++    async fn loopback_pool(max_connections: usize) -> (Pool, infinidysk_testkit::LoopbackServer) {
++        let server = infinidysk_testkit::LoopbackServer::start(Vec::new())
++            .await
++            .unwrap();
++        let endpoint = Endpoint::new(
++            "127.0.0.1",
++            server.addr().port(),
++            crate::TlsMode::Plain,
++            None,
++            Duration::from_secs(5),
++        )
++        .unwrap();
++        let config = PoolConfig {
++            max_connections,
++            pipeline_depth: 2,
++            idle_timeout: Duration::from_secs(60),
++            min_connections: 0,
++        };
++        let pool = Pool::new(endpoint, config, Downloads::new(16)).unwrap();
++        (pool, server)
++    }
++
++    async fn pending<F: Future + Unpin>(future: &mut F) {
++        assert!(
++            poll_fn(|cx| Poll::Ready(Pin::new(&mut *future).poll(cx)))
++                .await
++                .is_pending()
++        );
++    }
++
++    #[tokio::test]
++    async fn work_below_playback_and_cache_resumes_once_both_leave() {
++        let (pool, _server) = loopback_pool(4).await;
++        let stream = Present::start(&pool, false);
++        let cache = Present::start(&pool, true);
++        let mut queued = Box::pin(pool.worker(Workload::Queue, false, None, None));
++        pending(&mut queued).await;
++        drop(stream);
++        drop(cache);
++        let resumed = timeout(STREAM_LINGER * 3, queued).await;
++        assert!(matches!(resumed, Ok(Ok(_))), "background work stayed parked");
++        pool.abort();
++    }
++
++    #[tokio::test]
++    async fn background_work_resumes_when_a_parked_playback_request_gives_up() {
++        let (pool, _server) = loopback_pool(2).await;
++        let mut held = Vec::new();
++        for _ in 0..2 {
++            let Ok((_, load, _, _)) = pool.worker(Workload::Queue, false, None, None).await else {
++                panic!("a connection opens");
++            };
++            held.push(load);
++        }
++        let mut playback = Box::pin(pool.body("parked@loopback.invalid"));
++        pending(&mut playback).await;
++        assert_eq!(pool.stream_parked.load(Ordering::Relaxed), 1);
++        let mut queued = Box::pin(pool.worker(Workload::Queue, false, None, None));
++        pending(&mut queued).await;
++        drop(playback);
++        let resumed = timeout(Duration::from_secs(1), queued).await;
++        assert!(matches!(resumed, Ok(Ok(_))), "background work stayed parked");
++        drop(held);
++        pool.abort();
++    }
++
+     #[test]
+     fn slow_failing_retries_keep_doubling_the_backoff() {
+         let start = Instant::now();

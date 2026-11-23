@@ -16,21 +16,47 @@ const DAY: u64 = 24 * 60 * 60;
 
 pub struct Accounts {
     usage: Mutex<HashMap<String, Arc<Usage>>>,
-    pools: Mutex<HashMap<String, Built>>,
+    registry: Mutex<Registry>,
     downloads: Arc<Downloads>,
+}
+
+#[derive(Default)]
+struct Registry {
+    pools: HashMap<String, Built>,
+    accounts: HashMap<String, Account>,
 }
 
 struct Built {
     server: ServerConfig,
     shape: (usize, usize, Duration),
     pool: Pool,
-    account: Account,
 }
 
 #[derive(Clone)]
 struct Account {
+    connections: usize,
     permits: Arc<Semaphore>,
     owed: Arc<AtomicUsize>,
+}
+
+impl Account {
+    fn new(connections: usize) -> Self {
+        Self {
+            connections,
+            permits: Arc::new(Semaphore::new(connections)),
+            owed: Arc::default(),
+        }
+    }
+
+    // Pools, their open connections and a pending reclaim all hold the semaphore.
+    fn in_use(&self) -> bool {
+        Arc::strong_count(&self.permits) > 1
+    }
+
+    fn set_connections(&mut self, connections: usize) {
+        resize(self, self.connections, connections);
+        self.connections = connections;
+    }
 }
 
 pub struct Shape {
@@ -51,7 +77,7 @@ impl Accounts {
             .collect();
         Self {
             usage: Mutex::new(usage),
-            pools: Mutex::default(),
+            registry: Mutex::default(),
             downloads: Downloads::new(1),
         }
     }
@@ -92,7 +118,7 @@ impl Accounts {
             .map(|s| s.connections)
             .sum();
         self.downloads.resize((total * shape.pipeline_depth).max(1));
-        let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
         let providers = usable
             .iter()
             .map(|&server| {
@@ -101,7 +127,7 @@ impl Accounts {
                 } else {
                     0
                 };
-                let pool = self.pool(&mut pools, server, shape, warm)?;
+                let pool = self.pool(&mut registry, server, shape, warm)?;
                 Ok(Provider {
                     pool,
                     key: server.id.clone(),
@@ -111,31 +137,34 @@ impl Accounts {
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        pools.retain(|id, _| usable.iter().any(|s| &s.id == id));
+        let listed = |id: &String| usable.iter().any(|s| &s.id == id);
+        registry.pools.retain(|id, _| listed(id));
+        registry
+            .accounts
+            .retain(|id, account| listed(id) || account.in_use());
         Ok(providers)
     }
 
     fn pool(
         &self,
-        pools: &mut HashMap<String, Built>,
+        registry: &mut Registry,
         server: &ServerConfig,
         shape: &Shape,
         warm: usize,
     ) -> Result<Pool, Error> {
         let wanted = (shape.pipeline_depth, warm, shape.timeout);
-        let account = match pools.get(&server.id) {
-            Some(built) if built.shape == wanted && same_connection(&built.server, server) => {
-                return Ok(built.pool.clone());
-            }
-            Some(built) => {
-                resize(&built.account, built.server.connections, server.connections);
-                built.account.clone()
-            }
-            None => Account {
-                permits: Arc::new(Semaphore::new(server.connections)),
-                owed: Arc::default(),
-            },
-        };
+        if let Some(built) = registry.pools.get(&server.id)
+            && built.shape == wanted
+            && same_connection(&built.server, server)
+        {
+            return Ok(built.pool.clone());
+        }
+        let account = registry
+            .accounts
+            .entry(server.id.clone())
+            .and_modify(|account| account.set_connections(server.connections))
+            .or_insert_with(|| Account::new(server.connections));
+        let permits = Arc::clone(&account.permits);
         let fail = |source| Error::Server {
             server: server.id.clone(),
             source,
@@ -161,18 +190,17 @@ impl Accounts {
             Arc::clone(&self.downloads),
         )
         .map_err(fail)?
-        .with_account(Arc::clone(&account.permits));
+        .with_account(permits);
         let pool = match server.retention_days {
             Some(days) => pool.with_retention(Duration::from_secs(u64::from(days) * DAY)),
             None => pool,
         };
-        pools.insert(
+        registry.pools.insert(
             server.id.clone(),
             Built {
                 server: server.clone(),
                 shape: wanted,
                 pool: pool.clone(),
-                account,
             },
         );
         Ok(pool)

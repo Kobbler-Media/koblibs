@@ -75,7 +75,14 @@ async fn lost_staging_is_downloaded_again_instead_of_trusting_the_segment_map() 
     while rig.nntp.open_connections() > 0 {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    std::fs::remove_dir_all(&staging).unwrap();
+    // Dropping an engine aborts its job without waiting, so a blocking write can still be
+    // removing its own temporary file during this walk.
+    while staging.exists() {
+        match std::fs::remove_dir_all(&staging) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => panic!("{e}"),
+            _ => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
 
     let engine = rig.engine().await;
     let dir = completed(&finish(&engine, &id).await);

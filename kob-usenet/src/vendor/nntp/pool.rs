@@ -642,8 +642,8 @@ impl Pool {
         // Shared by retries; only admission waits spend it, not transfers.
         let mut budget = self.stream_wait;
         let _present = match tag.workload {
-            Workload::Stream => Some(Present::start(&self.state, false)),
-            Workload::Cache => Some(Present::start(&self.state, true)),
+            Workload::Stream => Some(Present::start(self, false)),
+            Workload::Cache => Some(Present::start(self, true)),
             _ => None,
         };
         let lane = if stream {
@@ -669,7 +669,7 @@ impl Pool {
             .ok_or(Failure::Request(Error::Closed))?;
             tag.step(Step::Permitted { provider });
             let parked = match tag.workload {
-                Workload::Stream => Some(Load::acquire(&self.stream_parked)),
+                Workload::Stream => Some(Load::watched(&self.stream_parked, &self.changed)),
                 Workload::Cache => Some(Load::watched(&self.cache_parked, &self.changed)),
                 _ => None,
             };
@@ -698,6 +698,11 @@ impl Pool {
                 _warm: (tag.workload == Workload::Warm).then(|| Load::acquire(&self.warm_busy)),
             };
             drop(stream_waiting);
+            if tag.fresh
+                && let Some(stats) = &tag.stats
+            {
+                stats.hedged();
+            }
             let request = Request {
                 command,
                 message_id: message_id.to_owned(),
@@ -1168,28 +1173,35 @@ impl Presence {
     }
 }
 
-/// Counts one playback (or, with `.1`, cache) request in its [`Presence`].
-struct Present(Arc<Mutex<State>>, bool);
+/// Counts one playback (or cache) request in its [`Presence`].
+struct Present {
+    state: Arc<Mutex<State>>,
+    changed: Arc<Notify>,
+    cache: bool,
+}
 
 impl Present {
-    fn start(state: &Arc<Mutex<State>>, cache: bool) -> Self {
-        state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .presence(cache)
-            .requests += 1;
-        Self(Arc::clone(state), cache)
+    fn start(pool: &Pool, cache: bool) -> Self {
+        pool.lock().presence(cache).requests += 1;
+        Self {
+            state: Arc::clone(&pool.state),
+            changed: Arc::clone(&pool.changed),
+            cache,
+        }
     }
 }
 
 impl Drop for Present {
     fn drop(&mut self) {
         let until = Instant::now() + STREAM_LINGER;
-        self.0
+        self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .presence(self.1)
+            .presence(self.cache)
             .leave(until);
+        // Work below parked while this request was present; from now on it waits out the
+        // linger on a timer, but only if it wakes to see it.
+        self.changed.notify_waiters();
     }
 }
 
@@ -1458,6 +1470,143 @@ mod tests {
         assert_eq!(reused, connection);
         assert_eq!(server.peak_connections(), 1);
         drop(load);
+        pool.abort();
+    }
+
+    async fn loopback_pool(
+        max_connections: usize,
+    ) -> (Pool, crate::vendor::testkit::LoopbackServer) {
+        let server = crate::vendor::testkit::LoopbackServer::start(Vec::new())
+            .await
+            .unwrap();
+        let endpoint = Endpoint::new(
+            "127.0.0.1",
+            server.addr().port(),
+            crate::vendor::nntp::TlsMode::Plain,
+            None,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let config = PoolConfig {
+            max_connections,
+            pipeline_depth: 2,
+            idle_timeout: Duration::from_secs(60),
+            min_connections: 0,
+        };
+        let pool = Pool::new(endpoint, config, Downloads::new(16)).unwrap();
+        (pool, server)
+    }
+
+    async fn pending<F: Future + Unpin>(future: &mut F) {
+        assert!(
+            poll_fn(|cx| Poll::Ready(Pin::new(&mut *future).poll(cx)))
+                .await
+                .is_pending()
+        );
+    }
+
+    #[tokio::test]
+    async fn work_below_playback_and_cache_resumes_once_both_leave() {
+        let (pool, _server) = loopback_pool(4).await;
+        let stream = Present::start(&pool, false);
+        let cache = Present::start(&pool, true);
+        let mut queued = Box::pin(pool.worker(Workload::Queue, false, None, None));
+        pending(&mut queued).await;
+        drop(stream);
+        drop(cache);
+        let resumed = timeout(STREAM_LINGER * 3, queued).await;
+        assert!(
+            matches!(resumed, Ok(Ok(_))),
+            "background work stayed parked"
+        );
+        pool.abort();
+    }
+
+    #[tokio::test]
+    async fn background_work_resumes_when_a_parked_playback_request_gives_up() {
+        let (pool, _server) = loopback_pool(2).await;
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let Ok((_, load, _, _)) = pool.worker(Workload::Queue, false, None, None).await else {
+                panic!("a connection opens");
+            };
+            held.push(load);
+        }
+        let mut playback = Box::pin(pool.body("parked@loopback.invalid"));
+        pending(&mut playback).await;
+        assert_eq!(pool.stream_parked.load(Ordering::Relaxed), 1);
+        let mut queued = Box::pin(pool.worker(Workload::Queue, false, None, None));
+        pending(&mut queued).await;
+        drop(playback);
+        let resumed = timeout(Duration::from_secs(1), queued).await;
+        assert!(
+            matches!(resumed, Ok(Ok(_))),
+            "background work stayed parked"
+        );
+        drop(held);
+        pool.abort();
+    }
+
+    async fn saturate(pool: &Pool, workload: Workload, lane: Option<Lane>, n: usize) -> Vec<Load> {
+        let mut loads = Vec::new();
+        for _ in 0..n {
+            let Ok((_, load, _, _)) = pool.worker(workload, false, None, lane).await else {
+                panic!("a connection is available");
+            };
+            loads.push(load);
+        }
+        loads
+    }
+
+    #[tokio::test]
+    async fn from_sixteen_connections_work_below_cache_leaves_a_second_idle_slot() {
+        for (limit, workload, opened) in [
+            (15, Workload::Queue, 14),
+            (16, Workload::Queue, 14),
+            (16, Workload::Cache, 15),
+            (24, Workload::Queue, 22),
+        ] {
+            let (pool, _server) = loopback_pool(limit).await;
+            let held = saturate(&pool, workload, None, limit + 2).await;
+            assert_eq!(pool.lock().workers.len(), opened, "{limit} {workload:?}");
+            if workload == Workload::Queue && limit >= CACHE_HEADROOM_MIN_CONNECTIONS {
+                let lane = Some(Lane::reader(1));
+                let Ok((_, cache, ahead, _)) =
+                    pool.worker(Workload::Cache, false, None, lane).await
+                else {
+                    panic!("the cache reader gets the slot left for it");
+                };
+                assert_eq!(ahead, 0, "its first read waits behind nothing");
+                drop(cache);
+            }
+            drop(held);
+            pool.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn work_below_cache_yields_while_a_cache_request_waits() {
+        let (pool, _server) = loopback_pool(16).await;
+        let lane = Lane::reader(1);
+        // Two download connections sit under the share a cache reader leaves them, with
+        // pipeline room, so only the waiting cache request holds them back.
+        let queue = saturate(&pool, Workload::Queue, None, 2).await;
+        let cache = saturate(&pool, Workload::Cache, Some(lane), 26).await;
+        let tag = Tag {
+            workload: Workload::Cache,
+            lane: Some(lane),
+            ..Tag::UNTRACKED
+        };
+        let mut waiting = Box::pin(pool.fetch(Command::Body, "waiting@loopback.invalid", &tag));
+        pending(&mut waiting).await;
+        assert_eq!(pool.cache_parked.load(Ordering::Relaxed), 1);
+        let mut below = Box::pin(pool.worker(Workload::Queue, false, None, None));
+        pending(&mut below).await;
+        drop(waiting);
+        drop(cache);
+        let resumed = timeout(STREAM_LINGER * 3, below).await;
+        assert!(matches!(resumed, Ok(Ok(_))), "work below cache resumes");
+        drop(queue);
         pool.abort();
     }
 

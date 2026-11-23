@@ -309,14 +309,11 @@ impl Partial {
     /// Bytes received so far.
     fn poll(&mut self, cx: &mut Context<'_>) -> &[u8] {
         while let Poll::Ready(Some((at, chunk))) = self.rx.poll_recv(cx) {
-            // A retry on another provider resends from offset 0; keep only new bytes.
-            if let Some(new) = self
-                .data
-                .len()
-                .checked_sub(at)
-                .and_then(|seen| chunk.get(seen..))
-            {
-                self.data.extend_from_slice(new);
+            // A retry on another provider resends from offset 0: the copy that failed
+            // may differ, so none of its unserved bytes may survive.
+            if at <= self.data.len() {
+                self.data.truncate(at);
+                self.data.extend_from_slice(&chunk);
             }
         }
         &self.data
@@ -1319,6 +1316,23 @@ async fn fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retry_on_another_provider_replaces_the_buffered_prefix() {
+        for (first, retry) in [(&b"AAAA"[..], &b"BBBBBB"[..]), (b"AAAA", b"BB")] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let mut partial = Partial {
+                rx,
+                data: Vec::new(),
+                wanted: Arc::new(AtomicBool::new(true)),
+            };
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            tx.send((0, first.to_vec())).unwrap();
+            assert_eq!(partial.poll(&mut cx), first);
+            tx.send((0, retry.to_vec())).unwrap();
+            assert_eq!(partial.poll(&mut cx), retry);
+        }
+    }
 
     #[test]
     fn fills_whole_ts_packets_inside_the_gap_only() {

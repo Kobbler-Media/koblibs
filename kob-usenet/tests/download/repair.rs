@@ -102,3 +102,31 @@ async fn missing_articles_within_par2_capacity_are_repaired_from_only_the_recove
         "one missing article is four slices: the smallest volume with four blocks holds them in its first two articles"
     );
 }
+
+#[tokio::test]
+async fn a_repair_larger_than_the_memory_budget_runs_in_passes() {
+    let release = Protected::new(
+        vec![
+            Posted::new("e01", "Show.S01E01.mkv", video(12 * ARTICLE + 500, 33)),
+            Posted::new("e02", "Show.S01E02.mkv", video(10 * ARTICLE + 33, 34)),
+        ],
+        "Show",
+        &[(0, 2), (2, 8), (10, 16)],
+    );
+    let gone = [
+        release.files[0].id(4).to_owned(),
+        release.files[1].id(10).to_owned(),
+    ];
+    let rig = Rig::new(release.articles_without(&[&gone[0], &gone[1]])).await;
+    let engine = rig
+        .engine_with(|c| c.download.repair_memory_bytes = 3 * par2::SLICE)
+        .await;
+    let spec = rig.spec("Show", nzb::of(&release.posts()), None);
+    let id = spec.id.clone();
+    engine.add_job(spec).await.unwrap();
+
+    let dir = completed(&finish(&engine, &id).await);
+    for file in &release.files {
+        assert_file(&dir, &file.name, &file.data);
+    }
+}

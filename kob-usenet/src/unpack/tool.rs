@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::io;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -14,22 +15,24 @@ use crate::unpack::tree;
 const TAIL: usize = 400;
 const KEEP: usize = 64 << 10;
 const TICK: Duration = Duration::from_millis(100);
-const WRONG_PASSWORD: [&str; 8] = [
+const WRONG_PASSWORD: [&str; 5] = [
     "incorrect password",
     "the specified password is incorrect",
-    "enter password",
     "error: wrong password",
     "can not open encrypted archive",
-    "data error in encrypted file",
-    "crc failed in the encrypted file",
-    "checksum error in the encrypted file",
+    "cannot open encrypted archive",
 ];
+// RAR4 and 7-Zip cannot tell a wrong key from damaged data: both fail the checksum.
+const DAMAGED_OR_WRONG: [&str; 2] = ["in the encrypted file", "in encrypted file"];
 const NO_SPACE: [&str; 3] = ["no space left", "disk full", "not enough space"];
+const UNRAR_MACHINE: [i32; 3] = [5, 8, 9];
+const SEVENZIP_MACHINE: [i32; 1] = [8];
 const PROGRESS: [&str; 5] = ["extracting", "creating", "inflating", "- ", "path ="];
 
 pub enum Attempt {
     Extracted,
     WrongPassword(String),
+    DamagedOrWrongPassword(String),
     Failed(Failure),
 }
 
@@ -58,7 +61,7 @@ pub async fn extract(
         ];
         match run(unrar, &args, password, into, stall).await {
             Err(Run::Spawn(e)) if e.kind() == io::ErrorKind::NotFound => missing.push(unrar),
-            result => return judge(unrar, archive, result),
+            result => return judge(unrar, &UNRAR_MACHINE, archive, result),
         }
     }
     let mut out = OsString::from("-o");
@@ -81,7 +84,7 @@ pub async fn extract(
                     .join(" and ")
             )))
         }
-        result => judge(sevenzip, archive, result),
+        result => judge(sevenzip, &SEVENZIP_MACHINE, archive, result),
     }
 }
 
@@ -93,7 +96,8 @@ enum Run {
 
 struct Finished {
     status: ExitStatus,
-    said: Vec<u8>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 async fn run(
@@ -127,21 +131,26 @@ async fn watch(child: &mut Child, into: &Path, stall: Duration) -> Result<Finish
     let mut stderr = child.stderr.take().expect("piped stderr");
     let (mut out_buf, mut err_buf) = ([0u8; 4096], [0u8; 4096]);
     let (mut out_open, mut err_open) = (true, true);
-    let mut said = Vec::new();
+    // Apart: a tool's progress on one stream can land inside an error on the other.
+    let (mut said_out, mut said_err) = (Vec::new(), Vec::new());
     let mut last = Instant::now();
     let mut size = tree::size(into);
     loop {
         tokio::select! {
             read = stdout.read(&mut out_buf), if out_open => match read.map_err(Run::Io)? {
                 0 => out_open = false,
-                n => { keep(&mut said, &out_buf[..n]); last = Instant::now(); }
+                n => { keep(&mut said_out, &out_buf[..n]); last = Instant::now(); }
             },
             read = stderr.read(&mut err_buf), if err_open => match read.map_err(Run::Io)? {
                 0 => err_open = false,
-                n => { keep(&mut said, &err_buf[..n]); last = Instant::now(); }
+                n => { keep(&mut said_err, &err_buf[..n]); last = Instant::now(); }
             },
             status = child.wait(), if !out_open && !err_open => {
-                return Ok(Finished { status: status.map_err(Run::Io)?, said });
+                return Ok(Finished {
+                    status: status.map_err(Run::Io)?,
+                    stdout: said_out,
+                    stderr: said_err,
+                });
             }
             () = tokio::time::sleep(TICK) => {
                 let now = tree::size(into);
@@ -165,7 +174,12 @@ fn keep(said: &mut Vec<u8>, data: &[u8]) {
     }
 }
 
-fn judge(program: &Path, archive: &Path, result: Result<Finished, Run>) -> Attempt {
+fn judge(
+    program: &Path,
+    machine: &[i32],
+    archive: &Path,
+    result: Result<Finished, Run>,
+) -> Attempt {
     let name = archive.file_name().map_or_else(
         || archive.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
@@ -182,16 +196,32 @@ fn judge(program: &Path, archive: &Path, result: Result<Finished, Run>) -> Attem
             )));
         }
     };
-    let said = String::from_utf8_lossy(&finished.said).into_owned();
-    let lower = said.to_lowercase();
+    let stdout = String::from_utf8_lossy(&finished.stdout);
+    let stderr = String::from_utf8_lossy(&finished.stderr);
+    let lower = [stdout.to_lowercase(), stderr.to_lowercase()];
     let lines = || {
         lower
-            .lines()
+            .iter()
+            .flat_map(|said| said.lines())
             .map(str::trim)
             .filter(|l| !PROGRESS.iter().any(|p| l.starts_with(p)))
     };
     if finished.status.success() {
         return Attempt::Extracted;
+    }
+    if let Some(signal) = finished.status.signal() {
+        return Attempt::Failed(Failure::Infrastructure(format!(
+            "{} was killed by signal {signal} unpacking {name}",
+            program.display()
+        )));
+    }
+    if let Some(code) = finished.status.code()
+        && machine.contains(&code)
+    {
+        return Attempt::Failed(Failure::Infrastructure(format!(
+            "{} hit a write, memory or file creation error unpacking {name} (exit status {code})",
+            program.display()
+        )));
     }
     if lines().any(|l| NO_SPACE.iter().any(|p| l.contains(p))) {
         return Attempt::Failed(Failure::Infrastructure(format!(
@@ -199,13 +229,17 @@ fn judge(program: &Path, archive: &Path, result: Result<Finished, Run>) -> Attem
             program.display()
         )));
     }
-    if lines().any(|l| {
-        WRONG_PASSWORD.iter().any(|p| l.starts_with(p))
-            || l.ends_with("wrong password?")
-            || l.ends_with("wrong password.")
-    }) {
+    if lines().any(|l| WRONG_PASSWORD.iter().any(|p| l.contains(p))) {
         return Attempt::WrongPassword(name);
     }
+    if lines().any(|l| DAMAGED_OR_WRONG.iter().any(|p| l.contains(p))) {
+        return Attempt::DamagedOrWrongPassword(name);
+    }
+    let said = if stderr.trim().is_empty() {
+        &stdout
+    } else {
+        &stderr
+    };
     let tail: String = said
         .trim()
         .chars()

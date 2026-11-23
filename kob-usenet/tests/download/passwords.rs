@@ -1,9 +1,11 @@
 use crate::compressed::FIXTURE_FILES;
 use crate::nzb::{self, nzb_with};
 use crate::post::Posted;
-use crate::support::{Rig, completed, crc_of, extractor_on_path, failed, finish};
+use crate::support::{Rig, completed, crc_of, extractor_on_path, failed, finish, unrar_on_path};
 
 const FILES_ONLY: &[u8] = include_bytes!("../vendor/fixtures/archive/Rar5.encrypted_filesOnly.rar");
+const RAR4_FILES_ONLY: &[u8] =
+    include_bytes!("../vendor/fixtures/archive/Rar.encrypted_filesOnly.rar");
 const HEADERS_TOO: &[u8] =
     include_bytes!("../vendor/fixtures/archive/Rar5.encrypted_filesAndHeader.rar");
 
@@ -61,4 +63,47 @@ async fn the_nzb_password_then_the_job_password_unlock_the_archive_for_the_exter
             );
         }
     }
+}
+
+#[tokio::test]
+async fn the_stored_job_spec_holding_the_password_is_private_to_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let rar = posted(FILES_ONLY);
+    let rig = Rig::new(rar.articles.clone()).await;
+    let engine = rig.engine().await;
+    engine
+        .add_job(rig.spec("Locked", nzb::of(&[&rar]), Some("test")))
+        .await
+        .unwrap();
+
+    let mode = std::fs::metadata(rig.record("spec"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+}
+
+#[tokio::test]
+async fn a_damaged_encrypted_archive_unlocked_by_the_right_password_is_not_called_a_wrong_password()
+{
+    if !unrar_on_path() {
+        return;
+    }
+    let mut damaged = RAR4_FILES_ONLY.to_vec();
+    let middle = damaged.len() / 2;
+    for byte in &mut damaged[middle..middle + 40] {
+        *byte ^= 0x55;
+    }
+    let rar = posted(&damaged);
+    let rig = Rig::new(rar.articles.clone()).await;
+    let engine = rig
+        .engine_with(|c| c.download.sevenzip = "/nonexistent/7z".into())
+        .await;
+    let spec = rig.spec("Locked", nzb::of(&[&rar]), Some("test"));
+    let id = spec.id.clone();
+    engine.add_job(spec).await.unwrap();
+
+    let error = failed(&finish(&engine, &id).await);
+    assert!(!error.contains("Wrong archive password"), "{error}");
+    assert!(error.contains("damaged"), "{error}");
 }

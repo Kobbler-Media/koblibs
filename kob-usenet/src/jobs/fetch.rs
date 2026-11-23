@@ -20,6 +20,15 @@ pub enum Outcome {
     Corrupt,
 }
 
+pub enum First {
+    Listed(Body),
+    // Part 1 of a post counting its parts differently from the NZB: this file's, or another
+    // file's under the id (#1915). The caller must prove which from the content.
+    Unproven(Body),
+    Missing,
+    Corrupt,
+}
+
 pub fn classify(result: Result<Body, Error>) -> Result<Outcome, Error> {
     match result {
         Ok(body) => Ok(Outcome::Body(body)),
@@ -67,12 +76,21 @@ impl Fetcher {
         retry(|| self.once(id, self.lane, BodyExpectation::NONE)).await
     }
 
-    pub async fn first(&self, id: &str, expected: BodyExpectation) -> Result<Outcome, Error> {
+    pub async fn first(&self, id: &str, expected: BodyExpectation) -> Result<First, Error> {
         match retry(|| self.once(id, self.lane, expected)).await? {
-            // An NZB listing more or fewer segments than the post's total has no copy that
-            // matches, as in the import; such a part 1 is taken as listed.
-            Outcome::Missing => self.body(id).await,
-            outcome => Ok(outcome),
+            Outcome::Body(body) => Ok(First::Listed(body)),
+            Outcome::Missing => Ok(First::Missing),
+            Outcome::Corrupt => {
+                let any_total = BodyExpectation {
+                    total: None,
+                    ..expected
+                };
+                Ok(match retry(|| self.once(id, self.lane, any_total)).await? {
+                    Outcome::Body(body) => First::Unproven(body),
+                    Outcome::Missing => First::Missing,
+                    Outcome::Corrupt => First::Corrupt,
+                })
+            }
         }
     }
 

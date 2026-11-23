@@ -1,5 +1,5 @@
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::jobs::JobState;
 use crate::jobs::failure::Failure;
@@ -27,9 +27,14 @@ pub async fn settle(
     damage: Vec<Vec<Range<u64>>>,
 ) -> Result<Settled, Failure> {
     let (shared, spec, staging) = (job.shared, job.spec, job.staging);
+    let paths = plan
+        .outputs
+        .iter()
+        .map(|o| o.under(staging))
+        .collect::<Result<Vec<PathBuf>, Failure>>()?;
     let checks = {
-        let (plan, staging) = (plan.clone(), staging.to_path_buf());
-        tokio::task::spawn_blocking(move || check(&plan, &damage, &staging))
+        let (plan, paths) = (plan.clone(), paths.clone());
+        tokio::task::spawn_blocking(move || check(&plan, &damage, &paths))
             .await
             .map_err(|e| Failure::io("verifying", e))?
             .map_err(|e| Failure::io("verifying", e))?
@@ -42,7 +47,9 @@ pub async fn settle(
                 return Ok(Settled::Raw);
             }
             Check::Member(reason) | Check::Unprotected(reason) => {
-                return Err(format!("{reason}, and no PAR2 recovery can repair it").into());
+                return Err(Failure::Content(format!(
+                    "{reason}, and no PAR2 recovery can repair it"
+                )));
             }
             Check::Clean | Check::Repairable => {}
         }
@@ -54,11 +61,12 @@ pub async fn settle(
     let files: Vec<OnDisk> = plan
         .outputs
         .iter()
-        .filter_map(|o| match &o.meta {
+        .zip(paths)
+        .filter_map(|(o, path)| match &o.meta {
             FileMeta::Nzb(f) => Some(OnDisk {
                 id: f.proof.as_ref().map(|p| p.file_id),
                 name: o.path.rsplit('/').next().unwrap_or(&o.path).to_owned(),
-                path: staging.join(&o.path),
+                path,
             }),
             FileMeta::Multipart(_) => None,
         })
@@ -82,17 +90,34 @@ pub async fn settle(
             tracing::info!(job = %spec.id, %reason, "downloading whole volumes to repair");
             Ok(Settled::Raw)
         }
-        Err(RepairError::Providers(error)) => Err(Failure::providers(&error)),
-        Err(error) => Err(error.to_string().into()),
+        Err(error) => Err(repair_failure(error)),
     }
 }
 
-fn check(plan: &Plan, damage: &[Vec<Range<u64>>], staging: &Path) -> std::io::Result<Vec<Check>> {
+fn repair_failure(error: RepairError) -> Failure {
+    match error {
+        RepairError::Providers(error) => Failure::providers(&error),
+        error @ (RepairError::Io(_) | RepairError::Memory { .. }) => {
+            Failure::Infrastructure(error.to_string())
+        }
+        error @ (RepairError::NoPar2
+        | RepairError::Uncovered(_)
+        | RepairError::Insufficient { .. }
+        | RepairError::Dependent
+        | RepairError::Failed(_)) => Failure::Content(error.to_string()),
+    }
+}
+
+fn check(
+    plan: &Plan,
+    damage: &[Vec<Range<u64>>],
+    paths: &[PathBuf],
+) -> std::io::Result<Vec<Check>> {
     plan.outputs
         .iter()
         .zip(damage)
-        .map(|(output, damaged)| {
-            let path = staging.join(&output.path);
+        .zip(paths)
+        .map(|((output, damaged), path)| {
             let proof = match &output.meta {
                 FileMeta::Nzb(f) => f.proof.as_ref(),
                 FileMeta::Multipart(_) => None,
@@ -106,7 +131,7 @@ fn check(plan: &Plan, damage: &[Vec<Range<u64>>], staging: &Path) -> std::io::Re
                     )));
                 }
                 if let Some(expected) = output.crc32
-                    && crc_of(&path)? != expected
+                    && crc_of(path)? != expected
                 {
                     return Ok(Check::Member(format!(
                         "{}: CRC mismatch against the archive header",
@@ -116,7 +141,7 @@ fn check(plan: &Plan, damage: &[Vec<Range<u64>>], staging: &Path) -> std::io::Re
                 return Ok(Check::Clean);
             }
             if let Some(proof) = proof {
-                return Ok(if proof_damage(&path, proof)?.is_empty() {
+                return Ok(if proof_damage(path, proof)?.is_empty() {
                     Check::Clean
                 } else {
                     Check::Repairable
@@ -146,5 +171,37 @@ fn crc_of(path: &Path) -> std::io::Result<u32> {
             return Ok(crc);
         }
         crc = crc32(crc, &buf[..n]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repair_failures_of_the_machine_are_infrastructure() {
+        let full = || std::io::Error::from(std::io::ErrorKind::StorageFull);
+        for (error, machine) in [
+            (RepairError::Io(full()), true),
+            (
+                RepairError::Memory {
+                    need: 9,
+                    required: 1 << 30,
+                    limit: 1 << 20,
+                },
+                true,
+            ),
+            (RepairError::Insufficient { need: 9, have: 3 }, false),
+            (RepairError::Dependent, false),
+            (RepairError::NoPar2, false),
+        ] {
+            let said = error.to_string();
+            let failure = repair_failure(error);
+            assert_eq!(
+                matches!(failure, Failure::Infrastructure(_)),
+                machine,
+                "{said}"
+            );
+        }
     }
 }

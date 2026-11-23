@@ -6,12 +6,6 @@ pub enum Failure {
     Infrastructure(String),
 }
 
-impl From<String> for Failure {
-    fn from(reason: String) -> Self {
-        Self::Content(reason)
-    }
-}
-
 impl Failure {
     pub fn io(context: &str, error: impl std::fmt::Display) -> Self {
         Self::Infrastructure(format!("{context}: {error}"))

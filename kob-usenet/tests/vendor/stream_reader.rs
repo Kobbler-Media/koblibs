@@ -515,7 +515,7 @@ async fn a_stalled_segment_is_hedged_instead_of_blocking_the_reader() {
     let started = std::time::Instant::now();
     let trace = Arc::new(Trace::new(10_000));
     let mut all = Vec::new();
-    SegmentReader::new(client, layout, 8)
+    SegmentReader::new(Arc::clone(&client), layout, 8)
         .with_trace(Arc::clone(&trace))
         .read_to_end(&mut all)
         .await
@@ -531,6 +531,7 @@ async fn a_stalled_segment_is_hedged_instead_of_blocking_the_reader() {
     assert_eq!(summary.served, 12);
     assert!(summary.first_byte_ns.is_some());
     assert!(summary.hedges >= 1, "{summary:?}");
+    assert!(client.stats()[0].hedges >= 1);
     let provider = summary.causes.latency + summary.causes.transfer + summary.causes.decode;
     assert!(provider >= summary.longest_stall_ns / 2, "{summary:?}");
 }

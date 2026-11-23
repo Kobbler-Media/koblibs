@@ -1,0 +1,99 @@
+From b449431167d601e2edea472efadb32509c68122f Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 15:06:43 +1100
+Subject: [PATCH] Count hedged requests in provider stats
+
+A hedge re-requests an article, so a test or an operator counting fetches could
+not tell a duplicate from a hedge under load.
+---
+ crates/nntp/src/client.rs     |  1 +
+ crates/nntp/src/pool.rs       |  5 +++++
+ crates/nntp/src/stats.rs      | 11 +++++++++++
+ crates/stream/tests/reader.rs |  3 ++-
+ 4 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index 0b8097ea..60cc83ab 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -252,6 +252,7 @@ impl Client {
+                     connecting,
+                     connect_failures,
+                     trips,
++                    hedges: e.stats.hedges(),
+                     open_for: e.breaker.open_for(),
+                     connected,
+                     connect_error,
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index 93b4365e..eeefe2e5 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -698,6 +698,11 @@ impl Pool {
+                 _warm: (tag.workload == Workload::Warm).then(|| Load::acquire(&self.warm_busy)),
+             };
+             drop(stream_waiting);
++            if tag.fresh
++                && let Some(stats) = &tag.stats
++            {
++                stats.hedged();
++            }
+             let request = Request {
+                 command,
+                 message_id: message_id.to_owned(),
+diff --git a/crates/nntp/src/stats.rs b/crates/nntp/src/stats.rs
+index 5171cc17..c4d17c7d 100644
+--- a/crates/nntp/src/stats.rs
++++ b/crates/nntp/src/stats.rs
+@@ -74,6 +74,7 @@ pub(crate) struct Stats {
+     latency: [[AtomicU64; LATENCY_BUCKETS]; WORKLOADS],
+     connect_failures: AtomicU64,
+     trips: AtomicU64,
++    hedges: AtomicU64,
+     /// Last warning and warnings held back since, by reply code (`None`: malformed).
+     unexpected: Mutex<HashMap<Option<u16>, (Instant, u64)>>,
+ }
+@@ -105,6 +106,14 @@ impl Stats {
+         self.trips.fetch_add(1, Ordering::Relaxed);
+     }
+ 
++    pub(crate) fn hedged(&self) {
++        self.hedges.fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn hedges(&self) -> u64 {
++        self.hedges.load(Ordering::Relaxed)
++    }
++
+     /// `Some(held back)` when an unexpected reply with this code should be logged now.
+     pub(crate) fn unexpected(&self, code: Option<u16>, now: Instant) -> Option<u64> {
+         let mut logged = self
+@@ -180,6 +189,8 @@ pub struct ProviderStats {
+     pub connect_failures: u64,
+     /// Times the circuit breaker opened.
+     pub trips: u64,
++    /// Duplicate requests raced against a slow playback read.
++    pub hedges: u64,
+     /// Cooldown left while the circuit is open.
+     pub open_for: Option<Duration>,
+     /// A connection opened since the provider was (re)configured.
+diff --git a/crates/stream/tests/reader.rs b/crates/stream/tests/reader.rs
+index 1c76d862..31c2c70a 100644
+--- a/crates/stream/tests/reader.rs
++++ b/crates/stream/tests/reader.rs
+@@ -515,7 +515,7 @@ async fn a_stalled_segment_is_hedged_instead_of_blocking_the_reader() {
+     let started = std::time::Instant::now();
+     let trace = Arc::new(Trace::new(10_000));
+     let mut all = Vec::new();
+-    SegmentReader::new(client, layout, 8)
++    SegmentReader::new(Arc::clone(&client), layout, 8)
+         .with_trace(Arc::clone(&trace))
+         .read_to_end(&mut all)
+         .await
+@@ -531,6 +531,7 @@ async fn a_stalled_segment_is_hedged_instead_of_blocking_the_reader() {
+     assert_eq!(summary.served, 12);
+     assert!(summary.first_byte_ns.is_some());
+     assert!(summary.hedges >= 1, "{summary:?}");
++    assert!(client.stats()[0].hedges >= 1);
+     let provider = summary.causes.latency + summary.causes.transfer + summary.causes.decode;
+     assert!(provider >= summary.longest_stall_ns / 2, "{summary:?}");
+ }

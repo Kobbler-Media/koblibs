@@ -16,8 +16,15 @@ const MAX_RECOVERY: usize = 256 << 20;
 
 struct Stored {
     set: Id,
+    exponent: u32,
     at: u64,
     len: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct Row {
+    pub exponent: u32,
+    at: u64,
 }
 
 #[derive(Default)]
@@ -122,6 +129,7 @@ impl Spool {
         self.end += packet.len() as u64;
         self.stored.push(Stored {
             set,
+            exponent,
             at,
             len: packet.len(),
         });
@@ -132,18 +140,22 @@ impl Spool {
         self.matching(set, slice_size).count()
     }
 
-    pub fn load(&self, set: Id, slice_size: usize, count: usize) -> io::Result<Vec<Vec<u8>>> {
-        let Some(file) = &self.file else {
-            return Ok(Vec::new());
-        };
+    pub fn rows(&self, set: Id, slice_size: usize, count: usize) -> Vec<Row> {
         self.matching(set, slice_size)
             .take(count)
-            .map(|s| {
-                let mut packet = vec![0; s.len];
-                file.read_exact_at(&mut packet, s.at)?;
-                Ok(packet)
+            .map(|s| Row {
+                exponent: s.exponent,
+                at: s.at,
             })
             .collect()
+    }
+
+    pub fn read(&self, row: Row, offset: usize, buf: &mut [u8]) -> io::Result<()> {
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("recovery spool has no backing file"))?;
+        file.read_exact_at(buf, row.at + (HEADER + 4 + offset) as u64)
     }
 
     fn matching(&self, set: Id, slice_size: usize) -> impl Iterator<Item = &Stored> {
@@ -187,9 +199,12 @@ mod tests {
         }
         assert_eq!(spool.count(set, slice), 64);
         assert!(peak <= slice + HEADER + 4, "carried {peak} bytes");
-        let loaded = spool.load(set, slice, 3).unwrap();
-        assert_eq!(loaded.len(), 3);
-        assert_eq!(loaded[2][HEADER + 4], 2);
+        let rows = spool.rows(set, slice, 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].exponent, 2);
+        let mut stripe = [0; 8];
+        spool.read(rows[2], 100, &mut stripe).unwrap();
+        assert_eq!(stripe, [2; 8]);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 

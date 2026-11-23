@@ -1,0 +1,53 @@
+#!/usr/bin/env perl
+# Each write waits until the reader has drained its pipe, so every piece is its own read
+# and the order the reader sees them in does not depend on timing.
+use strict;
+use warnings;
+
+use constant FIONREAD => 0x541B;
+
+my $damaged = "Checksum error in the encrypted file a.bin\n";
+my %cases = (
+    'damaged-interleaved' => [3, [\*STDERR, "Checksum error in the encrypted "],
+        [\*STDOUT, "Extracting  a.bin  50%\n"], [\*STDERR, "file a.bin\n"]],
+    'damaged-on-stdout' => [3, [\*STDOUT, "Checksum error in the enc"],
+        [\*STDERR, "warning: slow disk\n"], [\*STDOUT, "rypted file a.bin\n"]],
+    'wrong-password-split' => [11, [\*STDERR, "The specified pass"],
+        [\*STDOUT, "Extracting  a.bin  10%\n"], [\*STDERR, "word is incorrect.\n"]],
+    'no-space-split' => [3, [\*STDERR, "Write error: No spa"],
+        [\*STDOUT, "Extracting  a.bin  90%\n"], [\*STDERR, "ce left on device\n"]],
+    'machine-failure' => [5, [\*STDERR, "Write err"], [\*STDOUT, "Extracting\n"],
+        [\*STDERR, "or\n"]],
+    'opaque-split' => [3, [\*STDERR, "opaque "], [\*STDOUT, "Extracting\n"],
+        [\*STDERR, "failure\n"]],
+    'error-before-flood' => [3, [\*STDERR, $damaged],
+        map { [\*STDOUT, ("Extracting  a.bin  50%\n" x 180)] } 1 .. 50],
+);
+
+sub put {
+    my ($stream, $text) = @_;
+    syswrite($stream, $text) // die "write: $!";
+    while (1) {
+        my $queued = pack('i', 0);
+        ioctl($stream, FIONREAD, $queued) or die "ioctl: $!";
+        last if unpack('i', $queued) == 0;
+        select(undef, undef, undef, 0.001);
+    }
+}
+
+my ($case) = map { m{([a-z-]+)\.rar$} ? $1 : () } @ARGV;
+die "no case in @ARGV\n" unless defined $case;
+
+if ($case =~ /^alive-(stdout|stderr)$/) {
+    my $stream = $1 eq 'stdout' ? \*STDOUT : \*STDERR;
+    for (1 .. 25) {
+        put($stream, "working\n");
+        select(undef, undef, undef, 0.1);
+    }
+    put(\*STDERR, "opaque failure\n");
+    exit 3;
+}
+
+my ($code, @pieces) = @{ $cases{$case} // die "unknown case $case\n" };
+put(@$_) for @pieces;
+exit $code;

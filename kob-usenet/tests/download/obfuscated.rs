@@ -90,3 +90,32 @@ async fn whole_volume_downloads_name_obfuscated_files_by_par2() {
         listing(&dir)
     );
 }
+
+#[tokio::test]
+async fn a_scrambled_video_named_after_a_hostile_or_slashed_release_stays_inside_its_folder() {
+    for (release, file) in [
+        ("a/../../escape", "a_.._.._escape.mkv"),
+        ("x/../../../../escape", "x_.._.._.._.._escape.mkv"),
+        ("AC/DC Live", "AC_DC Live.mkv"),
+    ] {
+        let data = video(3 * ARTICLE + 17, 85);
+        let post = Posted::new("obf", &format!("{}.mkv", hash(release)), data.clone());
+        let rig = Rig::new(post.articles.clone()).await;
+        let engine = rig.engine().await;
+        let mut spec = rig.spec(release, nzb::of(&[&post]), None);
+        spec.id = "scrambled".to_owned();
+        engine.add_job(spec).await.unwrap();
+
+        let dir = completed(&finish(&engine, "scrambled").await);
+        assert_eq!(listing(&dir), [file], "{release}");
+        assert_file(&dir, file, &data);
+        let folder = dir.strip_prefix(rig.dest.path()).unwrap();
+        assert!(
+            listing(rig.dest.path())
+                .iter()
+                .all(|p| std::path::Path::new(p).starts_with(folder)),
+            "{release}: {:?}",
+            listing(rig.dest.path())
+        );
+    }
+}

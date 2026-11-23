@@ -1,18 +1,19 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use futures_util::{StreamExt, stream};
 
 use crate::jobs::failure::Failure;
-use crate::jobs::fetch::{Fetcher, Outcome};
+use crate::jobs::fetch::{Fetcher, First};
 use crate::jobs::headless;
 use crate::jobs::store::{Plan, Planned};
 use crate::repair::Spool;
 use crate::repair::recovery::Par2s;
 use crate::vendor::core::{FileMeta, NzbFile, Par2Proof, Segment, Segments};
-use crate::vendor::nntp::BodyExpectation;
+use crate::vendor::nntp::{Body, BodyExpectation};
 use crate::vendor::par2::{self, hash_16k};
 use crate::vendor::queue::names::{self, Kind};
-use crate::vendor::queue::nzb::{File, Nzb};
+use crate::vendor::queue::nzb::{self, File, Nzb};
 
 const FIRSTS: usize = 16;
 
@@ -29,12 +30,12 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Fai
     let described = index.map(|r| r.spool().critical().index());
     let slice_size = described.as_ref().map_or(0, |i| i.slice_size);
     let described: Vec<&par2::File> = described.iter().flat_map(|i| &i.files).collect();
-    let data: Vec<&File> = nzb
+    let data: Vec<Cow<'_, File>> = nzb
         .files
         .iter()
         .enumerate()
         .filter(|&(i, f)| !par2.contains(i) && names::classify(f.name()) != Kind::Par2)
-        .map(|(_, f)| f)
+        .map(|(_, f)| numbered(f))
         .collect();
     let firsts = bodies(
         fetcher,
@@ -46,6 +47,7 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Fai
             };
             (f.segments[0].id.clone(), expected)
         }),
+        &described,
     )
     .await?;
     let mut claimed = HashSet::new();
@@ -56,13 +58,9 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Fai
             continue;
         };
         if first.offset != 0 {
-            return Err(uneven(file).into());
+            return Err(Failure::Content(uneven(file)));
         }
-        let start = &first.data[..first.data.len().min(16 << 10)];
-        let matched = described
-            .iter()
-            .copied()
-            .find(|f| f.hash_16k == hash_16k(start) && f.length == first.file_size);
+        let matched = described.iter().copied().find(|f| describes(f, first));
         claimed.extend(matched.map(|f| f.id));
         let geometry = Geometry {
             part: first.data.len() as u64,
@@ -87,9 +85,13 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Fai
     }
     let mut taken = HashSet::new();
     let mut outputs = Vec::new();
-    for (file, slot) in data.into_iter().zip(found) {
+    for ((file, slot), first) in data.into_iter().zip(found).zip(&firsts) {
         let (geometry, matched) = slot.expect("every volume was described above");
-        let segments = uniform(file, &geometry)?;
+        let file = match (matched, first) {
+            (Some(_), Some(first)) => as_posted(file, first, &geometry),
+            _ => file,
+        };
+        let segments = uniform(&file, &geometry).map_err(Failure::Content)?;
         let name = matched.map_or_else(|| file.name().to_owned(), |f| f.name.clone());
         outputs.push(Planned {
             path: unique(
@@ -114,7 +116,8 @@ pub async fn raw(fetcher: &Fetcher, nzb: &Nzb, par2: &Par2s) -> Result<Plan, Fai
 async fn bodies(
     fetcher: &Fetcher,
     ids: impl Iterator<Item = (String, BodyExpectation)>,
-) -> Result<Vec<Option<crate::vendor::nntp::Body>>, Failure> {
+    described: &[&par2::File],
+) -> Result<Vec<Option<Body>>, Failure> {
     let requests: Vec<_> = ids
         .map(|(id, expected)| {
             let fetcher = fetcher.clone();
@@ -125,10 +128,78 @@ async fn bodies(
     answers
         .into_iter()
         .map(|answer| match answer.map_err(|e| Failure::providers(&e))? {
-            Outcome::Body(body) => Ok(Some(body)),
-            Outcome::Missing | Outcome::Corrupt => Ok(None),
+            First::Listed(body) => Ok(Some(body)),
+            First::Unproven(body) if described.iter().any(|f| describes(f, &body)) => {
+                Ok(Some(body))
+            }
+            First::Unproven(_) | First::Missing | First::Corrupt => Ok(None),
         })
         .collect()
+}
+
+fn describes(file: &par2::File, first: &Body) -> bool {
+    let start = &first.data[..first.data.len().min(16 << 10)];
+    file.hash_16k == hash_16k(start) && file.length == first.file_size
+}
+
+/// A PAR2-proven volume listed with more or fewer entries than its evenly split post:
+/// entries past the post are dropped and parts the NZB lacks are left for PAR2.
+fn as_posted<'a>(file: Cow<'a, File>, first: &Body, geometry: &Geometry) -> Cow<'a, File> {
+    let parts = geometry.size.div_ceil(geometry.part);
+    let listed = file.segments.len() as u64;
+    if listed == parts || first.total.map(u64::from) != Some(parts) {
+        return file;
+    }
+    let mut file = file.into_owned();
+    let parts = usize::try_from(parts).unwrap_or(usize::MAX);
+    let bytes = file.segments.iter().map(|s| s.bytes).max().unwrap_or(0);
+    let base = file.segments[0].number;
+    file.segments.truncate(parts);
+    while file.segments.len() < parts {
+        let number = base.saturating_add(file.segments.len() as i64);
+        file.segments.push(unlisted(number, bytes));
+    }
+    Cow::Owned(file)
+}
+
+fn unlisted(number: i64, bytes: u32) -> nzb::Segment {
+    nzb::Segment {
+        id: String::new(),
+        bytes,
+        number,
+    }
+}
+
+/// The file's segments placed by part number. A part the NZB does not list gets an empty
+/// id: no provider is asked for it, and the writer leaves it damaged for PAR2 to rebuild.
+fn numbered(file: &File) -> Cow<'_, File> {
+    let (Some(first), Some(last)) = (file.segments.first(), file.segments.last()) else {
+        return Cow::Borrowed(file);
+    };
+    let base = first.number.min(1);
+    let span = last
+        .number
+        .checked_sub(base)
+        .and_then(|span| usize::try_from(span).ok())
+        .and_then(|span| span.checked_add(1))
+        .filter(|&span| span <= 2 * file.segments.len());
+    let Some(span) = span.filter(|_| file.gap) else {
+        return Cow::Borrowed(file);
+    };
+    let typical = file.segments.iter().map(|s| s.bytes).max().unwrap_or(0);
+    let mut segments: Vec<nzb::Segment> = Vec::with_capacity(span);
+    for segment in &file.segments {
+        while base + (segments.len() as i64) < segment.number {
+            segments.push(unlisted(base + segments.len() as i64, typical));
+        }
+        segments.push(segment.clone());
+    }
+    Cow::Owned(File {
+        subject: file.subject.clone(),
+        date: file.date,
+        segments,
+        gap: false,
+    })
 }
 
 fn uniform(file: &File, geometry: &Geometry) -> Result<Segments, String> {

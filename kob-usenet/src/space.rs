@@ -55,11 +55,12 @@ impl SpaceGate {
             .is_none_or(|free| free >= need.saturating_add(self.floor))
     }
 
-    pub fn admits(&self, path: &Path, credit: u64) -> bool {
+    pub fn admits(&self, path: &Path, credit: u64, need: u64) -> bool {
         let Some(free) = self.free(path) else {
             return true;
         };
-        let admitted = free.saturating_add(credit) >= self.floor;
+        // Bytes this job already reserved may dip into the floor, never into the write itself.
+        let admitted = free >= need && free >= self.floor.saturating_sub(credit);
         if admitted {
             if self.paused.swap(false, Ordering::Relaxed) {
                 tracing::info!("resuming downloads: disk space returned");
@@ -68,5 +69,39 @@ impl SpaceGate {
             tracing::warn!(free, floor = self.floor, path = %path.display(), "pausing downloads: low disk space");
         }
         admitted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixed(u64);
+
+    impl FreeSpace for Fixed {
+        fn available(&self, _: &Path) -> io::Result<u64> {
+            Ok(self.0)
+        }
+    }
+
+    #[test]
+    fn unwritten_reservations_never_admit_a_write_the_disk_cannot_hold() {
+        let floor = 1 << 20;
+        let gate = |free| SpaceGate::new(Arc::new(Fixed(free)), floor);
+        let (dir, piece) = (Path::new("/"), 16 << 10);
+        for (free, credit, admitted) in [
+            (0, 10 << 20, false),
+            (1000, 10 << 20, false),
+            (floor / 2, floor, true),
+            (floor / 2, floor / 4, false),
+            (floor, 0, true),
+            (floor - 1, 0, false),
+        ] {
+            assert_eq!(
+                gate(free).admits(dir, credit, piece),
+                admitted,
+                "{free} free, {credit} credit"
+            );
+        }
     }
 }

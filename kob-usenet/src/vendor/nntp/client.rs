@@ -255,6 +255,7 @@ impl Client {
                     connecting,
                     connect_failures,
                     trips,
+                    hedges: e.stats.hedges(),
                     open_for: e.breaker.open_for(),
                     connected,
                     connect_error,
@@ -1226,6 +1227,65 @@ mod tests {
             );
             drop(held);
         }
+    }
+
+    #[tokio::test]
+    async fn a_geometry_mismatch_skips_its_backbone_but_asks_the_rest() {
+        let corpus = Corpus::generate(1025, 1, 1024);
+        let id = corpus.articles[0].message_id.clone();
+        let mut servers = Vec::new();
+        for _ in 0..5 {
+            servers.push(
+                LoopbackServer::start(corpus.articles.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let downloads = Downloads::new(8);
+        let backbones = [
+            ("alpha", 0),
+            ("alpha", 0),
+            ("gamma", 0),
+            ("alpha", 99),
+            ("beta", 99),
+        ];
+        let providers = backbones
+            .iter()
+            .zip(&servers)
+            .map(|(&(backbone, priority), server)| Provider {
+                backbone: Some(backbone.into()),
+                priority,
+                ..provider(server, &downloads)
+            });
+        let client = Client::new(providers);
+        // Another file's part 1 under the id (#1915) looks the same, and a provider on
+        // another backbone may hold the right one.
+        let listed_total_differs = crate::vendor::nntp::BodyExpectation {
+            part: Some(1),
+            total: Some(3),
+            ..crate::vendor::nntp::BodyExpectation::at(Some(0))
+        };
+        for workload in [Workload::Stream, Workload::Queue] {
+            let result = client
+                .body_expecting(&id, workload, None, None, listed_total_differs)
+                .await;
+            assert!(matches!(result, Err(Error::Yenc(_))), "{:?}", result.err());
+        }
+        let bodies: Vec<_> = servers.iter().map(LoopbackServer::body_commands).collect();
+        assert_eq!(
+            bodies[0] + bodies[1],
+            2,
+            "one alpha copy per request: {bodies:?}"
+        );
+        assert_eq!(bodies[2], 2, "the other backbone on the level: {bodies:?}");
+        assert_eq!(
+            bodies[3], 0,
+            "the next level on the same backbone: {bodies:?}"
+        );
+        assert_eq!(
+            bodies[4], 2,
+            "the next level on another backbone: {bodies:?}"
+        );
     }
 
     #[tokio::test]

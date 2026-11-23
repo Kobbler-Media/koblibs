@@ -38,7 +38,14 @@ async fn play_and_cache_readers_of_one_output_fetch_each_article_once() {
         let second = engine.open(&release.key, index, order[1]).unwrap();
         let (a, b) = tokio::join!(whole(first), whole(second));
         assert!(a == expected && b == expected, "{order:?}");
-        assert_eq!(nntp.body_commands() - before, articles, "{order:?}");
+        let (fetched, hedges) = (
+            nntp.body_commands() - before,
+            engine.stats()[0].hedges as usize,
+        );
+        assert!(
+            (articles..=articles + hedges).contains(&fetched),
+            "{order:?}: {fetched} fetches of {articles} articles with {hedges} hedges"
+        );
     }
 }
 

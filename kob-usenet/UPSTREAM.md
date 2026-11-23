@@ -53,8 +53,15 @@ which drives upstream's database-backed queue service.
 | 19 | Stream-first bound reserve from the connections playback holds, full background depth | ours, reworks 5 |
 | 20 | Warn on the part-1 fallback of 8; idle-relative seek gate in the loopback test | ours |
 | 21 | Cache-first bound: work below cache leaves an active cache reader its connections plus a spare, a headroom slot from 16 connections, cache pipelining capped at the depth | ours, extends 18 and 19 |
+| 22 | Work below playback or cache wakes when the last reader leaves or stops waiting | ours, fixes 5, 18 and 19 |
+| 23 | Backbone coverage for a geometry mismatch | ours, test only |
+| 24 | NZB segments keep their part number | ours, for whole-volume downloads across listing gaps |
+| 25 | A retry on another provider replaces the buffered prefix | ours |
+| 26 | Hedged requests counted in provider stats | ours |
+| 27 | Coverage for the cache-first bound's second headroom slot and yield | ours, test only |
+| 28 | Extreme NZB segment numbers count as a gap instead of overflowing | ours |
 
-Patches 5–21 are candidates to offer upstream.
+Patches 5–28 are candidates to offer upstream.
 
 ## Monthly sync
 

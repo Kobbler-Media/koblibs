@@ -1,11 +1,12 @@
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::Error;
+use crate::jobs::failure::Failure;
 use crate::jobs::{JobSpec, JobStatus};
 use crate::release::hex;
 use crate::store::{sweep_tmp, write_atomic};
@@ -65,6 +66,29 @@ pub struct Planned {
     pub meta: FileMeta,
     pub crc32: Option<u32>,
     pub member: bool,
+}
+
+impl Planned {
+    pub fn under(&self, staging: &Path) -> Result<PathBuf, Failure> {
+        self.contained()?;
+        Ok(staging.join(&self.path))
+    }
+
+    pub fn contained(&self) -> Result<(), Failure> {
+        if relative(&self.path) {
+            Ok(())
+        } else {
+            Err(Failure::Content(format!(
+                "{}: refusing a path that leaves the download folder",
+                self.path
+            )))
+        }
+    }
+}
+
+fn relative(path: &str) -> bool {
+    let mut parts = Path::new(path).components().peekable();
+    parts.peek().is_some() && parts.all(|c| matches!(c, Component::Normal(_)))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -251,4 +275,23 @@ fn decode<T: for<'a> Deserialize<'a>>(bytes: &[u8]) -> Result<T, Error> {
         return Err(Error::Stored(format!("job record version {version}")));
     }
     postcard::from_bytes(rest).map_err(|e| Error::Stored(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_plain_relative_paths_stay_inside_staging() {
+        for (path, inside) in [
+            ("Show.mkv", true),
+            ("Season 1/Show.mkv", true),
+            ("AC_DC Live.mkv", true),
+            ("", false),
+            ("..", false),
+            ("a/../../escape.mkv", false),
+            ("/etc/passwd", false),
+            ("./Show.mkv", false),
+        ] {
+            assert_eq!(super::relative(path), inside, "{path}");
+        }
+    }
 }
