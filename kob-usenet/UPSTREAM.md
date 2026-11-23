@@ -68,8 +68,9 @@ which drives upstream's database-backed queue service.
 | 34 | Viewers come first: while a playback or cache request is active or lingering (2 s, at most the burst it ended, one hour at the very most) Queue, Warm and Health start nothing on any provider and wait holding no slot; seeks take at most `SEEK_CONNECTIONS` beside a cache-ahead; `Workload::Import` keeps stream imports' rank without the hold; downloads weigh by article size; `Client::stat_quick` | ours, reworks 21 and 22's bound on work below cache |
 | 35 | A loopback server holds its port through refuse and resume, so a parallel test cannot take it in the gap | ours, test only, completes 33 |
 | 36 | An inspection reports the files the block list dropped, and whether they were all it found | ours, for refusing executable-only releases before download |
+| 37 | Cache-ahead keeps in flight only what fills the link: a byte bound from 20 MiB that grows while it buys throughput, three quarters of it during a seek, at most 16 pipelined requests across the pool, and connections chosen in request order | ours, reworks 34's cache-ahead |
 
-Patches 5–36 are candidates to offer upstream.
+Patches 5–37 are candidates to offer upstream.
 
 ## Monthly sync
 

@@ -1042,7 +1042,7 @@ async fn playback_finds_a_connection_imports_leave_free() {
         (4, Workload::Queue, 3),
         (10, Workload::Health, 9),
         (16, Workload::Queue, 14),
-        (16, Workload::Cache, 14),
+        (16, Workload::Import, 15),
     ] {
         let ids: Vec<_> = (0..max_connections + 2)
             .map(|index| format!("background-{index}@loopback"))

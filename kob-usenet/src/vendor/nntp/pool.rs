@@ -14,6 +14,7 @@ use crate::vendor::nntp::article::Body;
 use crate::vendor::nntp::client::{BodySink, Lane};
 use crate::vendor::nntp::connection::{ConnectionStats, Link, Phase, Timing, validate_message_id};
 use crate::vendor::nntp::downloads::{Downloads, Permit};
+use crate::vendor::nntp::pace::{Flight, Pace};
 use crate::vendor::nntp::stats::{Stats, Workload, outcome};
 use crate::vendor::nntp::{Connection, Endpoint, Error, Progress, Usage};
 
@@ -55,9 +56,16 @@ const STREAM_SPARE: usize = 4;
 const CACHE_SPARE: usize = 4;
 /// Connections a seek may take from a running cache-ahead, which keeps the rest.
 const SEEK_CONNECTIONS: usize = 2;
-
+/// Cache requests in flight across the pool, at least one per connection: what is pipelined
+/// on a shared link is what a seek has to wait for.
+const CACHE_FLIGHT: usize = 16;
 /// How often a waiting quick check looks again, for changes no connection announces.
 const LIGHT_RECHECK: Duration = Duration::from_millis(50);
+
+const fn cache_depth(limit: usize, depth: usize) -> usize {
+    let wanted = CACHE_FLIGHT.div_ceil(if limit == 0 { 1 } else { limit });
+    if wanted < depth { wanted } else { depth }
+}
 
 /// Connections kept for seeks beside a cache-ahead on a pool of `limit`.
 const fn seek_connections(limit: usize) -> usize {
@@ -104,6 +112,10 @@ pub struct Pool {
     /// [`Workload::Cache`] requests holding a download slot and waiting for a
     /// connection; lower-ranked background work takes none meanwhile.
     cache_parked: Arc<AtomicUsize>,
+    /// Taken in request order by [`Workload::Cache`] requests choosing a connection, so a
+    /// reader's next segment is not outrun by the read-ahead parked behind it.
+    cache_turn: Arc<tokio::sync::Mutex<()>>,
+    pace: Arc<Pace>,
     /// Connection tasks running.
     live: Arc<AtomicUsize>,
     state: Arc<Mutex<State>>,
@@ -343,6 +355,8 @@ impl Drop for Request {
 
 /// Held for exactly the life of one request; dropping it is the completion.
 struct Ticket {
+    // First, so a waiter woken by the connection's load sees these bytes gone.
+    _flight: Flight,
     _download: Permit,
     _load: Load,
     _busy: Load,
@@ -392,6 +406,8 @@ impl Pool {
             stream_waiting: Arc::default(),
             stream_parked: Arc::default(),
             cache_parked: Arc::default(),
+            cache_turn: Arc::default(),
+            pace: Arc::default(),
             live: Arc::default(),
             state: Arc::default(),
             changed: Arc::default(),
@@ -714,10 +730,17 @@ impl Pool {
                 }
                 _ => None,
             };
+            let mut flight = if tag.workload == Workload::Cache {
+                let size = tag.probe.as_ref().map(|probe| u64::from(probe.size));
+                Flight::of(&self.pace, size.or(tag.expected.decoded_len).unwrap_or(0))
+            } else {
+                Flight::default()
+            };
             let picked = if tag.light {
                 Some(self.light_worker().await?)
             } else {
-                self.worker(tag.workload, tag.fresh, deadline, lane).await?
+                self.worker(tag.workload, tag.fresh, deadline, lane, &mut flight)
+                    .await?
             };
             drop(parked);
             let Some((tx, load, ahead, connection)) = picked else {
@@ -739,6 +762,7 @@ impl Pool {
                 connection,
             });
             let ticket = Ticket {
+                _flight: flight,
                 _download: download,
                 _load: load,
                 _busy: Load::acquire(&self.busy),
@@ -795,12 +819,18 @@ impl Pool {
         fresh: bool,
         deadline: Option<tokio::time::Instant>,
         lane: Option<Lane>,
+        flight: &mut Flight,
     ) -> Result<Option<(mpsc::Sender<Request>, Load, usize, u32)>, Failure> {
         let stream = workload == Workload::Stream;
         let outranked = workload.rank().is_some_and(|rank| rank > 0);
         let cached = workload.rank() == Some(0) && lane.is_some();
         let viewers = self.downloads.viewers();
         let (mut impatient, mut first) = (false, true);
+        let mut turn = if workload == Workload::Cache {
+            Some(self.cache_turn.lock().await)
+        } else {
+            None
+        };
         loop {
             let viewer_arrived = viewers.changed();
             let mut viewer_arrived = pin!(viewer_arrived);
@@ -920,11 +950,14 @@ impl Pool {
                         .count()
                         >= most
                 };
-                let spare = spare && !seek_capped;
+                let cache_room = cache_depth(limit, self.config.pipeline_depth);
+                let paced = workload == Workload::Cache && self.pace.full(streaming);
+                let spare = spare && !seek_capped && !paced;
                 let best = state
                     .workers
                     .iter()
                     .filter(|worker| !seek_capped || (busy(worker) && playing(worker)))
+                    .filter(|_| !paced)
                     .filter(|worker| {
                         !seek_capped
                             || worker.load.load(Ordering::Relaxed) < self.config.pipeline_depth
@@ -940,7 +973,7 @@ impl Pool {
                     // yields connections and its read-ahead spreads over them.
                     .filter(|worker| {
                         workload != Workload::Cache
-                            || worker.load.load(Ordering::Relaxed) < self.config.pipeline_depth
+                            || worker.load.load(Ordering::Relaxed) < cache_room
                     })
                     .filter(|worker| !hold_headroom || worker.load.load(Ordering::Relaxed) > 0)
                     .filter(|worker| {
@@ -957,6 +990,7 @@ impl Pool {
                         if (!hold_headroom && w.load.load(Ordering::Relaxed) == 0)
                             || (!fresh && (impatient || (!spare && state.connecting == 0))) =>
                     {
+                        flight.charge();
                         let ahead = w.load.load(Ordering::Relaxed);
                         // An unscoped caller makes the connection mixed until idle;
                         // scoped callers may not pipeline behind that unknown work.
@@ -985,6 +1019,7 @@ impl Pool {
                         return Err(Failure::Connect(Error::Unavailable));
                     }
                     _ if spare => {
+                        flight.charge();
                         state.connecting += 1;
                         true
                     }
@@ -995,6 +1030,8 @@ impl Pool {
                 (reserved, live, held.into_iter().chain(linger).min())
             };
             if reserved {
+                // Connects run side by side; only choosing a connection is in order.
+                drop(turn.take());
                 let now = tokio::time::Instant::now();
                 // A detached connect keeps only the endpoint's own deadline.
                 let until = deadline
@@ -1621,20 +1658,35 @@ mod tests {
         let pool = Pool::new(endpoint, config, Downloads::new(4)).unwrap();
         let deadline = Some(tokio::time::Instant::now());
         assert!(matches!(
-            pool.worker(Workload::Stream, false, deadline, None).await,
+            pool.worker(
+                Workload::Stream,
+                false,
+                deadline,
+                None,
+                &mut Flight::default()
+            )
+            .await,
             Err(Failure::Request(Error::Unavailable))
         ));
         assert_eq!(server.peak_connections(), 0);
         assert_eq!(pool.lock().connecting, 0);
 
-        let Ok(Some((_, load, _, connection))) =
-            pool.worker(Workload::Stream, false, None, None).await
+        let Ok(Some((_, load, _, connection))) = pool
+            .worker(Workload::Stream, false, None, None, &mut Flight::default())
+            .await
         else {
             panic!("a connection opens before admission expires");
         };
         drop(load);
-        let Ok(Some((_, load, _, reused))) =
-            pool.worker(Workload::Stream, false, deadline, None).await
+        let Ok(Some((_, load, _, reused))) = pool
+            .worker(
+                Workload::Stream,
+                false,
+                deadline,
+                None,
+                &mut Flight::default(),
+            )
+            .await
         else {
             panic!("an idle connection is reusable after admission expires");
         };
@@ -1699,8 +1751,11 @@ mod tests {
             stream.write_all(b"200 ready\r\n").await.unwrap();
             (stream, peer.port())
         };
-        let ((stream, client), opened) =
-            tokio::join!(accept, pool.worker(Workload::Stream, false, None, None));
+        let mut flight = Flight::default();
+        let ((stream, client), opened) = tokio::join!(
+            accept,
+            pool.worker(Workload::Stream, false, None, None, &mut flight)
+        );
         let Ok(Some((_, load, _, _))) = opened else {
             panic!("the connection opens");
         };
@@ -1839,7 +1894,8 @@ mod tests {
         let (pool, _server) = loopback_pool(4).await;
         let stream = Present::start(&pool, false);
         let cache = Present::start(&pool, true);
-        let mut queued = Box::pin(pool.worker(Workload::Queue, false, None, None));
+        let mut flight = Flight::default();
+        let mut queued = Box::pin(pool.worker(Workload::Queue, false, None, None, &mut flight));
         pending(&mut queued).await;
         drop(stream);
         drop(cache);
@@ -1856,7 +1912,9 @@ mod tests {
         let (pool, _server) = loopback_pool(2).await;
         let mut held = Vec::new();
         for _ in 0..2 {
-            let Ok(Some((_, load, _, _))) = pool.worker(Workload::Queue, false, None, None).await
+            let Ok(Some((_, load, _, _))) = pool
+                .worker(Workload::Queue, false, None, None, &mut Flight::default())
+                .await
             else {
                 panic!("a connection opens");
             };
@@ -1882,7 +1940,10 @@ mod tests {
     ) -> Result<Option<(mpsc::Sender<Request>, Load, usize, u32)>, Failure> {
         loop {
             pool.downloads.viewers().clear().await;
-            match pool.worker(Workload::Queue, false, None, None).await {
+            match pool
+                .worker(Workload::Queue, false, None, None, &mut Flight::default())
+                .await
+            {
                 Ok(None) => {}
                 picked => return picked,
             }
@@ -1892,7 +1953,10 @@ mod tests {
     async fn saturate(pool: &Pool, workload: Workload, lane: Option<Lane>, n: usize) -> Vec<Load> {
         let mut loads = Vec::new();
         for _ in 0..n {
-            let Ok(Some((_, load, _, _))) = pool.worker(workload, false, None, lane).await else {
+            let Ok(Some((_, load, _, _))) = pool
+                .worker(workload, false, None, lane, &mut Flight::default())
+                .await
+            else {
                 panic!("a connection is available");
             };
             loads.push(load);
@@ -1909,12 +1973,18 @@ mod tests {
             (24, Workload::Queue, 22),
         ] {
             let (pool, _server) = loopback_pool(limit).await;
-            let held = saturate(&pool, workload, None, limit + 2).await;
+            let requests = if workload == Workload::Cache {
+                opened
+            } else {
+                limit + 2
+            };
+            let held = saturate(&pool, workload, None, requests).await;
             assert_eq!(pool.lock().workers.len(), opened, "{limit} {workload:?}");
             if workload == Workload::Queue && limit >= CACHE_HEADROOM_MIN_CONNECTIONS {
                 let lane = Some(Lane::reader(1));
-                let Ok(Some((_, cache, ahead, _))) =
-                    pool.worker(Workload::Cache, false, None, lane).await
+                let Ok(Some((_, cache, ahead, _))) = pool
+                    .worker(Workload::Cache, false, None, lane, &mut Flight::default())
+                    .await
                 else {
                     panic!("the cache reader gets the slot left for it");
                 };
@@ -1933,7 +2003,7 @@ mod tests {
         // Two download connections sit under the share a cache reader leaves them, with
         // pipeline room, so only the waiting cache request holds them back.
         let queue = saturate(&pool, Workload::Queue, None, 2).await;
-        let cache = saturate(&pool, Workload::Cache, Some(lane), 24).await;
+        let cache = saturate(&pool, Workload::Cache, Some(lane), 12).await;
         let tag = Tag {
             workload: Workload::Cache,
             lane: Some(lane),

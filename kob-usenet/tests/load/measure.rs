@@ -1,23 +1,26 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use kob_usenet::vendor::testkit::{Article, Impairment, LoopbackServer, post};
+use kob_usenet::vendor::testkit::{Article, LoopbackServer, post};
 use kob_usenet::{Engine, EngineConfig, ImportMode, JobSpec, JobState, Purpose, Release};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
+use crate::link::Link;
 use crate::rig::{media, single_nzb};
 use crate::support::{POSTED, quoted, server};
 
-const CONNECTIONS: usize = 32;
-const LATENCY: Duration = Duration::from_millis(100);
-const PER_CONNECTION: u64 = 1_500_000;
+const CONNECTIONS: usize = 49;
+const ROUND_TRIP: Duration = Duration::from_millis(206);
+const LINK: u64 = 25_000_000;
+const SEEK_LEAD: Duration = Duration::from_secs(9);
+const SEEK_AHEAD: u64 = 64 << 20;
 const FILM_BYTES: usize = 900_000_000;
 const LIBRARY_BYTES: usize = 1_500_000_000;
-const SEEK_EVERY: Duration = Duration::from_millis(400);
-const SEEK_READ: usize = 256 * 1024;
+const SEEK_EVERY: Duration = Duration::from_millis(150);
+const SEEK_READ: usize = 2 << 20;
 const REPAIR_BYTES: usize = 420_000_000;
 const SOLVING_CORES: f64 = 2.0;
 const CLOCK_TICKS: f64 = 100.0;
@@ -160,17 +163,9 @@ async fn serve() {
     if let Some(path) = std::env::var_os("KOB_MEASURE_NZB") {
         articles.extend(damaged_release(article, std::path::Path::new(&path)));
     }
-    let nntp = LoopbackServer::start_impaired(
-        articles,
-        Impairment {
-            response_delay: LATENCY,
-            bandwidth: Some(PER_CONNECTION),
-            ..Impairment::default()
-        },
-    )
-    .await
-    .unwrap();
-    println!("PORT={}", nntp.addr().port());
+    let nntp = LoopbackServer::start(articles).await.unwrap();
+    let front = Link::new(LINK, ROUND_TRIP).front(nntp.addr()).await;
+    println!("PORT={}", front.port());
     std::io::stdout().flush().unwrap();
     tokio::task::spawn_blocking(|| {
         let mut sink = [0; 1];
@@ -194,7 +189,13 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[((sorted.len() - 1) as f64 * p).round() as usize]
 }
 
-async fn seeks(engine: Arc<Engine>, film: Release, done: Arc<AtomicBool>) -> Vec<f64> {
+async fn seeks(
+    engine: Arc<Engine>,
+    film: Release,
+    done: Arc<AtomicBool>,
+    position: Arc<AtomicU64>,
+) -> Vec<(f64, f64)> {
+    tokio::time::sleep(SEEK_LEAD).await;
     let mut timings = Vec::new();
     let mut state = 0x9E37_79B9_u64;
     while !done.load(Ordering::Relaxed) {
@@ -202,13 +203,22 @@ async fn seeks(engine: Arc<Engine>, film: Release, done: Arc<AtomicBool>) -> Vec
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1);
         let mut reader = engine.open(&film.key, 0, Purpose::Play).unwrap();
-        let at = (state >> 16) % (reader.len() - SEEK_READ as u64);
+        let from = position.load(Ordering::Relaxed) + SEEK_AHEAD;
+        let last = reader.len() - SEEK_READ as u64;
+        if from >= last {
+            break;
+        }
+        let at = from + (state >> 16) % (last - from);
         reader.set_end(at + SEEK_READ as u64);
         let started = Instant::now();
         reader.seek(std::io::SeekFrom::Start(at)).await.unwrap();
         let mut buf = vec![0; SEEK_READ];
-        reader.read_exact(&mut buf).await.unwrap();
-        timings.push(started.elapsed().as_secs_f64());
+        let mut got = reader.read(&mut buf).await.unwrap();
+        let first = started.elapsed().as_secs_f64();
+        while got < SEEK_READ {
+            got += reader.read(&mut buf[got..]).await.unwrap();
+        }
+        timings.push((first, started.elapsed().as_secs_f64()));
         drop(reader);
         tokio::time::sleep(SEEK_EVERY).await;
     }
@@ -318,28 +328,42 @@ async fn scenario() {
     };
 
     let done = Arc::new(AtomicBool::new(false));
-    let seeker = seeking()
-        .then(|| tokio::spawn(seeks(Arc::clone(&engine), film.clone(), Arc::clone(&done))));
+    let position = Arc::new(AtomicU64::new(0));
+    let seeker = seeking().then(|| {
+        tokio::spawn(seeks(
+            Arc::clone(&engine),
+            film.clone(),
+            Arc::clone(&done),
+            Arc::clone(&position),
+        ))
+    });
     let queued_before = engine.job("library").unwrap().bytes_done;
     let started = Instant::now();
     let mut reader = engine.open(&film.key, 0, Purpose::Cache).unwrap();
     let mut buf = vec![0; 256 * 1024];
     let mut read = 0_u64;
+    let (mut last, mut longest_gap) = (Instant::now(), Duration::ZERO);
     loop {
         let n = reader.read(&mut buf).await.unwrap();
         if n == 0 {
             break;
         }
+        longest_gap = longest_gap.max(last.elapsed());
+        last = Instant::now();
         read += n as u64;
+        position.store(read, Ordering::Relaxed);
     }
     let took = started.elapsed().as_secs_f64();
     let queued_at_end = engine.job("library").unwrap().bytes_done;
     drop(reader);
     done.store(true, Ordering::Relaxed);
-    let mut timings = match seeker {
+    let timings = match seeker {
         Some(seeker) => seeker.await.unwrap(),
         None => Vec::new(),
     };
+    let mut whole: Vec<f64> = timings.iter().map(|t| t.1).collect();
+    whole.sort_by(f64::total_cmp);
+    let mut timings: Vec<f64> = timings.iter().map(|t| t.0).collect();
     timings.sort_by(f64::total_cmp);
 
     let repair_state = repairing().then(|| (solving, engine.job("damaged").unwrap().state));
@@ -361,13 +385,17 @@ async fn scenario() {
     tokio::time::sleep(Duration::from_secs(4)).await;
     let after_rate = (engine.job("library").unwrap().bytes_done - before) as f64 / 4e6;
     println!(
-        "RESULT article={article} seeks={} p50={:.2} p95={:.2} p99={:.2} cache_mbs={:.1} queue_mbs={:.1} cache_secs={took:.1} resume_s={resume:.2} queue_after_mbs={after_rate:.1} peak_rss_mib={} repair_after={repair_state:?}",
+        "RESULT article={article} seeks={} p50={:.2} p95={:.2} p99={:.2} read2mb_p50={:.2} read2mb_p95={:.2} read2mb_max={:.2} cache_mbs={:.1} queue_mbs={:.1} cache_secs={took:.1} longest_gap={:.2} resume_s={resume:.2} queue_after_mbs={after_rate:.1} peak_rss_mib={} repair_after={repair_state:?}",
         timings.len(),
         percentile(&timings, 0.5),
         percentile(&timings, 0.95),
         percentile(&timings, 0.99),
+        percentile(&whole, 0.5),
+        percentile(&whole, 0.95),
+        percentile(&whole, 1.0),
         read as f64 / took / 1e6,
         (queued_at_end - queued_before) as f64 / took / 1e6,
+        longest_gap.as_secs_f64(),
         peak_rss_mib(),
     );
 }

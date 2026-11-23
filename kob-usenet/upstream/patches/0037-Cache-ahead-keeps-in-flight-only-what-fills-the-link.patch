@@ -1,0 +1,481 @@
+From 08c02c80c3e2c0c0e35d67625d5a52b47075ed5e Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Tue, 24 Nov 2026 08:00:01 +1100
+Subject: [PATCH] Cache-ahead keeps in flight only what fills the link, in
+ request order
+
+---
+ crates/nntp/src/lib.rs      |   1 +
+ crates/nntp/src/pace.rs     | 178 ++++++++++++++++++++++++++++++++++++
+ crates/nntp/src/pool.rs     |  74 ++++++++++++---
+ crates/nntp/tests/client.rs |   2 +-
+ 4 files changed, 239 insertions(+), 16 deletions(-)
+ create mode 100644 crates/nntp/src/pace.rs
+
+diff --git a/crates/nntp/src/lib.rs b/crates/nntp/src/lib.rs
+index cae9fa5b..612951b5 100644
+--- a/crates/nntp/src/lib.rs
++++ b/crates/nntp/src/lib.rs
+@@ -8,6 +8,7 @@ mod client;
+ mod connection;
+ mod downloads;
+ mod missing;
++mod pace;
+ pub mod patch;
+ mod pool;
+ mod resolve;
+diff --git a/crates/nntp/src/pace.rs b/crates/nntp/src/pace.rs
+new file mode 100644
+index 00000000..fd3da92e
+--- /dev/null
++++ b/crates/nntp/src/pace.rs
+@@ -0,0 +1,178 @@
++//! How many bytes a cache-ahead keeps in flight. Connections on one link split it evenly, so
++//! whatever is in flight beyond what fills the link only delays a seek. The bound starts
++//! small and grows while more in flight buys more throughput, as it does on a provider that
++//! caps each connection.
++
++use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
++use std::time::{Duration, Instant};
++
++const INITIAL: u64 = 20 << 20;
++/// Quarters of the bound a cache-ahead keeps while a seek runs.
++const SEEKING_SHARE: u64 = 3;
++const PROBE: Duration = Duration::from_secs(2);
++const IDLE_RESET: Duration = Duration::from_secs(10);
++/// Growth that counts as the link not being full yet.
++const GAIN: f64 = 1.15;
++
++#[derive(Debug)]
++struct State {
++    limit: u64,
++    in_flight: u64,
++    tried: Option<(u64, f64)>,
++    settled: bool,
++    window: Instant,
++    landed: u64,
++    bound: bool,
++    seeking: bool,
++    last: Instant,
++}
++
++#[derive(Debug)]
++pub(crate) struct Pace(Mutex<State>);
++
++impl Default for Pace {
++    fn default() -> Self {
++        let now = Instant::now();
++        Self(Mutex::new(State {
++            limit: INITIAL,
++            in_flight: 0,
++            tried: None,
++            settled: false,
++            window: now,
++            landed: 0,
++            bound: false,
++            seeking: false,
++            last: now,
++        }))
++    }
++}
++
++impl Pace {
++    fn lock(&self) -> MutexGuard<'_, State> {
++        self.0.lock().unwrap_or_else(PoisonError::into_inner)
++    }
++
++    /// Whether another request must wait. While a seek runs the bound halves; a lone request
++    /// always goes, so an article larger than the bound still moves.
++    pub(crate) fn full(&self, seeking: bool) -> bool {
++        let mut state = self.lock();
++        state.seeking |= seeking;
++        let limit = if seeking { state.limit * SEEKING_SHARE / 4 } else { state.limit };
++        let full = state.in_flight > 0 && state.in_flight >= limit;
++        state.bound |= full;
++        full
++    }
++
++    fn landed(&self, bytes: u64, now: Instant) {
++        let mut state = self.lock();
++        state.in_flight = state.in_flight.saturating_sub(bytes);
++        state.landed += bytes;
++        state.last = now;
++        let elapsed = now.duration_since(state.window);
++        if elapsed < PROBE {
++            return;
++        }
++        if state.bound && !state.seeking && !state.settled {
++            let rate = state.landed as f64 / elapsed.as_secs_f64();
++            match state.tried {
++                Some((limit, best)) if rate < best * GAIN => {
++                    state.limit = limit;
++                    state.settled = true;
++                }
++                _ => {
++                    state.tried = Some((state.limit, rate));
++                    state.limit += state.limit / 2;
++                }
++            }
++        }
++        state.window = now;
++        state.landed = 0;
++        state.bound = false;
++        state.seeking = false;
++    }
++
++    fn charge(&self, bytes: u64, now: Instant) {
++        let mut state = self.lock();
++        if state.in_flight == 0 && now.duration_since(state.last) >= IDLE_RESET {
++            *state = State {
++                in_flight: 0,
++                window: now,
++                last: now,
++                ..Self::default().0.into_inner().unwrap_or_else(PoisonError::into_inner)
++            };
++        }
++        state.in_flight += bytes;
++    }
++}
++
++/// One cache request's bytes, counted in flight from when it takes a connection.
++#[derive(Debug, Default)]
++pub(crate) struct Flight {
++    pace: Option<Arc<Pace>>,
++    bytes: u64,
++    charged: bool,
++}
++
++impl Flight {
++    pub(crate) fn of(pace: &Arc<Pace>, bytes: u64) -> Self {
++        Self {
++            pace: Some(Arc::clone(pace)),
++            bytes,
++            charged: false,
++        }
++    }
++
++    pub(crate) fn charge(&mut self) {
++        if let (Some(pace), false) = (&self.pace, self.charged) {
++            pace.charge(self.bytes, Instant::now());
++            self.charged = true;
++        }
++    }
++}
++
++impl Drop for Flight {
++    fn drop(&mut self) {
++        if let (Some(pace), true) = (&self.pace, self.charged) {
++            pace.landed(self.bytes, Instant::now());
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const ARTICLE: u64 = 1 << 20;
++
++    fn window(pace: &Pace, at: &mut Instant, rate: u64) -> u64 {
++        pace.charge(ARTICLE, *at);
++        assert!(!pace.full(false) || pace.lock().limit <= ARTICLE);
++        pace.lock().bound = true;
++        pace.lock().landed = rate * PROBE.as_secs() - ARTICLE;
++        *at += PROBE;
++        pace.landed(ARTICLE, *at);
++        pace.lock().limit
++    }
++
++    #[test]
++    fn the_bound_grows_while_it_buys_throughput_and_returns_when_it_stops() {
++        let pace = Pace::default();
++        let mut at = pace.lock().window;
++        let grown = window(&pace, &mut at, 10 << 20);
++        assert_eq!(grown, INITIAL * 3 / 2);
++        let grown = window(&pace, &mut at, 15 << 20);
++        assert_eq!(grown, INITIAL * 9 / 4);
++        assert_eq!(window(&pace, &mut at, 15 << 20), INITIAL * 3 / 2);
++        assert_eq!(window(&pace, &mut at, 40 << 20), INITIAL * 3 / 2, "settled");
++    }
++
++    #[test]
++    fn a_lone_request_always_goes_and_a_seek_halves_the_bound() {
++        let pace = Pace::default();
++        let now = Instant::now();
++        assert!(!pace.full(true));
++        pace.charge(INITIAL * SEEKING_SHARE / 4, now);
++        assert!(!pace.full(false));
++        assert!(pace.full(true));
++    }
++}
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index f9cb5004..06ad4133 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -14,6 +14,7 @@ use crate::article::Body;
+ use crate::client::{BodySink, Lane};
+ use crate::connection::{ConnectionStats, Link, Phase, Timing, validate_message_id};
+ use crate::downloads::{Downloads, Permit};
++use crate::pace::{Flight, Pace};
+ use crate::stats::{Stats, Workload, outcome};
+ use crate::{Connection, Endpoint, Error, Progress, Usage};
+ 
+@@ -55,10 +56,17 @@ const STREAM_SPARE: usize = 4;
+ const CACHE_SPARE: usize = 4;
+ /// Connections a seek may take from a running cache-ahead, which keeps the rest.
+ const SEEK_CONNECTIONS: usize = 2;
+-
++/// Cache requests in flight across the pool, at least one per connection: what is pipelined
++/// on a shared link is what a seek has to wait for.
++const CACHE_FLIGHT: usize = 16;
+ /// How often a waiting quick check looks again, for changes no connection announces.
+ const LIGHT_RECHECK: Duration = Duration::from_millis(50);
+ 
++const fn cache_depth(limit: usize, depth: usize) -> usize {
++    let wanted = CACHE_FLIGHT.div_ceil(if limit == 0 { 1 } else { limit });
++    if wanted < depth { wanted } else { depth }
++}
++
+ /// Connections kept for seeks beside a cache-ahead on a pool of `limit`.
+ const fn seek_connections(limit: usize) -> usize {
+     if limit < STREAM_HEADROOM_MIN_CONNECTIONS {
+@@ -104,6 +112,10 @@ pub struct Pool {
+     /// [`Workload::Cache`] requests holding a download slot and waiting for a
+     /// connection; lower-ranked background work takes none meanwhile.
+     cache_parked: Arc<AtomicUsize>,
++    /// Taken in request order by [`Workload::Cache`] requests choosing a connection, so a
++    /// reader's next segment is not outrun by the read-ahead parked behind it.
++    cache_turn: Arc<tokio::sync::Mutex<()>>,
++    pace: Arc<Pace>,
+     /// Connection tasks running.
+     live: Arc<AtomicUsize>,
+     state: Arc<Mutex<State>>,
+@@ -343,6 +355,8 @@ impl Drop for Request {
+ 
+ /// Held for exactly the life of one request; dropping it is the completion.
+ struct Ticket {
++    // First, so a waiter woken by the connection's load sees these bytes gone.
++    _flight: Flight,
+     _download: Permit,
+     _load: Load,
+     _busy: Load,
+@@ -392,6 +406,8 @@ impl Pool {
+             stream_waiting: Arc::default(),
+             stream_parked: Arc::default(),
+             cache_parked: Arc::default(),
++            cache_turn: Arc::default(),
++            pace: Arc::default(),
+             live: Arc::default(),
+             state: Arc::default(),
+             changed: Arc::default(),
+@@ -714,10 +730,17 @@ impl Pool {
+                 }
+                 _ => None,
+             };
++            let mut flight = if tag.workload == Workload::Cache {
++                let size = tag.probe.as_ref().map(|probe| u64::from(probe.size));
++                Flight::of(&self.pace, size.or(tag.expected.decoded_len).unwrap_or(0))
++            } else {
++                Flight::default()
++            };
+             let picked = if tag.light {
+                 Some(self.light_worker().await?)
+             } else {
+-                self.worker(tag.workload, tag.fresh, deadline, lane).await?
++                self.worker(tag.workload, tag.fresh, deadline, lane, &mut flight)
++                    .await?
+             };
+             drop(parked);
+             let Some((tx, load, ahead, connection)) = picked else {
+@@ -739,6 +762,7 @@ impl Pool {
+                 connection,
+             });
+             let ticket = Ticket {
++                _flight: flight,
+                 _download: download,
+                 _load: load,
+                 _busy: Load::acquire(&self.busy),
+@@ -795,12 +819,18 @@ impl Pool {
+         fresh: bool,
+         deadline: Option<tokio::time::Instant>,
+         lane: Option<Lane>,
++        flight: &mut Flight,
+     ) -> Result<Option<(mpsc::Sender<Request>, Load, usize, u32)>, Failure> {
+         let stream = workload == Workload::Stream;
+         let outranked = workload.rank().is_some_and(|rank| rank > 0);
+         let cached = workload.rank() == Some(0) && lane.is_some();
+         let viewers = self.downloads.viewers();
+         let (mut impatient, mut first) = (false, true);
++        let mut turn = if workload == Workload::Cache {
++            Some(self.cache_turn.lock().await)
++        } else {
++            None
++        };
+         loop {
+             let viewer_arrived = viewers.changed();
+             let mut viewer_arrived = pin!(viewer_arrived);
+@@ -919,11 +949,14 @@ impl Pool {
+                         .count()
+                         >= most
+                 };
+-                let spare = spare && !seek_capped;
++                let cache_room = cache_depth(limit, self.config.pipeline_depth);
++                let paced = workload == Workload::Cache && self.pace.full(streaming);
++                let spare = spare && !seek_capped && !paced;
+                 let best = state
+                     .workers
+                     .iter()
+                     .filter(|worker| !seek_capped || (busy(worker) && playing(worker)))
++                    .filter(|_| !paced)
+                     .filter(|worker| {
+                         !seek_capped
+                             || worker.load.load(Ordering::Relaxed) < self.config.pipeline_depth
+@@ -939,7 +972,7 @@ impl Pool {
+                     // yields connections and its read-ahead spreads over them.
+                     .filter(|worker| {
+                         workload != Workload::Cache
+-                            || worker.load.load(Ordering::Relaxed) < self.config.pipeline_depth
++                            || worker.load.load(Ordering::Relaxed) < cache_room
+                     })
+                     .filter(|worker| !hold_headroom || worker.load.load(Ordering::Relaxed) > 0)
+                     .filter(|worker| {
+@@ -956,6 +989,7 @@ impl Pool {
+                         if (!hold_headroom && w.load.load(Ordering::Relaxed) == 0)
+                             || (!fresh && (impatient || (!spare && state.connecting == 0))) =>
+                     {
++                        flight.charge();
+                         let ahead = w.load.load(Ordering::Relaxed);
+                         // An unscoped caller makes the connection mixed until idle;
+                         // scoped callers may not pipeline behind that unknown work.
+@@ -984,6 +1018,7 @@ impl Pool {
+                         return Err(Failure::Connect(Error::Unavailable));
+                     }
+                     _ if spare => {
++                        flight.charge();
+                         state.connecting += 1;
+                         true
+                     }
+@@ -994,6 +1029,8 @@ impl Pool {
+                 (reserved, live, held.into_iter().chain(linger).min())
+             };
+             if reserved {
++                // Connects run side by side; only choosing a connection is in order.
++                drop(turn.take());
+                 let now = tokio::time::Instant::now();
+                 // A detached connect keeps only the endpoint's own deadline.
+                 let until = deadline
+@@ -1620,18 +1657,18 @@ mod tests {
+         let pool = Pool::new(endpoint, config, Downloads::new(4)).unwrap();
+         let deadline = Some(tokio::time::Instant::now());
+         assert!(matches!(
+-            pool.worker(Workload::Stream, false, deadline, None).await,
++            pool.worker(Workload::Stream, false, deadline, None, &mut Flight::default()).await,
+             Err(Failure::Request(Error::Unavailable))
+         ));
+         assert_eq!(server.peak_connections(), 0);
+         assert_eq!(pool.lock().connecting, 0);
+ 
+-        let Ok(Some((_, load, _, connection))) = pool.worker(Workload::Stream, false, None, None).await
++        let Ok(Some((_, load, _, connection))) = pool.worker(Workload::Stream, false, None, None, &mut Flight::default()).await
+         else {
+             panic!("a connection opens before admission expires");
+         };
+         drop(load);
+-        let Ok(Some((_, load, _, reused))) = pool.worker(Workload::Stream, false, deadline, None).await
++        let Ok(Some((_, load, _, reused))) = pool.worker(Workload::Stream, false, deadline, None, &mut Flight::default()).await
+         else {
+             panic!("an idle connection is reusable after admission expires");
+         };
+@@ -1696,8 +1733,9 @@ mod tests {
+             stream.write_all(b"200 ready\r\n").await.unwrap();
+             (stream, peer.port())
+         };
++        let mut flight = Flight::default();
+         let ((stream, client), opened) =
+-            tokio::join!(accept, pool.worker(Workload::Stream, false, None, None));
++            tokio::join!(accept, pool.worker(Workload::Stream, false, None, None, &mut flight));
+         let Ok(Some((_, load, _, _))) = opened else {
+             panic!("the connection opens");
+         };
+@@ -1834,7 +1872,8 @@ mod tests {
+         let (pool, _server) = loopback_pool(4).await;
+         let stream = Present::start(&pool, false);
+         let cache = Present::start(&pool, true);
+-        let mut queued = Box::pin(pool.worker(Workload::Queue, false, None, None));
++        let mut flight = Flight::default();
++        let mut queued = Box::pin(pool.worker(Workload::Queue, false, None, None, &mut flight));
+         pending(&mut queued).await;
+         drop(stream);
+         drop(cache);
+@@ -1851,7 +1890,7 @@ mod tests {
+         let (pool, _server) = loopback_pool(2).await;
+         let mut held = Vec::new();
+         for _ in 0..2 {
+-            let Ok(Some((_, load, _, _))) = pool.worker(Workload::Queue, false, None, None).await else {
++            let Ok(Some((_, load, _, _))) = pool.worker(Workload::Queue, false, None, None, &mut Flight::default()).await else {
+                 panic!("a connection opens");
+             };
+             held.push(load);
+@@ -1876,7 +1915,7 @@ mod tests {
+     ) -> Result<Option<(mpsc::Sender<Request>, Load, usize, u32)>, Failure> {
+         loop {
+             pool.downloads.viewers().clear().await;
+-            match pool.worker(Workload::Queue, false, None, None).await {
++            match pool.worker(Workload::Queue, false, None, None, &mut Flight::default()).await {
+                 Ok(None) => {}
+                 picked => return picked,
+             }
+@@ -1886,7 +1925,7 @@ mod tests {
+     async fn saturate(pool: &Pool, workload: Workload, lane: Option<Lane>, n: usize) -> Vec<Load> {
+         let mut loads = Vec::new();
+         for _ in 0..n {
+-            let Ok(Some((_, load, _, _))) = pool.worker(workload, false, None, lane).await else {
++            let Ok(Some((_, load, _, _))) = pool.worker(workload, false, None, lane, &mut Flight::default()).await else {
+                 panic!("a connection is available");
+             };
+             loads.push(load);
+@@ -1903,12 +1942,17 @@ mod tests {
+             (24, Workload::Queue, 22),
+         ] {
+             let (pool, _server) = loopback_pool(limit).await;
+-            let held = saturate(&pool, workload, None, limit + 2).await;
++            let requests = if workload == Workload::Cache {
++                opened
++            } else {
++                limit + 2
++            };
++            let held = saturate(&pool, workload, None, requests).await;
+             assert_eq!(pool.lock().workers.len(), opened, "{limit} {workload:?}");
+             if workload == Workload::Queue && limit >= CACHE_HEADROOM_MIN_CONNECTIONS {
+                 let lane = Some(Lane::reader(1));
+                 let Ok(Some((_, cache, ahead, _))) =
+-                    pool.worker(Workload::Cache, false, None, lane).await
++                    pool.worker(Workload::Cache, false, None, lane, &mut Flight::default()).await
+                 else {
+                     panic!("the cache reader gets the slot left for it");
+                 };
+@@ -1927,7 +1971,7 @@ mod tests {
+         // Two download connections sit under the share a cache reader leaves them, with
+         // pipeline room, so only the waiting cache request holds them back.
+         let queue = saturate(&pool, Workload::Queue, None, 2).await;
+-        let cache = saturate(&pool, Workload::Cache, Some(lane), 24).await;
++        let cache = saturate(&pool, Workload::Cache, Some(lane), 12).await;
+         let tag = Tag {
+             workload: Workload::Cache,
+             lane: Some(lane),
+diff --git a/crates/nntp/tests/client.rs b/crates/nntp/tests/client.rs
+index 983d20d5..933e39d4 100644
+--- a/crates/nntp/tests/client.rs
++++ b/crates/nntp/tests/client.rs
+@@ -1037,7 +1037,7 @@ async fn playback_finds_a_connection_imports_leave_free() {
+         (4, Workload::Queue, 3),
+         (10, Workload::Health, 9),
+         (16, Workload::Queue, 14),
+-        (16, Workload::Cache, 14),
++        (16, Workload::Import, 15),
+     ] {
+         let ids: Vec<_> = (0..max_connections + 2)
+             .map(|index| format!("background-{index}@loopback"))
+-- 
+2.56.1
+

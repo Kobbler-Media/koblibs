@@ -7,6 +7,7 @@ mod client;
 mod connection;
 mod downloads;
 mod missing;
+mod pace;
 pub mod patch;
 mod pool;
 mod resolve;
