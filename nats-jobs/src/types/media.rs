@@ -222,6 +222,10 @@ pub enum MediaWant {
         /// Episode title (e.g. "My First Day") for disambiguation boosting.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         episode_title: Option<String>,
+        /// Earliest air date in the season (ISO 8601). Providers list binge-dropped
+        /// seasons weekly, so once this has passed the episode's own date is no gate.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        season_premiere: Option<String>,
         quality_profile_id: Option<Uuid>,
         quality_overrides: Option<QualityOverrides>,
     },

@@ -3,7 +3,8 @@ use std::time::Duration;
 use kob_usenet::vendor::testkit::{Article, Impairment, LoopbackServer, post};
 use kob_usenet::{Engine, EngineConfig, JobSpec, JobState, ServerConfig};
 
-use crate::support::{ARTICLE, Fixture, POSTED, engine, quoted, server};
+pub use crate::support::single_nzb;
+use crate::support::{ARTICLE, Fixture, engine, server};
 
 const LIBRARY_ARTICLES: usize = 1500;
 const LATENCY: Duration = Duration::from_millis(20);
@@ -181,22 +182,4 @@ pub fn media(len: usize, modulus: usize) -> Vec<u8> {
     let mut data: Vec<u8> = (0..len).map(|i| (i % modulus) as u8).collect();
     data[..4].copy_from_slice(&[0x1A, 0x45, 0xDF, 0xA3]);
     data
-}
-
-pub fn single_nzb(prefix: &str, name: &str, parts: usize, article: usize) -> Vec<u8> {
-    let mut xml = String::from(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
-    );
-    xml.push_str(&format!(
-        "<file poster=\"p\" date=\"{POSTED}\" subject=\"{}\"><groups><group>a.b</group></groups><segments>\n",
-        quoted(name, 1, 1).replace('"', "&quot;")
-    ));
-    for part in 0..parts {
-        xml.push_str(&format!(
-            "<segment bytes=\"{article}\" number=\"{}\">{prefix}-{part}@loopback</segment>\n",
-            part + 1
-        ));
-    }
-    xml.push_str("</segments></file>\n</nzb>\n");
-    xml.into_bytes()
 }

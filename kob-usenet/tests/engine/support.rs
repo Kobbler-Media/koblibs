@@ -104,6 +104,24 @@ pub fn quoted(name: &str, n: usize, total: usize) -> String {
     format!("[{n}/{total}] - \"{name}\" yEnc (1/1)")
 }
 
+pub fn single_nzb(prefix: &str, name: &str, parts: usize, article: usize) -> Vec<u8> {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    xml.push_str(&format!(
+        "<file poster=\"p\" date=\"{POSTED}\" subject=\"{}\"><groups><group>a.b</group></groups><segments>\n",
+        quoted(name, 1, 1).replace('"', "&quot;")
+    ));
+    for part in 0..parts {
+        xml.push_str(&format!(
+            "<segment bytes=\"{article}\" number=\"{}\">{prefix}-{part}@loopback</segment>\n",
+            part + 1
+        ));
+    }
+    xml.push_str("</segments></file>\n</nzb>\n");
+    xml.into_bytes()
+}
+
 pub fn bare(name: &str, _: usize, _: usize) -> String {
     format!("Re: {name} yEnc")
 }

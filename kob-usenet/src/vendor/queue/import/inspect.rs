@@ -1,7 +1,7 @@
 //! Inspection: the planner run on an NZB that is never imported, and the report of what
 //! it saw.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -81,6 +81,10 @@ struct Notes {
     opaque: bool,
     /// A limit was reached; stays set whatever became of the error.
     exceeded: bool,
+    /// Files and members the block list dropped.
+    blocked: BTreeSet<String>,
+    /// Filtering left nothing to import.
+    emptied: bool,
 }
 
 struct Unread {
@@ -293,6 +297,11 @@ pub struct Inspection {
     pub limit_exceeded: bool,
     /// An archive inside an archive stayed a file, so its members are not listed.
     pub nested_archive_opaque: bool,
+    /// Files and members the block list dropped, which [`Self::files`] leaves out.
+    pub blocked: Vec<String>,
+    /// Every name was read and the block list dropped all of them, so an import finds
+    /// nothing; [`Self::manifest_complete`] is false for that failure.
+    pub only_blocked: bool,
     pub failure: Option<Failure>,
     pub timings: Timings,
     /// Article requests the planner issued for every NZB read; failover inside the client
@@ -322,6 +331,18 @@ impl Job {
         self.inspection
             .as_ref()
             .is_some_and(|run| run.notes().failure.is_some())
+    }
+
+    pub(super) fn note_blocked(&self, name: &str) {
+        let Some(run) = &self.inspection else {
+            return;
+        };
+        let mut notes = run.notes();
+        if notes.blocked.len() < run.limits.reported {
+            notes.blocked.insert(name.to_owned());
+        } else if !notes.blocked.contains(name) {
+            notes.exceeded = true;
+        }
     }
 
     fn over(&self, why: &'static str) -> Error {
@@ -603,6 +624,11 @@ impl Inspector {
             .collect();
         Level::Report(Inspection {
             manifest_complete: listed && !notes.opaque && !notes.exceeded,
+            only_blocked: notes.emptied
+                && !notes.opaque
+                && !notes.exceeded
+                && !notes.blocked.is_empty(),
+            blocked: std::mem::take(&mut notes.blocked).into_iter().collect(),
             files,
             password_not_validated: notes
                 .sets
@@ -629,6 +655,7 @@ impl Inspector {
         let listing = async {
             let outputs = filter(outputs, job);
             if outputs.is_empty() && self.run.notes().unread.is_empty() {
+                self.run.notes().emptied = true;
                 return Err(failed("No importable files found."));
             }
             let limit = self.run.limits.reported;

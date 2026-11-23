@@ -322,3 +322,30 @@ async fn a_refusing_loopback_server_keeps_its_port_until_it_resumes() {
     server.resume().await.unwrap();
     assert!(tokio::net::TcpStream::connect(server.addr()).await.is_ok());
 }
+
+#[tokio::test]
+async fn a_resuming_loopback_server_never_lets_go_of_its_port() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let server = LoopbackServer::start(Vec::new()).await.unwrap();
+    let addr = server.addr();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stolen = Arc::new(AtomicUsize::new(0));
+    let thief = {
+        let (stop, stolen) = (Arc::clone(&stop), Arc::clone(&stolen));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if std::net::TcpListener::bind(addr).is_ok() {
+                    stolen.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+    };
+    let mut failed = 0;
+    for _ in 0..300 {
+        server.refuse().await;
+        failed += usize::from(server.resume().await.is_err());
+    }
+    stop.store(true, Ordering::Relaxed);
+    thief.join().unwrap();
+    assert_eq!((failed, stolen.load(Ordering::Relaxed)), (0, 0));
+}

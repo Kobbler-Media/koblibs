@@ -65,8 +65,11 @@ which drives upstream's database-backed queue service.
 | 31 | An account permit is owned by its connection and outlives the socket in every task state; idle connections log out before freeing it | ours |
 | 32 | Loopback server uncounts a connection before closing it, so `peak_connections` never counts one the client saw close | ours, test only |
 | 33 | A refusing loopback server keeps its port, so a parallel test's server cannot answer in its place | ours, test only |
+| 34 | Viewers come first: while a playback or cache request is active or lingering (2 s, at most the burst it ended, one hour at the very most) Queue, Warm and Health start nothing on any provider and wait holding no slot; seeks take at most `SEEK_CONNECTIONS` beside a cache-ahead; `Workload::Import` keeps stream imports' rank without the hold; downloads weigh by article size; `Client::stat_quick` | ours, reworks 21 and 22's bound on work below cache |
+| 35 | A loopback server holds its port through refuse and resume, so a parallel test cannot take it in the gap | ours, test only, completes 33 |
+| 36 | An inspection reports the files the block list dropped, and whether they were all it found | ours, for refusing executable-only releases before download |
 
-Patches 5–33 are candidates to offer upstream.
+Patches 5–36 are candidates to offer upstream.
 
 ## Monthly sync
 

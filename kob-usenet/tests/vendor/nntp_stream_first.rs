@@ -181,7 +181,10 @@ async fn playback_reads_are_not_queued_behind_a_saturating_download() {
     // Relative to a read on an idle connection (~0.3 s), so a slow runner does not fail
     // it: behind four queued articles a read takes about three of those.
     assert!(p99 < idle * 5 / 2, "p99 {p99:?}, idle read {idle:?}");
-    assert!(shared > alone * 0.8, "{shared:.1} of {alone:.1} MB/s");
+    assert!(
+        shared < alone * 0.8,
+        "the queue kept {shared:.1} of {alone:.1} MB/s while playback was active"
+    );
 }
 
 #[tokio::test]

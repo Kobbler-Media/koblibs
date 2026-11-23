@@ -1,0 +1,111 @@
+From 59f7dd6fc5c10838f14322677a4e770a4bfbd48c Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 22:10:42 +1100
+Subject: [PATCH] A loopback server holds its port through refuse and resume
+
+---
+ crates/nntp/tests/pool.rs    | 27 +++++++++++++++++++++++++++
+ crates/testkit/src/server.rs | 24 ++++++++++++++++++------
+ 2 files changed, 45 insertions(+), 6 deletions(-)
+
+diff --git a/crates/nntp/tests/pool.rs b/crates/nntp/tests/pool.rs
+index 8e842029..fa886388 100644
+--- a/crates/nntp/tests/pool.rs
++++ b/crates/nntp/tests/pool.rs
+@@ -322,3 +322,30 @@ async fn a_refusing_loopback_server_keeps_its_port_until_it_resumes() {
+     server.resume().await.unwrap();
+     assert!(tokio::net::TcpStream::connect(server.addr()).await.is_ok());
+ }
++
++#[tokio::test]
++async fn a_resuming_loopback_server_never_lets_go_of_its_port() {
++    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++    let server = LoopbackServer::start(Vec::new()).await.unwrap();
++    let addr = server.addr();
++    let stop = Arc::new(AtomicBool::new(false));
++    let stolen = Arc::new(AtomicUsize::new(0));
++    let thief = {
++        let (stop, stolen) = (Arc::clone(&stop), Arc::clone(&stolen));
++        std::thread::spawn(move || {
++            while !stop.load(Ordering::Relaxed) {
++                if std::net::TcpListener::bind(addr).is_ok() {
++                    stolen.fetch_add(1, Ordering::Relaxed);
++                }
++            }
++        })
++    };
++    let mut failed = 0;
++    for _ in 0..300 {
++        server.refuse().await;
++        failed += usize::from(server.resume().await.is_err());
++    }
++    stop.store(true, Ordering::Relaxed);
++    thief.join().unwrap();
++    assert_eq!((failed, stolen.load(Ordering::Relaxed)), (0, 0));
++}
+diff --git a/crates/testkit/src/server.rs b/crates/testkit/src/server.rs
+index d29fb9bf..ce55cfd7 100644
+--- a/crates/testkit/src/server.rs
++++ b/crates/testkit/src/server.rs
+@@ -241,7 +241,7 @@ impl LoopbackServer {
+                 .map(|a| (a.message_id, a.wire))
+                 .collect(),
+         );
+-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
++        let listener = reserve(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)))?.listen(1024)?;
+         let addr = listener.local_addr()?;
+         let acceptor = Acceptor {
+             articles,
+@@ -266,6 +266,8 @@ impl LoopbackServer {
+ 
+     /// Stops listening, so new connects are refused; open connections keep serving.
+     pub async fn refuse(&self) {
++        // Reserved before the listener closes, so the port is never free.
++        *self.refusing.lock().unwrap_or_else(PoisonError::into_inner) = reserve(self.addr).ok();
+         let accept = self
+             .accept
+             .lock()
+@@ -275,13 +277,20 @@ impl LoopbackServer {
+             accept.abort();
+             let _ = accept.await;
+         }
+-        *self.refusing.lock().unwrap_or_else(PoisonError::into_inner) = reserve(self.addr).ok();
+     }
+ 
+     /// Listens again on the same port after [`refuse`](Self::refuse).
+     pub async fn resume(&self) -> io::Result<()> {
+-        drop(self.refusing.lock().unwrap_or_else(PoisonError::into_inner).take());
+-        let listener = TcpListener::bind(self.addr).await?;
++        let reserved = self
++            .refusing
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .take();
++        // Listens on the reserved socket: closing it first would free the port to anyone.
++        let listener = match reserved {
++            Some(socket) => socket.listen(1024)?,
++            None => reserve(self.addr)?.listen(1024)?,
++        };
+         let accept = self.acceptor.clone().spawn(listener);
+         if let Some(old) = self
+             .accept
+@@ -384,11 +393,14 @@ async fn delay(duration: Duration) {
+ }
+ 
+ // Bound but not listening, so connects are refused and no other server is handed the port.
+-// Address reuse is on only for the bind, past connections on the port; left on, another
+-// socket could share the port.
++// Address reuse is on only for the bind, past connections on the port. Port reuse lets this
++// server's own sockets overlap while it hands the port over; a socket without it cannot
++// take the port, and the kernel never picks a bound port for
++// a bind to port 0.
+ fn reserve(addr: SocketAddr) -> io::Result<TcpSocket> {
+     let socket = TcpSocket::new_v4()?;
+     socket.set_reuseaddr(true)?;
++    socket.set_reuseport(true)?;
+     socket.bind(addr)?;
+     socket.set_reuseaddr(false)?;
+     Ok(socket)
+-- 
+2.56.1
+

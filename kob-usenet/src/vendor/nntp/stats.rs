@@ -17,17 +17,20 @@ pub enum Workload {
     Health,
     Warm,
     /// Stream-side background work: a client caching a stream ahead of playback, and
-    /// imports for streams. Below playback, above downloads.
+    /// Below playback, above downloads; while one is active nothing below it starts.
     Cache,
+    /// Imports for streams: ranked with [`Self::Cache`], but downloads run beside them.
+    Import,
 }
 
 impl Workload {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Stream,
         Self::Queue,
         Self::Health,
         Self::Warm,
         Self::Cache,
+        Self::Import,
     ];
 
     #[must_use]
@@ -38,6 +41,7 @@ impl Workload {
             Self::Health => "health",
             Self::Warm => "warm",
             Self::Cache => "cache",
+            Self::Import => "import",
         }
     }
 
@@ -46,7 +50,7 @@ impl Workload {
     pub const fn rank(self) -> Option<usize> {
         match self {
             Self::Stream => None,
-            Self::Cache => Some(0),
+            Self::Cache | Self::Import => Some(0),
             Self::Queue => Some(1),
             Self::Warm => Some(2),
             Self::Health => Some(3),

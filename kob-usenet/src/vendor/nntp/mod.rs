@@ -13,6 +13,7 @@ mod resolve;
 mod stats;
 mod tls;
 mod usage;
+mod viewers;
 
 use std::fmt;
 use std::future::Future;

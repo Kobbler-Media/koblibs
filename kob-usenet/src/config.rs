@@ -81,6 +81,7 @@ pub struct EngineConfig {
     pub release_cache_bytes: u64,
     pub maintenance_interval: Duration,
     pub read_ahead_bytes: u64,
+    pub cache_read_ahead_bytes: u64,
     pub flight_cache_bytes: u64,
     pub read_budget_bytes: usize,
     pub download: DownloadConfig,
@@ -99,10 +100,18 @@ impl EngineConfig {
             release_cache_bytes: 1 << 30,
             maintenance_interval: Duration::from_secs(30),
             read_ahead_bytes: 32 << 20,
+            cache_read_ahead_bytes: 256 << 20,
             flight_cache_bytes: 96 << 20,
-            read_budget_bytes: 256 << 20,
+            read_budget_bytes: 384 << 20,
             download: DownloadConfig::default(),
         }
+    }
+
+    #[must_use]
+    pub fn memory_budget_bytes(&self) -> u64 {
+        self.read_budget_bytes as u64
+            + self.flight_cache_bytes
+            + self.download.repair_memory_bytes as u64
     }
 }
 

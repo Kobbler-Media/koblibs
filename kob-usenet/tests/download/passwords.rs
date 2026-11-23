@@ -3,9 +3,8 @@ use crate::nzb::{self, nzb_with};
 use crate::post::Posted;
 use crate::support::{Rig, completed, crc_of, extractor_on_path, failed, finish, unrar_on_path};
 
-const FILES_ONLY: &[u8] = include_bytes!("../vendor/fixtures/archive/Rar5.encrypted_filesOnly.rar");
-const RAR4_FILES_ONLY: &[u8] =
-    include_bytes!("../vendor/fixtures/archive/Rar.encrypted_filesOnly.rar");
+const FILES_ONLY: &[u8] = include_bytes!("../fixtures/Rar5.encrypted_filesOnly.no-exe.rar");
+const RAR4_FILES_ONLY: &[u8] = include_bytes!("../fixtures/Rar.encrypted_filesOnly.no-exe.rar");
 const HEADERS_TOO: &[u8] =
     include_bytes!("../vendor/fixtures/archive/Rar5.encrypted_filesAndHeader.rar");
 

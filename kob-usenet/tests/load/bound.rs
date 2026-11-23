@@ -6,7 +6,7 @@ use kob_usenet::vendor::testkit::post;
 use kob_usenet::{Engine, ImportMode, JobState, Purpose};
 use tokio::io::AsyncReadExt;
 
-use crate::rig::{Loaded, media, single_nzb};
+use crate::rig::{DRAIN, Loaded, media, single_nzb};
 use crate::support::ARTICLE;
 
 const CONNECTIONS: usize = 8;
@@ -14,21 +14,25 @@ const STREAM_ARTICLES: usize = 600;
 // About 5 Mbit/s, read ahead by 2 MB: playback in its steady state.
 const PACE: Duration = Duration::from_millis(100);
 const READ_AHEAD: u64 = 2 << 20;
+const HELD_FOR: Duration = Duration::from_millis(1500);
+const FINISH_WITHIN: Duration = Duration::from_secs(30);
 
-async fn download_time(rig: &Loaded, engine: &Engine) -> Duration {
+async fn finishes(engine: &Engine) -> Duration {
     let started = Instant::now();
-    rig.start_download(engine).await;
     loop {
         let status = engine.job("library").unwrap();
         match status.state {
             JobState::Completed => return started.elapsed(),
             JobState::Failed => panic!("{status:?}"),
+            _ if started.elapsed() > FINISH_WITHIN => panic!("{status:?}"),
             _ => tokio::time::sleep(Duration::from_millis(10)).await,
         }
     }
 }
 
-async fn queue_time(playing: bool) -> Duration {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn continuous_playback_holds_the_download_until_it_stops() {
+    let _serial = crate::rig::serial().await;
     let rig = Loaded::new(post(
         "film",
         "Film.2026.mkv",
@@ -52,46 +56,28 @@ async fn queue_time(playing: bool) -> Duration {
         )
         .await
         .unwrap();
+    rig.start_download(&engine).await;
     let done = Arc::new(AtomicBool::new(false));
-    let player = playing.then(|| {
+    let player = {
         let (engine, done) = (Arc::clone(&engine), Arc::clone(&done));
         tokio::spawn(async move {
             let mut reader = engine.open(&release.key, 0, Purpose::Play).unwrap();
             let mut buf = vec![0; 64 * 1024];
-            let mut read = 0;
             while !done.load(Ordering::Relaxed) {
-                let n = reader.read(&mut buf).await.unwrap();
-                assert!(n > 0, "the film ran out before the download finished");
-                read += n;
+                assert!(reader.read(&mut buf).await.unwrap() > 0, "the film ran out");
                 tokio::time::sleep(PACE).await;
             }
-            read
         })
-    });
-    let took = download_time(&rig, &engine).await;
+    };
+    tokio::time::sleep(DRAIN).await;
+    let before = engine.job("library").unwrap().bytes_done;
+    tokio::time::sleep(HELD_FOR).await;
+    let during = engine.job("library").unwrap().bytes_done - before;
     done.store(true, Ordering::Relaxed);
-    if let Some(player) = player {
-        let read = player.await.unwrap();
-        eprintln!("player read {read} B");
-    }
-    took
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn continuous_playback_keeps_most_of_the_download_throughput() {
-    let _serial = crate::rig::serial().await;
-    let alone = queue_time(false).await;
-    let playing = queue_time(true).await;
-    let share = alone.as_secs_f64() / playing.as_secs_f64();
-    eprintln!(
-        "download alone {alone:?}, with playback {playing:?}: {:.0}%",
-        share * 100.0
-    );
-    // 8 connections leave playback a reserve of 2 (a quarter); seeks need it, so a steady
-    // stream costs a download about a fifth here, less on larger pools.
+    player.await.unwrap();
     assert!(
-        share >= 0.75,
-        "download kept {:.0}% of its throughput",
-        share * 100.0
+        during <= (CONNECTIONS * ARTICLE) as u64,
+        "the download moved {during} bytes during playback"
     );
+    finishes(&engine).await;
 }

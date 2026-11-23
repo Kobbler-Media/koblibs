@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::oneshot;
 
 use crate::vendor::nntp::stats::{RANKS, Workload};
+use crate::vendor::nntp::viewers::Viewers;
 
 /// Request slots shared by every provider pool. A freed slot goes to a waiting playback
 /// request before any background (import, health) request, so imports never make a
@@ -14,6 +15,7 @@ use crate::vendor::nntp::stats::{RANKS, Workload};
 #[derive(Debug)]
 pub struct Downloads {
     lanes: Mutex<Lanes>,
+    viewers: Arc<Viewers>,
 }
 
 const BORROW_DIVISOR: usize = 4;
@@ -107,6 +109,13 @@ impl Drop for Permit {
     }
 }
 
+impl Permit {
+    /// Holds no slots: a STAT small enough to skip admission.
+    pub(crate) const fn none() -> Self {
+        Self(None, 0, 0)
+    }
+}
+
 impl Downloads {
     #[must_use]
     pub fn new(permits: usize) -> Arc<Self> {
@@ -119,7 +128,12 @@ impl Downloads {
                 held: HashMap::new(),
                 owed: 0,
             }),
+            viewers: Arc::default(),
         })
+    }
+
+    pub(crate) const fn viewers(&self) -> &Arc<Viewers> {
+        &self.viewers
     }
 
     /// Changes the number of slots; requests holding slots keep them, and a lowered

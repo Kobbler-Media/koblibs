@@ -44,7 +44,7 @@ const STREAM_HEADROOM_MIN_CONNECTIONS: usize = 4;
 const CACHE_HEADROOM_MIN_CONNECTIONS: usize = 16;
 /// Background work stays bounded this long after the last playback request: reads and
 /// seeks come in bursts.
-const STREAM_LINGER: Duration = Duration::from_secs(2);
+pub(crate) const STREAM_LINGER: Duration = Duration::from_secs(2);
 /// While bounded, background work leaves playback the connections it holds plus this
 /// many, a seek's first reads, up to a quarter of the limit.
 const STREAM_SPARE: usize = 4;
@@ -53,6 +53,24 @@ const STREAM_SPARE: usize = 4;
 /// reads from pipelining behind downloads, so without idle connections they wait for
 /// whole pipelines to drain.
 const CACHE_SPARE: usize = 4;
+/// Connections a seek may take from a running cache-ahead, which keeps the rest.
+const SEEK_CONNECTIONS: usize = 2;
+
+/// How often a waiting quick check looks again, for changes no connection announces.
+const LIGHT_RECHECK: Duration = Duration::from_millis(50);
+
+/// Connections kept for seeks beside a cache-ahead on a pool of `limit`.
+const fn seek_connections(limit: usize) -> usize {
+    if limit < STREAM_HEADROOM_MIN_CONNECTIONS {
+        return 0;
+    }
+    let quarter = limit / 4;
+    if quarter < SEEK_CONNECTIONS {
+        quarter
+    } else {
+        SEEK_CONNECTIONS
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct PoolConfig {
@@ -227,6 +245,8 @@ pub(crate) struct Tag {
     /// A provider's miss is remembered, so later requests skip that provider.
     pub(crate) remember: bool,
     pub(crate) lane: Option<Lane>,
+    /// Skips admission and the hold for viewers; see [`Pool::light_worker`].
+    pub(crate) light: bool,
 }
 
 impl Tag {
@@ -241,6 +261,7 @@ impl Tag {
         fresh: false,
         remember: true,
         lane: None,
+        light: false,
     };
 
     fn step(&self, step: Step) {
@@ -643,39 +664,65 @@ impl Pool {
         let mut budget = self.stream_wait;
         let _present = match tag.workload {
             Workload::Stream => Some(Present::start(self, false)),
-            Workload::Cache => Some(Present::start(self, true)),
+            Workload::Cache | Workload::Import => Some(Present::start(self, true)),
             _ => None,
         };
+        let viewers = self.downloads.viewers();
+        let _viewing = matches!(tag.workload, Workload::Stream | Workload::Cache)
+            .then(|| viewers.enter(tag.workload == Workload::Cache));
+        let held_back = !tag.light && tag.workload.rank().is_some_and(|rank| rank > 0);
         let lane = if stream {
             tag.lane.or(Some(Lane::STREAM))
         } else {
             tag.lane
         };
         loop {
+            // Waits holding no download slot: a slot parked here is one a cache reader,
+            // the very work being waited for, could never get.
+            if held_back {
+                viewers.clear().await;
+            }
             let stream_waiting = stream.then(|| Load::acquire(&self.stream_waiting));
             let admitted = tokio::time::Instant::now();
             let deadline = stream.then(|| admitted + budget);
             let acquire = self.downloads.acquire_for(
                 tag.workload,
-                self.weight(tag.probe.as_ref().map(|probe| probe.size)),
+                self.weight(tag.probe.as_ref().map(|probe| probe.size).or_else(|| {
+                    tag.expected
+                        .decoded_len
+                        .map(|len| u32::try_from(len).unwrap_or(u32::MAX))
+                })),
                 tag.probe.as_ref().map_or(0, |probe| probe.reader),
             );
-            let download = match deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, acquire)
-                    .await
-                    .map_err(|_| Failure::Request(Error::Unavailable))?,
-                None => acquire.await,
-            }
-            .ok_or(Failure::Request(Error::Closed))?;
+            let download = if tag.light {
+                drop(acquire);
+                Permit::none()
+            } else {
+                match deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, acquire)
+                        .await
+                        .map_err(|_| Failure::Request(Error::Unavailable))?,
+                    None => acquire.await,
+                }
+                .ok_or(Failure::Request(Error::Closed))?
+            };
             tag.step(Step::Permitted { provider });
             let parked = match tag.workload {
                 Workload::Stream => Some(Load::watched(&self.stream_parked, &self.changed)),
-                Workload::Cache => Some(Load::watched(&self.cache_parked, &self.changed)),
+                Workload::Cache | Workload::Import => {
+                    Some(Load::watched(&self.cache_parked, &self.changed))
+                }
                 _ => None,
             };
-            let (tx, load, ahead, connection) =
-                self.worker(tag.workload, tag.fresh, deadline, lane).await?;
+            let picked = if tag.light {
+                Some(self.light_worker().await?)
+            } else {
+                self.worker(tag.workload, tag.fresh, deadline, lane).await?
+            };
             drop(parked);
+            let Some((tx, load, ahead, connection)) = picked else {
+                continue;
+            };
             // Withdrawn while it waited: someone else asks for the article instead.
             if tag
                 .probe
@@ -748,12 +795,19 @@ impl Pool {
         fresh: bool,
         deadline: Option<tokio::time::Instant>,
         lane: Option<Lane>,
-    ) -> Result<(mpsc::Sender<Request>, Load, usize, u32), Failure> {
+    ) -> Result<Option<(mpsc::Sender<Request>, Load, usize, u32)>, Failure> {
         let stream = workload == Workload::Stream;
         let outranked = workload.rank().is_some_and(|rank| rank > 0);
-        let cached = workload == Workload::Cache && lane.is_some();
+        let cached = workload.rank() == Some(0) && lane.is_some();
+        let viewers = self.downloads.viewers();
         let (mut impatient, mut first) = (false, true);
         loop {
+            let viewer_arrived = viewers.changed();
+            let mut viewer_arrived = pin!(viewer_arrived);
+            viewer_arrived.as_mut().enable();
+            if outranked && viewers.holding() {
+                return Ok(None);
+            }
             // A spent budget still takes a connection that is free right away.
             if !std::mem::take(&mut first)
                 && deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
@@ -775,6 +829,22 @@ impl Pool {
                     None => 0,
                     Some(_) if limit < STREAM_HEADROOM_MIN_CONNECTIONS => 0,
                     Some(rank) if rank > 0 && limit >= CACHE_HEADROOM_MIN_CONNECTIONS => 2,
+                    // A reader's first request may take all but one free slot, so several
+                    // readers starting together still leave a seek a connection.
+                    Some(_) if workload == Workload::Cache => {
+                        // A connect in progress counts: a burst of read-ahead would otherwise
+                        // see nothing busy yet and open every slot.
+                        let reading = state.connecting > 0
+                            || state.workers.iter().any(|w| {
+                                w.load.load(Ordering::Relaxed) > 0
+                                    && lane.is_none_or(|l| {
+                                        w.cached.load(Ordering::Relaxed)
+                                            && w.lane.load(Ordering::Relaxed) == l.0
+                                    })
+                            });
+                        let most = seek_connections(limit);
+                        if reading { most } else { most.min(1) }
+                    }
                     Some(_) => 1,
                 };
                 let hold_headroom = headroom > 0 && {
@@ -809,7 +879,12 @@ impl Pool {
                         state.workers.iter().filter(|w| busy(w) && class(w)).count()
                     };
                     let stream_reserve = if streaming {
-                        (held(&playing) + STREAM_SPARE).min(limit / 4)
+                        let most = if workload == Workload::Cache {
+                            seek_connections(limit)
+                        } else {
+                            limit / 4
+                        };
+                        (held(&playing) + STREAM_SPARE).min(most)
                     } else {
                         0
                     };
@@ -834,9 +909,26 @@ impl Pool {
                 let spare =
                     open < limit && !hold_headroom && !capped && !yielding && held.is_none();
                 let live = !state.workers.is_empty();
+                // Beside a cache-ahead a seek keeps to its few connections, pipelining on
+                // them, so the file's sequential fetch never loses more than those.
+                let seek_capped = stream && viewers.caching() && {
+                    let most = seek_connections(limit).max(1);
+                    state
+                        .workers
+                        .iter()
+                        .filter(|w| busy(w) && playing(w))
+                        .count()
+                        >= most
+                };
+                let spare = spare && !seek_capped;
                 let best = state
                     .workers
                     .iter()
+                    .filter(|worker| !seek_capped || (busy(worker) && playing(worker)))
+                    .filter(|worker| {
+                        !seek_capped
+                            || worker.load.load(Ordering::Relaxed) < self.config.pipeline_depth
+                    })
                     .filter(|worker| {
                         let load = worker.load.load(Ordering::Relaxed);
                         !bounded
@@ -873,12 +965,12 @@ impl Pool {
                                 .store(lane.map_or(0, |lane| lane.0), Ordering::Relaxed);
                             w.cached.store(cached, Ordering::Relaxed);
                         }
-                        return Ok((
+                        return Ok(Some((
                             w.tx.clone(),
                             Load::watched(&w.load, &self.changed),
                             ahead,
                             w.link.id,
-                        ));
+                        )));
                     }
                     _ if deadline
                         .is_some_and(|deadline| tokio::time::Instant::now() >= deadline) =>
@@ -926,7 +1018,7 @@ impl Pool {
                     open.await
                 };
                 if let Some((tx, load, id)) = opened? {
-                    return Ok((tx, load, 0, id));
+                    return Ok(Some((tx, load, 0, id)));
                 }
                 continue;
             }
@@ -934,12 +1026,88 @@ impl Pool {
                 (Some(held), Some(deadline)) => Some(held.min(deadline)),
                 (held, deadline) => held.or(deadline),
             };
+            let either = poll_fn(|cx| {
+                if changed.as_mut().poll(cx).is_ready()
+                    || (outranked && viewer_arrived.as_mut().poll(cx).is_ready())
+                {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            });
             match wake {
                 Some(until) => {
-                    let _ = tokio::time::timeout_at(until, changed).await;
+                    let _ = tokio::time::timeout_at(until, either).await;
                 }
-                None => changed.await,
+                None => either.await,
             }
+        }
+    }
+
+    /// A connection for a STAT that must answer quickly whatever else is running: the
+    /// least loaded one that is not serving playback. While someone watches it opens
+    /// none of its own and leaves idle connections to a waiting seek.
+    async fn light_worker(&self) -> Result<(mpsc::Sender<Request>, Load, usize, u32), Failure> {
+        let viewers = self.downloads.viewers();
+        loop {
+            let mut changed = pin!(self.changed.notified());
+            changed.as_mut().enable();
+            let reserved = {
+                let mut state = self.lock();
+                if state.retired {
+                    return Err(Failure::Request(Error::Unavailable));
+                }
+                state.workers.retain(|w| !w.tx.is_closed());
+                let open = state.workers.len() + state.connecting;
+                let limit = self.limit(&state);
+                let watching = viewers.holding();
+                let load = |w: &Worker| w.load.load(Ordering::Relaxed);
+                // STATs answer within a round trip, so they may use the connections kept
+                // for seeks until a seek actually waits.
+                let free_idle = !watching || self.stream_waiting.load(Ordering::Relaxed) == 0;
+                let best = state
+                    .workers
+                    .iter()
+                    .filter(|w| load(w) < self.config.pipeline_depth)
+                    .filter(|w| load(w) == 0 || w.lane.load(Ordering::Relaxed) != Lane::STREAM.0)
+                    .filter(|w| free_idle || load(w) > 0)
+                    .min_by_key(|w| load(w));
+                if let Some(w) = best {
+                    let ahead = load(w);
+                    if ahead == 0 {
+                        w.lane.store(0, Ordering::Relaxed);
+                        w.cached.store(false, Ordering::Relaxed);
+                    }
+                    return Ok((
+                        w.tx.clone(),
+                        Load::watched(&w.load, &self.changed),
+                        ahead,
+                        w.link.id,
+                    ));
+                }
+                if open == 0
+                    && state
+                        .failed_at
+                        .is_some_and(|at| at.elapsed() < CONNECT_BACKOFF)
+                {
+                    return Err(Failure::Connect(Error::Unavailable));
+                }
+                let reserved =
+                    open < limit && (!watching || open == 0) && state.held(open).is_none();
+                if reserved {
+                    state.connecting += 1;
+                }
+                reserved
+            };
+            if reserved {
+                if let Some((tx, load, id)) =
+                    self.open(self.connecting(), None, None, false).await?
+                {
+                    return Ok((tx, load, 0, id));
+                }
+                continue;
+            }
+            let _ = timeout(LIGHT_RECHECK, changed).await;
         }
     }
 
@@ -1459,12 +1627,14 @@ mod tests {
         assert_eq!(server.peak_connections(), 0);
         assert_eq!(pool.lock().connecting, 0);
 
-        let Ok((_, load, _, connection)) = pool.worker(Workload::Stream, false, None, None).await
+        let Ok(Some((_, load, _, connection))) =
+            pool.worker(Workload::Stream, false, None, None).await
         else {
             panic!("a connection opens before admission expires");
         };
         drop(load);
-        let Ok((_, load, _, reused)) = pool.worker(Workload::Stream, false, deadline, None).await
+        let Ok(Some((_, load, _, reused))) =
+            pool.worker(Workload::Stream, false, deadline, None).await
         else {
             panic!("an idle connection is reusable after admission expires");
         };
@@ -1531,7 +1701,7 @@ mod tests {
         };
         let ((stream, client), opened) =
             tokio::join!(accept, pool.worker(Workload::Stream, false, None, None));
-        let Ok((_, load, _, _)) = opened else {
+        let Ok(Some((_, load, _, _))) = opened else {
             panic!("the connection opens");
         };
         drop(load);
@@ -1686,7 +1856,8 @@ mod tests {
         let (pool, _server) = loopback_pool(2).await;
         let mut held = Vec::new();
         for _ in 0..2 {
-            let Ok((_, load, _, _)) = pool.worker(Workload::Queue, false, None, None).await else {
+            let Ok(Some((_, load, _, _))) = pool.worker(Workload::Queue, false, None, None).await
+            else {
                 panic!("a connection opens");
             };
             held.push(load);
@@ -1694,7 +1865,7 @@ mod tests {
         let mut playback = Box::pin(pool.body("parked@loopback.invalid"));
         pending(&mut playback).await;
         assert_eq!(pool.stream_parked.load(Ordering::Relaxed), 1);
-        let mut queued = Box::pin(pool.worker(Workload::Queue, false, None, None));
+        let mut queued = Box::pin(below_viewers(&pool));
         pending(&mut queued).await;
         drop(playback);
         let resumed = timeout(Duration::from_secs(1), queued).await;
@@ -1706,10 +1877,22 @@ mod tests {
         pool.abort();
     }
 
+    async fn below_viewers(
+        pool: &Pool,
+    ) -> Result<Option<(mpsc::Sender<Request>, Load, usize, u32)>, Failure> {
+        loop {
+            pool.downloads.viewers().clear().await;
+            match pool.worker(Workload::Queue, false, None, None).await {
+                Ok(None) => {}
+                picked => return picked,
+            }
+        }
+    }
+
     async fn saturate(pool: &Pool, workload: Workload, lane: Option<Lane>, n: usize) -> Vec<Load> {
         let mut loads = Vec::new();
         for _ in 0..n {
-            let Ok((_, load, _, _)) = pool.worker(workload, false, None, lane).await else {
+            let Ok(Some((_, load, _, _))) = pool.worker(workload, false, None, lane).await else {
                 panic!("a connection is available");
             };
             loads.push(load);
@@ -1722,7 +1905,7 @@ mod tests {
         for (limit, workload, opened) in [
             (15, Workload::Queue, 14),
             (16, Workload::Queue, 14),
-            (16, Workload::Cache, 15),
+            (16, Workload::Cache, 14),
             (24, Workload::Queue, 22),
         ] {
             let (pool, _server) = loopback_pool(limit).await;
@@ -1730,7 +1913,7 @@ mod tests {
             assert_eq!(pool.lock().workers.len(), opened, "{limit} {workload:?}");
             if workload == Workload::Queue && limit >= CACHE_HEADROOM_MIN_CONNECTIONS {
                 let lane = Some(Lane::reader(1));
-                let Ok((_, cache, ahead, _)) =
+                let Ok(Some((_, cache, ahead, _))) =
                     pool.worker(Workload::Cache, false, None, lane).await
                 else {
                     panic!("the cache reader gets the slot left for it");
@@ -1750,7 +1933,7 @@ mod tests {
         // Two download connections sit under the share a cache reader leaves them, with
         // pipeline room, so only the waiting cache request holds them back.
         let queue = saturate(&pool, Workload::Queue, None, 2).await;
-        let cache = saturate(&pool, Workload::Cache, Some(lane), 26).await;
+        let cache = saturate(&pool, Workload::Cache, Some(lane), 24).await;
         let tag = Tag {
             workload: Workload::Cache,
             lane: Some(lane),
@@ -1759,7 +1942,7 @@ mod tests {
         let mut waiting = Box::pin(pool.fetch(Command::Body, "waiting@loopback.invalid", &tag));
         pending(&mut waiting).await;
         assert_eq!(pool.cache_parked.load(Ordering::Relaxed), 1);
-        let mut below = Box::pin(pool.worker(Workload::Queue, false, None, None));
+        let mut below = Box::pin(below_viewers(&pool));
         pending(&mut below).await;
         drop(waiting);
         drop(cache);

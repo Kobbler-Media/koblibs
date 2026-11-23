@@ -6,9 +6,9 @@ use crate::nzb::{self, Listed};
 use crate::par2::{self, Set};
 use crate::post::{ARTICLE, Posted, articles, noise};
 
-const RAR4: &[u8] = include_bytes!("../vendor/fixtures/archive/Rar.rar");
+const RAR4: &[u8] = include_bytes!("../fixtures/Rar.no-exe.rar");
 const MEMBERS: [(&str, usize, u32); 2] = [
-    ("exe/test.exe", 45_056, 0xCFB1_09C8),
+    ("exe/test.bin", 45_056, 0xCFB1_09C8),
     ("jpg/test.jpg", 40_372, 0x0888_14E3),
 ];
 

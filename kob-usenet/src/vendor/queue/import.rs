@@ -355,7 +355,11 @@ struct Job {
 
 impl Job {
     fn blocks(&self, name: &str) -> bool {
-        names::is_blocked(name, &self.blocklist)
+        let blocked = names::is_blocked(name, &self.blocklist);
+        if blocked {
+            self.note_blocked(name);
+        }
+        blocked
     }
 
     fn bodies(&self) -> MutexGuard<'_, HashMap<String, Bytes>> {

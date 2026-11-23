@@ -172,6 +172,7 @@ impl StructuralRejectReason {
                 | Self::CrossMediaTypeTv
                 | Self::EpisodeWantPackRejected
                 | Self::YearMismatch
+                | Self::UnairedEpisode
                 | Self::EventNotYetHeld
                 | Self::UnsourcedNewMovie
                 | Self::LanguageMismatch

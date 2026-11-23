@@ -10,6 +10,7 @@ use crate::vendor::nntp::{self, Client, Lane, Workload};
 use crate::vendor::queue::import::Error as ImportError;
 
 const CONCURRENCY: usize = 16;
+const QUICK_CONCURRENCY: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HealthSample {
@@ -23,8 +24,50 @@ pub async fn sample(
     percent: u8,
     output: Option<usize>,
 ) -> Result<HealthSample, Error> {
+    let ids = article_ids(layout, output);
+    let wanted = (ids.len() * usize::from(percent.min(100)))
+        .div_ceil(100)
+        .clamp(ids.len().min(1), ids.len());
+    let picked = (0..wanted).map(|i| ids[i * ids.len() / wanted].clone());
+    let posted = layout.posted;
+    tally(picked, CONCURRENCY, |id| {
+        let client = Arc::clone(client);
+        async move {
+            client
+                .stat_in_lane(&id, Lane::default(), Workload::Health, None, posted)
+                .await
+        }
+    })
+    .await
+}
+
+pub async fn quick(
+    client: &Arc<Client>,
+    layout: &Layout,
+    articles: usize,
+    output: Option<usize>,
+) -> Result<HealthSample, Error> {
+    let ids = article_ids(layout, output);
+    let posted = layout.posted;
+    let picked = spread(ids.len(), articles).map(|i| ids[i].clone());
+    tally(picked, QUICK_CONCURRENCY, |id| {
+        let client = Arc::clone(client);
+        async move { client.stat_quick(&id, posted).await }
+    })
+    .await
+}
+
+fn spread(len: usize, wanted: usize) -> impl Iterator<Item = usize> {
+    let wanted = wanted.clamp(len.min(2), len);
+    (0..wanted).map(move |i| match wanted {
+        1 => 0,
+        _ => i * (len - 1) / (wanted - 1),
+    })
+}
+
+fn article_ids(layout: &Layout, output: Option<usize>) -> Vec<String> {
     let mut seen = HashSet::new();
-    let ids: Vec<String> = layout
+    layout
         .outputs
         .iter()
         .enumerate()
@@ -32,34 +75,30 @@ pub async fn sample(
         .flat_map(|(_, (_, meta))| ids(meta))
         .filter(|id| !id.is_empty() && seen.insert(*id))
         .map(str::to_owned)
-        .collect();
-    let wanted = (ids.len() * usize::from(percent.min(100)))
-        .div_ceil(100)
-        .clamp(ids.len().min(1), ids.len());
-    let (lane, posted) = (Lane::default(), layout.posted);
-    let picked: Vec<String> = (0..wanted)
-        .map(|i| ids[i * ids.len() / wanted].clone())
-        .collect();
-    let answers: Vec<Result<bool, nntp::Error>> = stream::iter(picked)
-        .map(|id| {
-            let client = Arc::clone(client);
-            async move {
-                match client
-                    .stat_in_lane(&id, lane, Workload::Health, None, posted)
-                    .await
-                {
-                    Ok(()) => Ok(true),
-                    Err(nntp::Error::NotFound) => Ok(false),
-                    Err(error) => Err(error),
-                }
-            }
-        })
-        .buffer_unordered(CONCURRENCY)
+        .collect()
+}
+
+async fn tally<F, Fut>(
+    picked: impl Iterator<Item = String>,
+    concurrency: usize,
+    stat: F,
+) -> Result<HealthSample, Error>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<(), nntp::Error>>,
+{
+    let answers: Vec<_> = stream::iter(picked)
+        .map(stat)
+        .buffer_unordered(concurrency)
         .collect()
         .await;
     let mut sample = HealthSample::default();
     for answer in answers {
-        let found = answer.map_err(|e| Error::Import(ImportError::Retry(e)))?;
+        let found = match answer {
+            Ok(()) => true,
+            Err(nntp::Error::NotFound) => false,
+            Err(error) => return Err(Error::Import(ImportError::Retry(error))),
+        };
         sample.checked += 1;
         sample.missing += usize::from(!found);
     }

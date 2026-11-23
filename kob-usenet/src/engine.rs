@@ -38,6 +38,14 @@ pub struct Engine {
 
 impl Engine {
     pub async fn new(config: EngineConfig) -> Result<Self, Error> {
+        tracing::info!(
+            memory_budget_bytes = config.memory_budget_bytes(),
+            read_budget_bytes = config.read_budget_bytes,
+            cache_read_ahead_bytes = config.cache_read_ahead_bytes,
+            flight_cache_bytes = config.flight_cache_bytes,
+            repair_memory_bytes = config.download.repair_memory_bytes,
+            "engine memory budget"
+        );
         let store = Arc::new(Store::open(
             &config.data_dir,
             config.nzb_cache_bytes,
@@ -63,6 +71,7 @@ impl Engine {
             providers,
             flights: Flights::new(
                 config.read_ahead_bytes,
+                config.cache_read_ahead_bytes,
                 config.flight_cache_bytes,
                 config.read_budget_bytes,
             ),
@@ -157,9 +166,7 @@ impl Engine {
                 kept.push((path, meta));
                 continue;
             }
-            let reader = self
-                .flights
-                .reader(&self.providers.client, &meta, Purpose::Cache)?;
+            let reader = self.flights.import_reader(&self.providers.client, &meta)?;
             match verify::decrypted(&path, reader, meta.size()).await {
                 Ok(()) => kept.push((path, meta)),
                 Err(Error::Import(ImportError::Unsupported(reason))) => {
@@ -217,6 +224,21 @@ impl Engine {
         percent: u8,
         output: Option<usize>,
     ) -> Result<HealthSample, Error> {
+        let layout = self.checkable(key, output)?;
+        health::sample(&self.providers.client, &layout, percent, output).await
+    }
+
+    pub async fn quick_check(
+        &self,
+        key: &ReleaseKey,
+        articles: usize,
+        output: Option<usize>,
+    ) -> Result<HealthSample, Error> {
+        let layout = self.checkable(key, output)?;
+        health::quick(&self.providers.client, &layout, articles, output).await
+    }
+
+    fn checkable(&self, key: &ReleaseKey, output: Option<usize>) -> Result<Arc<Layout>, Error> {
         let layout = self
             .layout(key)?
             .ok_or_else(|| Error::UnknownRelease(key.clone()))?;
@@ -228,7 +250,7 @@ impl Engine {
                 index,
             });
         }
-        health::sample(&self.providers.client, &layout, percent, output).await
+        Ok(layout)
     }
 
     pub async fn add_job(&self, spec: JobSpec) -> Result<JobStatus, Error> {

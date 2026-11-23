@@ -5,6 +5,7 @@ mod clean;
 mod compressed;
 mod described;
 mod durable;
+mod fake;
 mod firsts;
 mod headless;
 mod hedge;

@@ -639,6 +639,21 @@ impl Client {
         self.request(Command::Stat, message_id, tag).await.map(drop)
     }
 
+    /// [`stat`](Self::stat) on the warming workload that neither waits for download slots
+    /// nor for a viewer to finish: it pipelines behind whatever connections are doing.
+    pub async fn stat_quick(&self, message_id: &str, posted: Option<i64>) -> Result<(), Error> {
+        let tag = Tag {
+            workload: Workload::Warm,
+            light: true,
+            expected: BodyExpectation {
+                posted,
+                ..BodyExpectation::NONE
+            },
+            ..Tag::UNTRACKED
+        };
+        self.request(Command::Stat, message_id, tag).await.map(drop)
+    }
+
     /// Takes a [`Lease`] once every admitted request has finished and closes the idle
     /// connections of provider `close`, so a diagnostic can open its own within the
     /// provider's limit. `None` if work is still running after `drain` or playback
@@ -698,7 +713,7 @@ impl Client {
     ) -> Result<Option<Body>, Error> {
         match base.workload {
             Workload::Warm => base.lane = Some(self.warm_lane),
-            Workload::Cache if base.lane.is_none() => {
+            Workload::Cache | Workload::Import if base.lane.is_none() => {
                 base.lane = base.probe.as_ref().map(|probe| Lane::reader(probe.reader));
             }
             _ => {}

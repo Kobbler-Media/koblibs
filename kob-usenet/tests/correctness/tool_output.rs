@@ -28,7 +28,7 @@ async fn unpacking(case: &str) -> JobStatus {
 }
 
 fn archive() -> Vec<u8> {
-    let mut data = include_bytes!("../vendor/fixtures/archive/Rar.rar").to_vec();
+    let mut data = include_bytes!("../fixtures/Rar.no-exe.rar").to_vec();
     data.extend(noise(ARTICLE, 7));
     data
 }

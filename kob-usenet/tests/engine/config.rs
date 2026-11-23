@@ -55,3 +55,16 @@ fn server_config() -> kob_usenet::ServerConfig {
         password: String::new(),
     }
 }
+
+#[test]
+fn the_default_memory_budget_covers_readers_flights_and_repair_under_a_gibibyte() {
+    let config = kob_usenet::EngineConfig::new(std::path::PathBuf::new(), Vec::new());
+    assert_eq!(
+        config.memory_budget_bytes(),
+        config.read_budget_bytes as u64
+            + config.flight_cache_bytes
+            + config.download.repair_memory_bytes as u64
+    );
+    assert!(config.memory_budget_bytes() < 1 << 30);
+    assert!(config.cache_read_ahead_bytes <= config.read_budget_bytes as u64);
+}

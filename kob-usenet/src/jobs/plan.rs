@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::ImportMode;
 use crate::jobs::failure::Failure;
 use crate::jobs::fetch::Fetcher;
+use crate::jobs::payload;
 use crate::jobs::store::{Plan, Planned};
 use crate::repair::recovery::Par2s;
 use crate::vendor::queue::import::{
@@ -52,6 +53,19 @@ pub async fn direct(
         }
     };
     let password = passwords.last().map(String::as_str);
+    let unproven = match &imported {
+        Ok(Imported::Files { outputs, .. }) => !payload::proven(outputs),
+        Err(ImportError::Password(_) | ImportError::Unsupported(_) | ImportError::Failed(_)) => {
+            true
+        }
+        Ok(Imported::Nzb(_)) | Err(_) => false,
+    };
+    if unproven
+        && let Some(refusal) =
+            payload::only_executables(fetcher, nzb, &release, &rules, password).await
+    {
+        return Next::Fail(Failure::Content(refusal));
+    }
     match imported {
         Ok(Imported::Files { outputs, .. }) if outputs.iter().any(|o| o.meta.encrypted()) => {
             Next::Raw

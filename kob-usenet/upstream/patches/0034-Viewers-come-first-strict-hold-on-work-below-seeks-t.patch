@@ -1,0 +1,921 @@
+From 284c53b21091b281830a57b680b78276103a8749 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Mon, 23 Nov 2026 21:51:37 +1100
+Subject: [PATCH] Viewers come first: strict hold on work below, seeks take a
+ bounded few connections, quick STATs
+
+---
+ crates/nntp/src/client.rs         |  17 +-
+ crates/nntp/src/downloads.rs      |  34 +++-
+ crates/nntp/src/lib.rs            |   1 +
+ crates/nntp/src/pool.rs           | 270 +++++++++++++++++++++++++-----
+ crates/nntp/src/stats.rs          |  10 +-
+ crates/nntp/src/viewers.rs        | 158 +++++++++++++++++
+ crates/nntp/tests/client.rs       |   9 +-
+ crates/nntp/tests/stream_first.rs |   5 +-
+ 8 files changed, 448 insertions(+), 56 deletions(-)
+ create mode 100644 crates/nntp/src/viewers.rs
+
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index 27fa24ad..c46dbbec 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -636,6 +636,21 @@ impl Client {
+         self.request(Command::Stat, message_id, tag).await.map(drop)
+     }
+ 
++    /// [`stat`](Self::stat) on the warming workload that neither waits for download slots
++    /// nor for a viewer to finish: it pipelines behind whatever connections are doing.
++    pub async fn stat_quick(&self, message_id: &str, posted: Option<i64>) -> Result<(), Error> {
++        let tag = Tag {
++            workload: Workload::Warm,
++            light: true,
++            expected: BodyExpectation {
++                posted,
++                ..BodyExpectation::NONE
++            },
++            ..Tag::UNTRACKED
++        };
++        self.request(Command::Stat, message_id, tag).await.map(drop)
++    }
++
+     /// Takes a [`Lease`] once every admitted request has finished and closes the idle
+     /// connections of provider `close`, so a diagnostic can open its own within the
+     /// provider's limit. `None` if work is still running after `drain` or playback
+@@ -695,7 +710,7 @@ impl Client {
+     ) -> Result<Option<Body>, Error> {
+         match base.workload {
+             Workload::Warm => base.lane = Some(self.warm_lane),
+-            Workload::Cache if base.lane.is_none() => {
++            Workload::Cache | Workload::Import if base.lane.is_none() => {
+                 base.lane = base.probe.as_ref().map(|probe| Lane::reader(probe.reader));
+             }
+             _ => {}
+diff --git a/crates/nntp/src/downloads.rs b/crates/nntp/src/downloads.rs
+index a9798644..c07db3e9 100644
+--- a/crates/nntp/src/downloads.rs
++++ b/crates/nntp/src/downloads.rs
+@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+ use tokio::sync::oneshot;
+ 
+ use crate::stats::{RANKS, Workload};
++use crate::viewers::Viewers;
+ 
+ /// Request slots shared by every provider pool. A freed slot goes to a waiting playback
+ /// request before any background (import, health) request, so imports never make a
+@@ -14,6 +15,7 @@ use crate::stats::{RANKS, Workload};
+ #[derive(Debug)]
+ pub struct Downloads {
+     lanes: Mutex<Lanes>,
++    viewers: Arc<Viewers>,
+ }
+ 
+ const BORROW_DIVISOR: usize = 4;
+@@ -67,7 +69,11 @@ impl Lanes {
+     }
+ 
+     const fn take(&mut self, weight: usize) {
+-        let paid = if weight < self.free { weight } else { self.free };
++        let paid = if weight < self.free {
++            weight
++        } else {
++            self.free
++        };
+         self.free -= paid;
+         self.owed += weight - paid;
+     }
+@@ -103,6 +109,13 @@ impl Drop for Permit {
+     }
+ }
+ 
++impl Permit {
++    /// Holds no slots: a STAT small enough to skip admission.
++    pub(crate) const fn none() -> Self {
++        Self(None, 0, 0)
++    }
++}
++
+ impl Downloads {
+     #[must_use]
+     pub fn new(permits: usize) -> Arc<Self> {
+@@ -115,9 +128,14 @@ impl Downloads {
+                 held: HashMap::new(),
+                 owed: 0,
+             }),
++            viewers: Arc::default(),
+         })
+     }
+ 
++    pub(crate) const fn viewers(&self) -> &Arc<Viewers> {
++        &self.viewers
++    }
++
+     /// Changes the number of slots; requests holding slots keep them, and a lowered
+     /// total takes effect as they finish.
+     pub fn resize(self: &Arc<Self>, permits: usize) {
+@@ -284,7 +302,12 @@ mod tests {
+         let held = downloads.acquire(false, 1).await;
+         let order = Arc::new(Mutex::new(Vec::new()));
+         let mut waiters = Vec::new();
+-        for workload in [Workload::Health, Workload::Warm, Workload::Queue, Workload::Cache] {
++        for workload in [
++            Workload::Health,
++            Workload::Warm,
++            Workload::Queue,
++            Workload::Cache,
++        ] {
+             let (downloads, order) = (Arc::clone(&downloads), Arc::clone(&order));
+             waiters.push(tokio::spawn(async move {
+                 let permit = downloads.acquire_for(workload, 1, 0).await;
+@@ -299,7 +322,12 @@ mod tests {
+         }
+         assert_eq!(
+             *order.lock().unwrap(),
+-            [Workload::Cache, Workload::Queue, Workload::Warm, Workload::Health]
++            [
++                Workload::Cache,
++                Workload::Queue,
++                Workload::Warm,
++                Workload::Health
++            ]
+         );
+     }
+ 
+diff --git a/crates/nntp/src/lib.rs b/crates/nntp/src/lib.rs
+index c4fce282..cae9fa5b 100644
+--- a/crates/nntp/src/lib.rs
++++ b/crates/nntp/src/lib.rs
+@@ -14,6 +14,7 @@ mod resolve;
+ mod stats;
+ mod tls;
+ mod usage;
++mod viewers;
+ 
+ use std::fmt;
+ use std::future::Future;
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index 41454e1e..f9cb5004 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -44,7 +44,7 @@ const STREAM_HEADROOM_MIN_CONNECTIONS: usize = 4;
+ const CACHE_HEADROOM_MIN_CONNECTIONS: usize = 16;
+ /// Background work stays bounded this long after the last playback request: reads and
+ /// seeks come in bursts.
+-const STREAM_LINGER: Duration = Duration::from_secs(2);
++pub(crate) const STREAM_LINGER: Duration = Duration::from_secs(2);
+ /// While bounded, background work leaves playback the connections it holds plus this
+ /// many, a seek's first reads, up to a quarter of the limit.
+ const STREAM_SPARE: usize = 4;
+@@ -53,6 +53,24 @@ const STREAM_SPARE: usize = 4;
+ /// reads from pipelining behind downloads, so without idle connections they wait for
+ /// whole pipelines to drain.
+ const CACHE_SPARE: usize = 4;
++/// Connections a seek may take from a running cache-ahead, which keeps the rest.
++const SEEK_CONNECTIONS: usize = 2;
++
++/// How often a waiting quick check looks again, for changes no connection announces.
++const LIGHT_RECHECK: Duration = Duration::from_millis(50);
++
++/// Connections kept for seeks beside a cache-ahead on a pool of `limit`.
++const fn seek_connections(limit: usize) -> usize {
++    if limit < STREAM_HEADROOM_MIN_CONNECTIONS {
++        return 0;
++    }
++    let quarter = limit / 4;
++    if quarter < SEEK_CONNECTIONS {
++        quarter
++    } else {
++        SEEK_CONNECTIONS
++    }
++}
+ 
+ #[derive(Debug, Clone, Copy)]
+ pub struct PoolConfig {
+@@ -227,6 +245,8 @@ pub(crate) struct Tag {
+     /// A provider's miss is remembered, so later requests skip that provider.
+     pub(crate) remember: bool,
+     pub(crate) lane: Option<Lane>,
++    /// Skips admission and the hold for viewers; see [`Pool::light_worker`].
++    pub(crate) light: bool,
+ }
+ 
+ impl Tag {
+@@ -241,6 +261,7 @@ impl Tag {
+         fresh: false,
+         remember: true,
+         lane: None,
++        light: false,
+     };
+ 
+     fn step(&self, step: Step) {
+@@ -467,9 +488,9 @@ impl Pool {
+             let open = state.workers.len() + state.connecting;
+             let backoff = state.retired
+                 || open == 0
+-                && state
+-                    .failed_at
+-                    .is_some_and(|at| at.elapsed() < CONNECT_BACKOFF);
++                    && state
++                        .failed_at
++                        .is_some_and(|at| at.elapsed() < CONNECT_BACKOFF);
+             let reserved = if backoff || state.held(open).is_some() {
+                 0
+             } else {
+@@ -643,39 +664,65 @@ impl Pool {
+         let mut budget = self.stream_wait;
+         let _present = match tag.workload {
+             Workload::Stream => Some(Present::start(self, false)),
+-            Workload::Cache => Some(Present::start(self, true)),
++            Workload::Cache | Workload::Import => Some(Present::start(self, true)),
+             _ => None,
+         };
++        let viewers = self.downloads.viewers();
++        let _viewing = matches!(tag.workload, Workload::Stream | Workload::Cache)
++            .then(|| viewers.enter(tag.workload == Workload::Cache));
++        let held_back = !tag.light && tag.workload.rank().is_some_and(|rank| rank > 0);
+         let lane = if stream {
+             tag.lane.or(Some(Lane::STREAM))
+         } else {
+             tag.lane
+         };
+         loop {
++            // Waits holding no download slot: a slot parked here is one a cache reader,
++            // the very work being waited for, could never get.
++            if held_back {
++                viewers.clear().await;
++            }
+             let stream_waiting = stream.then(|| Load::acquire(&self.stream_waiting));
+             let admitted = tokio::time::Instant::now();
+             let deadline = stream.then(|| admitted + budget);
+             let acquire = self.downloads.acquire_for(
+                 tag.workload,
+-                self.weight(tag.probe.as_ref().map(|probe| probe.size)),
++                self.weight(tag.probe.as_ref().map(|probe| probe.size).or_else(|| {
++                    tag.expected
++                        .decoded_len
++                        .map(|len| u32::try_from(len).unwrap_or(u32::MAX))
++                })),
+                 tag.probe.as_ref().map_or(0, |probe| probe.reader),
+             );
+-            let download = match deadline {
+-                Some(deadline) => tokio::time::timeout_at(deadline, acquire)
+-                    .await
+-                    .map_err(|_| Failure::Request(Error::Unavailable))?,
+-                None => acquire.await,
+-            }
+-            .ok_or(Failure::Request(Error::Closed))?;
++            let download = if tag.light {
++                drop(acquire);
++                Permit::none()
++            } else {
++                match deadline {
++                    Some(deadline) => tokio::time::timeout_at(deadline, acquire)
++                        .await
++                        .map_err(|_| Failure::Request(Error::Unavailable))?,
++                    None => acquire.await,
++                }
++                .ok_or(Failure::Request(Error::Closed))?
++            };
+             tag.step(Step::Permitted { provider });
+             let parked = match tag.workload {
+                 Workload::Stream => Some(Load::watched(&self.stream_parked, &self.changed)),
+-                Workload::Cache => Some(Load::watched(&self.cache_parked, &self.changed)),
++                Workload::Cache | Workload::Import => {
++                    Some(Load::watched(&self.cache_parked, &self.changed))
++                }
+                 _ => None,
+             };
+-            let (tx, load, ahead, connection) =
+-                self.worker(tag.workload, tag.fresh, deadline, lane).await?;
++            let picked = if tag.light {
++                Some(self.light_worker().await?)
++            } else {
++                self.worker(tag.workload, tag.fresh, deadline, lane).await?
++            };
+             drop(parked);
++            let Some((tx, load, ahead, connection)) = picked else {
++                continue;
++            };
+             // Withdrawn while it waited: someone else asks for the article instead.
+             if tag
+                 .probe
+@@ -748,12 +795,19 @@ impl Pool {
+         fresh: bool,
+         deadline: Option<tokio::time::Instant>,
+         lane: Option<Lane>,
+-    ) -> Result<(mpsc::Sender<Request>, Load, usize, u32), Failure> {
++    ) -> Result<Option<(mpsc::Sender<Request>, Load, usize, u32)>, Failure> {
+         let stream = workload == Workload::Stream;
+         let outranked = workload.rank().is_some_and(|rank| rank > 0);
+-        let cached = workload == Workload::Cache && lane.is_some();
++        let cached = workload.rank() == Some(0) && lane.is_some();
++        let viewers = self.downloads.viewers();
+         let (mut impatient, mut first) = (false, true);
+         loop {
++            let viewer_arrived = viewers.changed();
++            let mut viewer_arrived = pin!(viewer_arrived);
++            viewer_arrived.as_mut().enable();
++            if outranked && viewers.holding() {
++                return Ok(None);
++            }
+             // A spent budget still takes a connection that is free right away.
+             if !std::mem::take(&mut first)
+                 && deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+@@ -775,6 +829,21 @@ impl Pool {
+                     None => 0,
+                     Some(_) if limit < STREAM_HEADROOM_MIN_CONNECTIONS => 0,
+                     Some(rank) if rank > 0 && limit >= CACHE_HEADROOM_MIN_CONNECTIONS => 2,
++                    // A reader's first request may take all but one free slot, so several
++                    // readers starting together still leave a seek a connection.
++                    Some(_) if workload == Workload::Cache => {
++                        // A connect in progress counts: a burst of read-ahead would otherwise
++                        // see nothing busy yet and open every slot.
++                        let reading = state.connecting > 0 || state.workers.iter().any(|w| {
++                            w.load.load(Ordering::Relaxed) > 0
++                                && lane.is_none_or(|l| {
++                                    w.cached.load(Ordering::Relaxed)
++                                        && w.lane.load(Ordering::Relaxed) == l.0
++                                })
++                        });
++                        let most = seek_connections(limit);
++                        if reading { most } else { most.min(1) }
++                    }
+                     Some(_) => 1,
+                 };
+                 let hold_headroom = headroom > 0 && {
+@@ -809,7 +878,12 @@ impl Pool {
+                         state.workers.iter().filter(|w| busy(w) && class(w)).count()
+                     };
+                     let stream_reserve = if streaming {
+-                        (held(&playing) + STREAM_SPARE).min(limit / 4)
++                        let most = if workload == Workload::Cache {
++                            seek_connections(limit)
++                        } else {
++                            limit / 4
++                        };
++                        (held(&playing) + STREAM_SPARE).min(most)
+                     } else {
+                         0
+                     };
+@@ -834,16 +908,31 @@ impl Pool {
+                 let spare =
+                     open < limit && !hold_headroom && !capped && !yielding && held.is_none();
+                 let live = !state.workers.is_empty();
++                // Beside a cache-ahead a seek keeps to its few connections, pipelining on
++                // them, so the file's sequential fetch never loses more than those.
++                let seek_capped = stream && viewers.caching() && {
++                    let most = seek_connections(limit).max(1);
++                    state
++                        .workers
++                        .iter()
++                        .filter(|w| busy(w) && playing(w))
++                        .count()
++                        >= most
++                };
++                let spare = spare && !seek_capped;
+                 let best = state
+                     .workers
+                     .iter()
++                    .filter(|worker| !seek_capped || (busy(worker) && playing(worker)))
++                    .filter(|worker| {
++                        !seek_capped
++                            || worker.load.load(Ordering::Relaxed) < self.config.pipeline_depth
++                    })
+                     .filter(|worker| {
+                         let load = worker.load.load(Ordering::Relaxed);
+                         !bounded
+                             || (load == 0 && !capped)
+-                            || (!starved
+-                                && load < self.config.pipeline_depth
+-                                && background(worker))
++                            || (!starved && load < self.config.pipeline_depth && background(worker))
+                     })
+                     .filter(|_| !yielding)
+                     // A cache reader past a full pipeline parks instead, so work below it
+@@ -875,12 +964,12 @@ impl Pool {
+                                 .store(lane.map_or(0, |lane| lane.0), Ordering::Relaxed);
+                             w.cached.store(cached, Ordering::Relaxed);
+                         }
+-                        return Ok((
++                        return Ok(Some((
+                             w.tx.clone(),
+                             Load::watched(&w.load, &self.changed),
+                             ahead,
+                             w.link.id,
+-                        ));
++                        )));
+                     }
+                     _ if deadline
+                         .is_some_and(|deadline| tokio::time::Instant::now() >= deadline) =>
+@@ -928,7 +1017,7 @@ impl Pool {
+                     open.await
+                 };
+                 if let Some((tx, load, id)) = opened? {
+-                    return Ok((tx, load, 0, id));
++                    return Ok(Some((tx, load, 0, id)));
+                 }
+                 continue;
+             }
+@@ -936,15 +1025,91 @@ impl Pool {
+                 (Some(held), Some(deadline)) => Some(held.min(deadline)),
+                 (held, deadline) => held.or(deadline),
+             };
++            let either = poll_fn(|cx| {
++                if changed.as_mut().poll(cx).is_ready()
++                    || (outranked && viewer_arrived.as_mut().poll(cx).is_ready())
++                {
++                    Poll::Ready(())
++                } else {
++                    Poll::Pending
++                }
++            });
+             match wake {
+                 Some(until) => {
+-                    let _ = tokio::time::timeout_at(until, changed).await;
++                    let _ = tokio::time::timeout_at(until, either).await;
+                 }
+-                None => changed.await,
++                None => either.await,
+             }
+         }
+     }
+ 
++    /// A connection for a STAT that must answer quickly whatever else is running: the
++    /// least loaded one that is not serving playback. While someone watches it opens
++    /// none of its own and leaves idle connections to a waiting seek.
++    async fn light_worker(&self) -> Result<(mpsc::Sender<Request>, Load, usize, u32), Failure> {
++        let viewers = self.downloads.viewers();
++        loop {
++            let mut changed = pin!(self.changed.notified());
++            changed.as_mut().enable();
++            let reserved = {
++                let mut state = self.lock();
++                if state.retired {
++                    return Err(Failure::Request(Error::Unavailable));
++                }
++                state.workers.retain(|w| !w.tx.is_closed());
++                let open = state.workers.len() + state.connecting;
++                let limit = self.limit(&state);
++                let watching = viewers.holding();
++                let load = |w: &Worker| w.load.load(Ordering::Relaxed);
++                // STATs answer within a round trip, so they may use the connections kept
++                // for seeks until a seek actually waits.
++                let free_idle = !watching || self.stream_waiting.load(Ordering::Relaxed) == 0;
++                let best = state
++                    .workers
++                    .iter()
++                    .filter(|w| load(w) < self.config.pipeline_depth)
++                    .filter(|w| load(w) == 0 || w.lane.load(Ordering::Relaxed) != Lane::STREAM.0)
++                    .filter(|w| free_idle || load(w) > 0)
++                    .min_by_key(|w| load(w));
++                if let Some(w) = best {
++                    let ahead = load(w);
++                    if ahead == 0 {
++                        w.lane.store(0, Ordering::Relaxed);
++                        w.cached.store(false, Ordering::Relaxed);
++                    }
++                    return Ok((
++                        w.tx.clone(),
++                        Load::watched(&w.load, &self.changed),
++                        ahead,
++                        w.link.id,
++                    ));
++                }
++                if open == 0
++                    && state
++                        .failed_at
++                        .is_some_and(|at| at.elapsed() < CONNECT_BACKOFF)
++                {
++                    return Err(Failure::Connect(Error::Unavailable));
++                }
++                let reserved =
++                    open < limit && (!watching || open == 0) && state.held(open).is_none();
++                if reserved {
++                    state.connecting += 1;
++                }
++                reserved
++            };
++            if reserved {
++                if let Some((tx, load, id)) =
++                    self.open(self.connecting(), None, None, false).await?
++                {
++                    return Ok((tx, load, 0, id));
++                }
++                continue;
++            }
++            let _ = timeout(LIGHT_RECHECK, changed).await;
++        }
++    }
++
+     fn limit(&self, state: &State) -> usize {
+         state.limit(self.config.max_connections)
+     }
+@@ -970,11 +1135,7 @@ impl Pool {
+             let until = until.map_or(limit, |until| until.min(limit));
+             let Ok(Ok(permit)) = tokio::time::timeout_at(until, account.acquire_owned()).await
+             else {
+-                let others = connecting
+-                    .lock()
+-                    .workers
+-                    .iter()
+-                    .any(|w| !w.tx.is_closed());
++                let others = connecting.lock().workers.iter().any(|w| !w.tx.is_closed());
+                 drop(connecting);
+                 return if others {
+                     Ok(None)
+@@ -1465,11 +1626,13 @@ mod tests {
+         assert_eq!(server.peak_connections(), 0);
+         assert_eq!(pool.lock().connecting, 0);
+ 
+-        let Ok((_, load, _, connection)) = pool.worker(Workload::Stream, false, None, None).await else {
++        let Ok(Some((_, load, _, connection))) = pool.worker(Workload::Stream, false, None, None).await
++        else {
+             panic!("a connection opens before admission expires");
+         };
+         drop(load);
+-        let Ok((_, load, _, reused)) = pool.worker(Workload::Stream, false, deadline, None).await else {
++        let Ok(Some((_, load, _, reused))) = pool.worker(Workload::Stream, false, deadline, None).await
++        else {
+             panic!("an idle connection is reusable after admission expires");
+         };
+         assert_eq!(reused, connection);
+@@ -1535,7 +1698,7 @@ mod tests {
+         };
+         let ((stream, client), opened) =
+             tokio::join!(accept, pool.worker(Workload::Stream, false, None, None));
+-        let Ok((_, load, _, _)) = opened else {
++        let Ok(Some((_, load, _, _))) = opened else {
+             panic!("the connection opens");
+         };
+         drop(load);
+@@ -1676,7 +1839,10 @@ mod tests {
+         drop(stream);
+         drop(cache);
+         let resumed = timeout(STREAM_LINGER * 3, queued).await;
+-        assert!(matches!(resumed, Ok(Ok(_))), "background work stayed parked");
++        assert!(
++            matches!(resumed, Ok(Ok(_))),
++            "background work stayed parked"
++        );
+         pool.abort();
+     }
+ 
+@@ -1685,7 +1851,7 @@ mod tests {
+         let (pool, _server) = loopback_pool(2).await;
+         let mut held = Vec::new();
+         for _ in 0..2 {
+-            let Ok((_, load, _, _)) = pool.worker(Workload::Queue, false, None, None).await else {
++            let Ok(Some((_, load, _, _))) = pool.worker(Workload::Queue, false, None, None).await else {
+                 panic!("a connection opens");
+             };
+             held.push(load);
+@@ -1693,19 +1859,34 @@ mod tests {
+         let mut playback = Box::pin(pool.body("parked@loopback.invalid"));
+         pending(&mut playback).await;
+         assert_eq!(pool.stream_parked.load(Ordering::Relaxed), 1);
+-        let mut queued = Box::pin(pool.worker(Workload::Queue, false, None, None));
++        let mut queued = Box::pin(below_viewers(&pool));
+         pending(&mut queued).await;
+         drop(playback);
+         let resumed = timeout(Duration::from_secs(1), queued).await;
+-        assert!(matches!(resumed, Ok(Ok(_))), "background work stayed parked");
++        assert!(
++            matches!(resumed, Ok(Ok(_))),
++            "background work stayed parked"
++        );
+         drop(held);
+         pool.abort();
+     }
+ 
++    async fn below_viewers(
++        pool: &Pool,
++    ) -> Result<Option<(mpsc::Sender<Request>, Load, usize, u32)>, Failure> {
++        loop {
++            pool.downloads.viewers().clear().await;
++            match pool.worker(Workload::Queue, false, None, None).await {
++                Ok(None) => {}
++                picked => return picked,
++            }
++        }
++    }
++
+     async fn saturate(pool: &Pool, workload: Workload, lane: Option<Lane>, n: usize) -> Vec<Load> {
+         let mut loads = Vec::new();
+         for _ in 0..n {
+-            let Ok((_, load, _, _)) = pool.worker(workload, false, None, lane).await else {
++            let Ok(Some((_, load, _, _))) = pool.worker(workload, false, None, lane).await else {
+                 panic!("a connection is available");
+             };
+             loads.push(load);
+@@ -1718,7 +1899,7 @@ mod tests {
+         for (limit, workload, opened) in [
+             (15, Workload::Queue, 14),
+             (16, Workload::Queue, 14),
+-            (16, Workload::Cache, 15),
++            (16, Workload::Cache, 14),
+             (24, Workload::Queue, 22),
+         ] {
+             let (pool, _server) = loopback_pool(limit).await;
+@@ -1726,7 +1907,8 @@ mod tests {
+             assert_eq!(pool.lock().workers.len(), opened, "{limit} {workload:?}");
+             if workload == Workload::Queue && limit >= CACHE_HEADROOM_MIN_CONNECTIONS {
+                 let lane = Some(Lane::reader(1));
+-                let Ok((_, cache, ahead, _)) = pool.worker(Workload::Cache, false, None, lane).await
++                let Ok(Some((_, cache, ahead, _))) =
++                    pool.worker(Workload::Cache, false, None, lane).await
+                 else {
+                     panic!("the cache reader gets the slot left for it");
+                 };
+@@ -1745,7 +1927,7 @@ mod tests {
+         // Two download connections sit under the share a cache reader leaves them, with
+         // pipeline room, so only the waiting cache request holds them back.
+         let queue = saturate(&pool, Workload::Queue, None, 2).await;
+-        let cache = saturate(&pool, Workload::Cache, Some(lane), 26).await;
++        let cache = saturate(&pool, Workload::Cache, Some(lane), 24).await;
+         let tag = Tag {
+             workload: Workload::Cache,
+             lane: Some(lane),
+@@ -1754,7 +1936,7 @@ mod tests {
+         let mut waiting = Box::pin(pool.fetch(Command::Body, "waiting@loopback.invalid", &tag));
+         pending(&mut waiting).await;
+         assert_eq!(pool.cache_parked.load(Ordering::Relaxed), 1);
+-        let mut below = Box::pin(pool.worker(Workload::Queue, false, None, None));
++        let mut below = Box::pin(below_viewers(&pool));
+         pending(&mut below).await;
+         drop(waiting);
+         drop(cache);
+diff --git a/crates/nntp/src/stats.rs b/crates/nntp/src/stats.rs
+index c4d17c7d..5bbef3b7 100644
+--- a/crates/nntp/src/stats.rs
++++ b/crates/nntp/src/stats.rs
+@@ -17,17 +17,20 @@ pub enum Workload {
+     Health,
+     Warm,
+     /// Stream-side background work: a client caching a stream ahead of playback, and
+-    /// imports for streams. Below playback, above downloads.
++    /// Below playback, above downloads; while one is active nothing below it starts.
+     Cache,
++    /// Imports for streams: ranked with [`Self::Cache`], but downloads run beside them.
++    Import,
+ }
+ 
+ impl Workload {
+-    pub const ALL: [Self; 5] = [
++    pub const ALL: [Self; 6] = [
+         Self::Stream,
+         Self::Queue,
+         Self::Health,
+         Self::Warm,
+         Self::Cache,
++        Self::Import,
+     ];
+ 
+     #[must_use]
+@@ -38,6 +41,7 @@ impl Workload {
+             Self::Health => "health",
+             Self::Warm => "warm",
+             Self::Cache => "cache",
++            Self::Import => "import",
+         }
+     }
+ 
+@@ -46,7 +50,7 @@ impl Workload {
+     pub const fn rank(self) -> Option<usize> {
+         match self {
+             Self::Stream => None,
+-            Self::Cache => Some(0),
++            Self::Cache | Self::Import => Some(0),
+             Self::Queue => Some(1),
+             Self::Warm => Some(2),
+             Self::Health => Some(3),
+diff --git a/crates/nntp/src/viewers.rs b/crates/nntp/src/viewers.rs
+new file mode 100644
+index 00000000..d4616c77
+--- /dev/null
++++ b/crates/nntp/src/viewers.rs
+@@ -0,0 +1,158 @@
++//! Whether someone is watching: while a playback or cache-ahead request is in flight, and
++//! shortly after, work below them starts nothing on any provider.
++
++use std::pin::pin;
++use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
++use std::time::{Duration, Instant};
++
++use tokio::sync::Notify;
++
++use crate::pool::STREAM_LINGER;
++
++#[derive(Debug, Default)]
++struct Presence {
++    requests: usize,
++    caches: usize,
++    busy_since: Option<Instant>,
++    until: Option<Instant>,
++}
++
++/// A viewer that never goes quiet still cannot hold work below it for longer than this.
++const MAX_HOLD: Duration = Duration::from_hours(1);
++
++#[derive(Debug)]
++pub(crate) struct Viewers {
++    presence: Mutex<Presence>,
++    changed: Notify,
++    max_hold: Duration,
++}
++
++impl Default for Viewers {
++    fn default() -> Self {
++        Self {
++            presence: Mutex::default(),
++            changed: Notify::new(),
++            max_hold: MAX_HOLD,
++        }
++    }
++}
++
++impl Viewers {
++    fn lock(&self) -> MutexGuard<'_, Presence> {
++        self.presence.lock().unwrap_or_else(PoisonError::into_inner)
++    }
++
++    pub(crate) fn enter(self: &Arc<Self>, cache: bool) -> Viewing {
++        let now = Instant::now();
++        let mut presence = self.lock();
++        if presence.requests == 0 && presence.until.is_none_or(|until| now >= until) {
++            presence.busy_since = Some(now);
++        }
++        presence.requests += 1;
++        presence.caches += usize::from(cache);
++        drop(presence);
++        self.changed.notify_waiters();
++        Viewing {
++            viewers: Arc::clone(self),
++            cache,
++        }
++    }
++
++    /// Until when work below waits, unless a change comes first; `None` when it may start.
++    fn hold(&self, now: Instant) -> Option<Instant> {
++        let presence = self.lock();
++        let longest = presence.busy_since? + self.max_hold;
++        if now >= longest {
++            return None;
++        }
++        if presence.requests > 0 {
++            return Some(longest);
++        }
++        presence
++            .until
++            .filter(|&until| now < until)
++            .map(|until| until.min(longest))
++    }
++
++    pub(crate) fn holding(&self) -> bool {
++        self.hold(Instant::now()).is_some()
++    }
++
++    pub(crate) fn caching(&self) -> bool {
++        self.lock().caches > 0
++    }
++
++    /// A future that resolves on the next change, armed before the caller's own check.
++    pub(crate) fn changed(&self) -> tokio::sync::futures::Notified<'_> {
++        self.changed.notified()
++    }
++
++    pub(crate) async fn clear(&self) {
++        loop {
++            let mut changed = pin!(self.changed());
++            changed.as_mut().enable();
++            let Some(until) = self.hold(Instant::now()) else {
++                return;
++            };
++            let _ = tokio::time::timeout_at(until.into(), changed).await;
++        }
++    }
++}
++
++/// One viewer request. The hold after it is at most as long as the burst it ended, so a
++/// reader trickling a few articles leaves the link to downloads between them.
++pub(crate) struct Viewing {
++    viewers: Arc<Viewers>,
++    cache: bool,
++}
++
++impl Drop for Viewing {
++    fn drop(&mut self) {
++        let now = Instant::now();
++        let mut presence = self.viewers.lock();
++        presence.requests -= 1;
++        presence.caches -= usize::from(self.cache);
++        if presence.requests == 0 {
++            let burst = presence
++                .busy_since
++                .map_or(Duration::ZERO, |since| now.duration_since(since));
++            presence.until = Some(now + burst.min(STREAM_LINGER));
++        }
++        drop(presence);
++        self.viewers.changed.notify_waiters();
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn the_hold_ends_after_a_burst_as_long_as_it() {
++        let viewers = Arc::new(Viewers::default());
++        assert!(!viewers.holding());
++        let request = viewers.enter(true);
++        assert!(viewers.holding() && viewers.caching());
++        tokio::time::sleep(Duration::from_millis(40)).await;
++        drop(request);
++        assert!(viewers.holding() && !viewers.caching());
++        tokio::time::timeout(Duration::from_millis(500), viewers.clear())
++            .await
++            .expect("a short burst holds work below only briefly");
++        assert!(!viewers.holding());
++    }
++
++    #[tokio::test]
++    async fn a_viewer_that_never_stops_cannot_hold_work_below_forever() {
++        let viewers = Arc::new(Viewers {
++            max_hold: Duration::from_millis(60),
++            ..Viewers::default()
++        });
++        let _request = viewers.enter(true);
++        assert!(viewers.holding());
++        tokio::time::timeout(Duration::from_secs(1), viewers.clear())
++            .await
++            .expect("the hold has a ceiling");
++        assert!(!viewers.holding());
++    }
++}
+diff --git a/crates/nntp/tests/client.rs b/crates/nntp/tests/client.rs
+index ce5b92be..983d20d5 100644
+--- a/crates/nntp/tests/client.rs
++++ b/crates/nntp/tests/client.rs
+@@ -841,6 +841,7 @@ async fn a_stalled_stream_read_fails_over_without_retrying() {
+ /// busy with a BODY held for 600 ms, and a healthy backup one level down.
+ async fn hung_connects(
+     corpus: &Corpus,
++    workload: Workload,
+ ) -> (
+     LoopbackServer,
+     LoopbackServer,
+@@ -874,7 +875,7 @@ async fn hung_connects(
+     body(&client, &corpus.articles[0].message_id).await.unwrap();
+     let busy = tokio::spawn({
+         let (client, id) = (Arc::clone(&client), corpus.articles[1].message_id.clone());
+-        async move { body(&client, &id).await.map(|_| ()) }
++        async move { client.body(&id, workload, None).await.map(|_| ()) }
+     });
+     tokio::time::sleep(Duration::from_millis(50)).await;
+     (flaky, backup, client, busy)
+@@ -883,7 +884,7 @@ async fn hung_connects(
+ #[tokio::test]
+ async fn a_hung_new_connection_does_not_stall_playback() {
+     let corpus = Corpus::generate(1025, 3, ARTICLE_SIZE);
+-    let (_flaky, backup, client, busy) = hung_connects(&corpus).await;
++    let (_flaky, backup, client, busy) = hung_connects(&corpus, Workload::Stream).await;
+ 
+     let started = std::time::Instant::now();
+     body(&client, &corpus.articles[2].message_id).await.unwrap();
+@@ -903,7 +904,7 @@ async fn a_hung_new_connection_does_not_stall_playback() {
+ #[tokio::test]
+ async fn a_request_waiting_on_a_hung_connect_never_asks_the_next_level() {
+     let corpus = Corpus::generate(1025, 3, ARTICLE_SIZE);
+-    let (flaky, backup, client, busy) = hung_connects(&corpus).await;
++    let (flaky, backup, client, busy) = hung_connects(&corpus, Workload::Queue).await;
+ 
+     assert!(
+         client
+@@ -1036,7 +1037,7 @@ async fn playback_finds_a_connection_imports_leave_free() {
+         (4, Workload::Queue, 3),
+         (10, Workload::Health, 9),
+         (16, Workload::Queue, 14),
+-        (16, Workload::Cache, 15),
++        (16, Workload::Cache, 14),
+     ] {
+         let ids: Vec<_> = (0..max_connections + 2)
+             .map(|index| format!("background-{index}@loopback"))
+diff --git a/crates/nntp/tests/stream_first.rs b/crates/nntp/tests/stream_first.rs
+index 7c96790c..b47b7c7e 100644
+--- a/crates/nntp/tests/stream_first.rs
++++ b/crates/nntp/tests/stream_first.rs
+@@ -171,7 +171,10 @@ async fn playback_reads_are_not_queued_behind_a_saturating_download() {
+     // Relative to a read on an idle connection (~0.3 s), so a slow runner does not fail
+     // it: behind four queued articles a read takes about three of those.
+     assert!(p99 < idle * 5 / 2, "p99 {p99:?}, idle read {idle:?}");
+-    assert!(shared > alone * 0.8, "{shared:.1} of {alone:.1} MB/s");
++    assert!(
++        shared < alone * 0.8,
++        "the queue kept {shared:.1} of {alone:.1} MB/s while playback was active"
++    );
+ }
+ 
+ #[tokio::test]
+-- 
+2.56.1
+

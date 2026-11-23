@@ -316,7 +316,7 @@ async fn a_hung_tool_that_only_prints_is_stopped() {
     let rar = Posted::new(
         "r",
         "R.rar",
-        include_bytes!("../vendor/fixtures/archive/Rar.rar").to_vec(),
+        include_bytes!("../fixtures/Rar.no-exe.rar").to_vec(),
     );
     let rig = Rig::new(rar.articles.clone()).await;
     let engine = rig

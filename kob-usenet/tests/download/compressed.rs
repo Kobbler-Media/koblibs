@@ -5,10 +5,10 @@ use crate::rar::{self, Member};
 use crate::repair::Protected;
 use crate::support::{Rig, assert_file, completed, crc_of, extractor_on_path, finish, listing};
 
-pub const RAR4: &[u8] = include_bytes!("../vendor/fixtures/archive/Rar.rar");
+pub const RAR4: &[u8] = include_bytes!("../fixtures/Rar.no-exe.rar");
 
 pub const FIXTURE_FILES: [(&str, usize, u32); 2] = [
-    ("exe/test.exe", 45_056, 0xCFB1_09C8),
+    ("exe/test.bin", 45_056, 0xCFB1_09C8),
     ("jpg/test.jpg", 40_372, 0x0888_14E3),
 ];
 

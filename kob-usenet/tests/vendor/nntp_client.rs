@@ -846,6 +846,7 @@ async fn a_stalled_stream_read_fails_over_without_retrying() {
 /// busy with a BODY held for 600 ms, and a healthy backup one level down.
 async fn hung_connects(
     corpus: &Corpus,
+    workload: Workload,
 ) -> (
     LoopbackServer,
     LoopbackServer,
@@ -879,7 +880,7 @@ async fn hung_connects(
     body(&client, &corpus.articles[0].message_id).await.unwrap();
     let busy = tokio::spawn({
         let (client, id) = (Arc::clone(&client), corpus.articles[1].message_id.clone());
-        async move { body(&client, &id).await.map(|_| ()) }
+        async move { client.body(&id, workload, None).await.map(|_| ()) }
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     (flaky, backup, client, busy)
@@ -888,7 +889,7 @@ async fn hung_connects(
 #[tokio::test]
 async fn a_hung_new_connection_does_not_stall_playback() {
     let corpus = Corpus::generate(1025, 3, ARTICLE_SIZE);
-    let (_flaky, backup, client, busy) = hung_connects(&corpus).await;
+    let (_flaky, backup, client, busy) = hung_connects(&corpus, Workload::Stream).await;
 
     let started = std::time::Instant::now();
     body(&client, &corpus.articles[2].message_id).await.unwrap();
@@ -908,7 +909,7 @@ async fn a_hung_new_connection_does_not_stall_playback() {
 #[tokio::test]
 async fn a_request_waiting_on_a_hung_connect_never_asks_the_next_level() {
     let corpus = Corpus::generate(1025, 3, ARTICLE_SIZE);
-    let (flaky, backup, client, busy) = hung_connects(&corpus).await;
+    let (flaky, backup, client, busy) = hung_connects(&corpus, Workload::Queue).await;
 
     assert!(
         client
@@ -1041,7 +1042,7 @@ async fn playback_finds_a_connection_imports_leave_free() {
         (4, Workload::Queue, 3),
         (10, Workload::Health, 9),
         (16, Workload::Queue, 14),
-        (16, Workload::Cache, 15),
+        (16, Workload::Cache, 14),
     ] {
         let ids: Vec<_> = (0..max_connections + 2)
             .map(|index| format!("background-{index}@loopback"))

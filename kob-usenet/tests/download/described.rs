@@ -14,7 +14,7 @@ async fn a_first_article_serving_another_files_part_one_is_not_a_second_copy() {
         let rar = Posted::new(
             "rar",
             "Release.rar",
-            include_bytes!("../vendor/fixtures/archive/Rar.rar").to_vec(),
+            include_bytes!("../fixtures/Rar.no-exe.rar").to_vec(),
         );
         let sets = par2_set(&[&one, &two, &rar], "S", SLICE, 100);
         let mut posts = vec![&one, &two, &rar];

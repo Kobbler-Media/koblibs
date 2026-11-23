@@ -70,3 +70,94 @@ async fn a_health_sample_runs_on_a_spawned_task() {
 
     assert_eq!(sample.missing, 0);
 }
+
+#[tokio::test]
+async fn a_quick_check_stats_a_fixed_spread_including_both_ends() {
+    let fixture = Fixture::season();
+    let episode = &fixture.files[1].articles;
+    let (first, last) = (
+        episode[0].message_id.clone(),
+        episode[episode.len() - 1].message_id.clone(),
+    );
+    let healthy = LoopbackServer::start(fixture.articles()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let release = {
+        let engine = engine(dir.path(), vec![server("a", &healthy, 0)]).await;
+        import(&engine, &fixture.standard_nzb(), None).await
+    };
+    let index = output(&release, "Show.S01E01.mkv");
+    for (gone, articles, checked, missing) in [
+        (first.as_str(), 2, 2, 1),
+        (last.as_str(), 2, 2, 1),
+        (first.as_str(), 5, 5, 1),
+        (last.as_str(), 5, 5, 1),
+        (last.as_str(), 1000, episode.len(), 1),
+    ] {
+        let kept = fixture
+            .articles()
+            .into_iter()
+            .filter(|a| a.message_id != gone);
+        let damaged = LoopbackServer::start(kept).await.unwrap();
+        let engine = engine(dir.path(), vec![server("a", &damaged, 0)]).await;
+        let sample = engine
+            .quick_check(&release.key, articles, Some(index))
+            .await
+            .unwrap();
+        assert_eq!(
+            sample,
+            HealthSample { checked, missing },
+            "{articles} articles with {gone} gone"
+        );
+        assert_eq!(
+            damaged.body_commands(),
+            0,
+            "a quick check never fetches bodies"
+        );
+        let stats = &engine.stats()[0];
+        let attempts = |w: kob_usenet::vendor::nntp::Workload| {
+            stats.workloads[w as usize].attempts.iter().sum::<u64>()
+        };
+        assert!(attempts(kob_usenet::vendor::nntp::Workload::Warm) > 0);
+        assert_eq!(attempts(kob_usenet::vendor::nntp::Workload::Health), 0);
+    }
+}
+
+#[tokio::test]
+async fn sixty_four_articles_check_in_about_a_second_at_200ms_rtt() {
+    use kob_usenet::vendor::testkit::{Impairment, post};
+    let mut data = vec![7_u8; 128 * 16 * 1024];
+    data[..4].copy_from_slice(&[0x1A, 0x45, 0xDF, 0xA3]);
+    let articles = post("q", "Quick.2026.mkv", &data, 16 * 1024);
+    let plain = LoopbackServer::start(articles.clone()).await.unwrap();
+    let slow = LoopbackServer::start_impaired(
+        articles,
+        Impairment {
+            response_delay: std::time::Duration::from_millis(200),
+            ..Impairment::default()
+        },
+    )
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let nzb = crate::support::single_nzb("q", "Quick.2026.mkv", 128, 16 * 1024);
+    let release = {
+        let engine = engine(dir.path(), vec![server("a", &plain, 0)]).await;
+        import(&engine, &nzb, None).await
+    };
+    let engine = engine(
+        dir.path(),
+        vec![kob_usenet::ServerConfig {
+            connections: 16,
+            ..server("a", &slow, 0)
+        }],
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let sample = engine.quick_check(&release.key, 64, None).await.unwrap();
+    let took = started.elapsed();
+    assert_eq!((sample.checked, sample.missing), (64, 0));
+    assert!(
+        took < std::time::Duration::from_millis(1500),
+        "took {took:?}"
+    );
+}

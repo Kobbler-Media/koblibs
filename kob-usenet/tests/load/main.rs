@@ -3,6 +3,8 @@
 mod bound;
 mod cache;
 mod lanes;
+mod measure;
+mod priority;
 mod rig;
 mod seek;
 mod stall;

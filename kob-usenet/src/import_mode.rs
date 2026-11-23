@@ -17,7 +17,7 @@ impl ImportMode {
 
     pub(crate) const fn workload(self) -> Workload {
         match self {
-            Self::Stream => Workload::Cache,
+            Self::Stream => Workload::Import,
             Self::Prewarm => Workload::Warm,
             Self::Download => Workload::Queue,
         }
