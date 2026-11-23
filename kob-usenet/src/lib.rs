@@ -15,6 +15,7 @@
 
 mod config;
 mod day;
+mod disk;
 mod engine;
 mod error;
 mod flight;
@@ -36,6 +37,7 @@ mod writer;
 pub mod vendor;
 
 pub use config::{DownloadConfig, EngineConfig, IpPreference, ServerConfig};
+pub use disk::{DirectDisk, JobDisk};
 pub use engine::Engine;
 pub use error::Error;
 pub use health::HealthSample;

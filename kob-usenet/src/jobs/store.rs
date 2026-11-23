@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::Error;
+use crate::disk::hand_off_worker;
 use crate::jobs::failure::Failure;
 use crate::jobs::{JobSpec, JobStatus};
 use crate::release::hex;
@@ -170,14 +171,14 @@ impl JobStore {
     }
 
     pub fn put_nzb(&self, id: &str, nzb: &[u8]) -> io::Result<()> {
-        write_atomic(&self.dir(id).join("nzb"), nzb)
+        hand_off_worker(|| write_atomic(&self.dir(id).join("nzb"), nzb))
     }
 
     pub fn put_status(&self, status: &JobStatus) -> Result<(), Error> {
-        Ok(write_atomic(
-            &self.dir(&status.id).join("status"),
-            &encode(status)?,
-        )?)
+        let bytes = encode(status)?;
+        Ok(hand_off_worker(|| {
+            write_atomic(&self.dir(&status.id).join("status"), &bytes)
+        })?)
     }
 
     pub fn plan(&self, id: &str) -> Result<Option<Plan>, Error> {
@@ -226,7 +227,10 @@ impl JobStore {
             probed: plan.probed,
             outputs,
         };
-        Ok(write_atomic(&self.dir(id).join("plan"), &encode(&stored)?)?)
+        let bytes = encode(&stored)?;
+        Ok(hand_off_worker(|| {
+            write_atomic(&self.dir(id).join("plan"), &bytes)
+        })?)
     }
 
     pub fn phase(&self, id: &str) -> Result<Phase, Error> {
@@ -238,7 +242,10 @@ impl JobStore {
     }
 
     pub fn put_phase(&self, id: &str, phase: &Phase) -> Result<(), Error> {
-        Ok(write_atomic(&self.dir(id).join("phase"), &encode(phase)?)?)
+        let bytes = encode(phase)?;
+        Ok(hand_off_worker(|| {
+            write_atomic(&self.dir(id).join("phase"), &bytes)
+        })?)
     }
 
     pub fn map(&self, id: &str, output: usize) -> PathBuf {

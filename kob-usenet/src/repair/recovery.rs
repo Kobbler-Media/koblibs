@@ -14,7 +14,6 @@ use crate::vendor::queue::nzb::{File, Nzb};
 const PACKET_OVERHEAD: u64 = 68;
 const YENC_OVERHEAD_PERCENT: u64 = 103;
 const PARALLEL: usize = 8;
-const DISCOVER: usize = 16;
 const KNOWN: [&str; 26] = [
     "mkv", "mp4", "avi", "m4v", "mov", "ts", "m2ts", "wmv", "mpg", "webm", "srt", "sub", "idx",
     "ass", "nfo", "sfv", "txt", "jpg", "jpeg", "png", "nzb", "flac", "mp3", "m4a", "epub", "iso",
@@ -75,7 +74,10 @@ impl Par2s {
                 async move { (index, fetcher.first(&id, expected).await) }
             })
             .collect();
-        let read: Vec<_> = stream::iter(probes).buffered(DISCOVER).collect().await;
+        let read: Vec<_> = stream::iter(probes)
+            .buffered(fetcher.planning_breadth())
+            .collect()
+            .await;
         let mut files: Vec<Par2File> = nzb
             .files
             .iter()

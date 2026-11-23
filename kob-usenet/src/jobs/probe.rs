@@ -12,7 +12,6 @@ use crate::vendor::queue::nzb::Nzb;
 const ALL_BELOW: usize = 200;
 const SAMPLE_PERCENT: usize = 2;
 const SAMPLE_MAX: usize = 1000;
-const CONCURRENCY: usize = 16;
 
 pub struct Missed {
     pub members: bool,
@@ -53,7 +52,10 @@ pub async fn hopeless(
             async move { fetcher.stat(&id).await }
         })
         .collect();
-    let answers: Vec<_> = stream::iter(stats).buffered(CONCURRENCY).collect().await;
+    let answers: Vec<_> = stream::iter(stats)
+        .buffered(fetcher.planning_breadth())
+        .collect()
+        .await;
     if let Some(Err(error)) = answers.iter().find(|a| a.is_err()) {
         return Err(Failure::providers(error));
     }

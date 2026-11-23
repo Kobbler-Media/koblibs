@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::day;
+use crate::disk::{DirectDisk, JobDisk};
 use crate::space::{FreeSpace, Statvfs};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -120,6 +121,7 @@ pub struct DownloadConfig {
     pub active_jobs: usize,
     pub free_space_floor: u64,
     pub free_space: Arc<dyn FreeSpace>,
+    pub disk: Arc<dyn JobDisk>,
     pub unrar: PathBuf,
     pub sevenzip: PathBuf,
     pub repair_memory_bytes: usize,
@@ -136,6 +138,7 @@ impl Default for DownloadConfig {
             active_jobs: 2,
             free_space_floor: 1 << 30,
             free_space: Arc::new(Statvfs),
+            disk: Arc::new(DirectDisk),
             unrar: PathBuf::from("unrar"),
             sevenzip: PathBuf::from("7z"),
             repair_memory_bytes: 256 << 20,

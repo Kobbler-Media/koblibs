@@ -6,6 +6,8 @@ use crate::vendor::nntp::{Body, BodyExpectation, Client, Error, Lane, Workload};
 pub const MESSAGE_ID: &str = "message-id";
 const ATTEMPTS: u32 = 4;
 const BACKOFF: Duration = Duration::from_millis(500);
+const PLANNING_LEAST: usize = 16;
+const PLANNING_MOST: usize = 64;
 
 #[derive(Clone)]
 pub struct Fetcher {
@@ -50,6 +52,12 @@ impl Fetcher {
             lane: Lane::default(),
             posted,
         }
+    }
+
+    pub fn planning_breadth(&self) -> usize {
+        self.client
+            .max_connections()
+            .clamp(PLANNING_LEAST, PLANNING_MOST)
     }
 
     pub fn expect(&self, expected: BodyExpectation) -> BodyExpectation {

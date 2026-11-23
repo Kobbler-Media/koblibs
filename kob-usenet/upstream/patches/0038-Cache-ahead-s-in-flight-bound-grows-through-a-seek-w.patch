@@ -1,0 +1,55 @@
+From 5cb37fb3e0c53afd1f52b0d5a68970aab6ba14ee Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Tue, 24 Nov 2026 09:10:34 +1100
+Subject: [PATCH] Cache-ahead's in-flight bound grows through a seek while it
+ drains quickly
+
+---
+ crates/nntp/src/pace.rs | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/crates/nntp/src/pace.rs b/crates/nntp/src/pace.rs
+index fd3da92e..962d322f 100644
+--- a/crates/nntp/src/pace.rs
++++ b/crates/nntp/src/pace.rs
+@@ -13,6 +13,8 @@ const PROBE: Duration = Duration::from_secs(2);
+ const IDLE_RESET: Duration = Duration::from_secs(10);
+ /// Growth that counts as the link not being full yet.
+ const GAIN: f64 = 1.15;
++/// Beyond this much queued on the link, more in flight would only delay the running seek.
++const SEEK_DRAIN_SECS: f64 = 0.5;
+ 
+ #[derive(Debug)]
+ struct State {
+@@ -72,8 +74,9 @@ impl Pace {
+         if elapsed < PROBE {
+             return;
+         }
+-        if state.bound && !state.seeking && !state.settled {
+-            let rate = state.landed as f64 / elapsed.as_secs_f64();
++        let rate = state.landed as f64 / elapsed.as_secs_f64();
++        let queued = state.seeking && state.limit as f64 > rate * SEEK_DRAIN_SECS;
++        if state.bound && !state.settled && !queued {
+             match state.tried {
+                 Some((limit, best)) if rate < best * GAIN => {
+                     state.limit = limit;
+@@ -166,6 +169,16 @@ mod tests {
+         assert_eq!(window(&pace, &mut at, 40 << 20), INITIAL * 3 / 2, "settled");
+     }
+ 
++    #[test]
++    fn a_seek_grows_the_bound_only_while_it_drains_quickly() {
++        for (rate, grown) in [(100 << 20, INITIAL * 3 / 2), (25 << 20, INITIAL)] {
++            let pace = Pace::default();
++            let mut at = pace.lock().window;
++            assert!(!pace.full(true));
++            assert_eq!(window(&pace, &mut at, rate), grown, "{rate} B/s");
++        }
++    }
++
+     #[test]
+     fn a_lone_request_always_goes_and_a_seek_halves_the_bound() {
+         let pace = Pace::default();
+-- 
+2.56.1
+

@@ -2,9 +2,11 @@
 
 mod bound;
 mod cache;
+mod job_rate;
 mod lanes;
 mod link;
 mod measure;
+mod model_disk;
 mod priority;
 mod rig;
 mod seek;

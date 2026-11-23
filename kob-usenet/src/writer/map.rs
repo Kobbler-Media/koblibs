@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Arc;
 
 pub const HEADER: usize = 16;
 
@@ -28,7 +29,7 @@ impl Identity {
 }
 
 pub struct SegmentMap {
-    file: File,
+    file: Arc<File>,
     marks: Vec<Mark>,
 }
 
@@ -56,7 +57,10 @@ impl SegmentMap {
             .create(true)
             .truncate(false)
             .open(path)?;
-        Ok(Self { file, marks })
+        Ok(Self {
+            file: Arc::new(file),
+            marks,
+        })
     }
 
     pub fn stamp(&self, data: Identity) -> io::Result<()> {
@@ -77,7 +81,7 @@ impl SegmentMap {
             .write_all_at(&[mark as u8], (HEADER + index) as u64)
     }
 
-    pub fn sync(&self) -> io::Result<()> {
-        self.file.sync_data()
+    pub fn handle(&self) -> Arc<File> {
+        Arc::clone(&self.file)
     }
 }

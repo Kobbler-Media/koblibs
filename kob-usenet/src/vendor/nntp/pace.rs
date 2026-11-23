@@ -13,6 +13,8 @@ const PROBE: Duration = Duration::from_secs(2);
 const IDLE_RESET: Duration = Duration::from_secs(10);
 /// Growth that counts as the link not being full yet.
 const GAIN: f64 = 1.15;
+/// Beyond this much queued on the link, more in flight would only delay the running seek.
+const SEEK_DRAIN_SECS: f64 = 0.5;
 
 #[derive(Debug)]
 struct State {
@@ -76,8 +78,9 @@ impl Pace {
         if elapsed < PROBE {
             return;
         }
-        if state.bound && !state.seeking && !state.settled {
-            let rate = state.landed as f64 / elapsed.as_secs_f64();
+        let rate = state.landed as f64 / elapsed.as_secs_f64();
+        let queued = state.seeking && state.limit as f64 > rate * SEEK_DRAIN_SECS;
+        if state.bound && !state.settled && !queued {
             match state.tried {
                 Some((limit, best)) if rate < best * GAIN => {
                     state.limit = limit;
@@ -171,6 +174,16 @@ mod tests {
         assert_eq!(grown, INITIAL * 9 / 4);
         assert_eq!(window(&pace, &mut at, 15 << 20), INITIAL * 3 / 2);
         assert_eq!(window(&pace, &mut at, 40 << 20), INITIAL * 3 / 2, "settled");
+    }
+
+    #[test]
+    fn a_seek_grows_the_bound_only_while_it_drains_quickly() {
+        for (rate, grown) in [(100 << 20, INITIAL * 3 / 2), (25 << 20, INITIAL)] {
+            let pace = Pace::default();
+            let mut at = pace.lock().window;
+            assert!(!pace.full(true));
+            assert_eq!(window(&pace, &mut at, rate), grown, "{rate} B/s");
+        }
     }
 
     #[test]

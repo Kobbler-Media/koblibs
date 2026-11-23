@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::ImportMode;
 use crate::jobs::failure::Failure;
 use crate::jobs::fetch::Fetcher;
 use crate::jobs::payload;
@@ -28,7 +27,7 @@ pub async fn direct(
 ) -> Next {
     let rules = Rules {
         check_percent: 0,
-        concurrency: ImportMode::Download.concurrency(),
+        concurrency: fetcher.planning_breadth(),
         ..Rules::default()
     };
     let release = names::sanitize(name).unwrap_or_else(|| "release".to_owned());

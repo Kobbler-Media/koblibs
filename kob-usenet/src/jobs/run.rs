@@ -265,6 +265,7 @@ async fn write(job: &Job<'_>, plan: &Plan) -> Result<Vec<Vec<Range<u64>>>, Failu
     let writer = Writer {
         fetcher: job.fetcher,
         gate: &shared.gate,
+        disk: &shared.config.disk,
         window: connections * shared.pipeline_depth.max(1),
         tail: connections,
         straggler_after: shared.config.straggler_after,

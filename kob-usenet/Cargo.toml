@@ -17,6 +17,7 @@ crc32fast = "1.5.2"
 flate2 = "1.1.10"
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "alloc"] }
 hmac = "0.13.0"
+libc = "0.2.191"
 lzma-rs = { version = "0.3.0", default-features = false }
 md-5 = "0.11.0"
 nix = { version = "0.31.3", default-features = false, features = ["dir", "fs"] }
@@ -31,7 +32,7 @@ sha1 = "0.11.0"
 sha2 = "0.11.1"
 socket2 = "0.6.5"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = "0.26.6"
 tokio-util = { version = "0.7.20", features = ["io"] }
 tracing = "0.1"

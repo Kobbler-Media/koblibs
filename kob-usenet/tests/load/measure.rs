@@ -14,22 +14,36 @@ use crate::support::{POSTED, quoted, server};
 
 const CONNECTIONS: usize = 49;
 const ROUND_TRIP: Duration = Duration::from_millis(206);
-const LINK: u64 = 25_000_000;
-const SEEK_LEAD: Duration = Duration::from_secs(9);
+const SEEK_LEAD_BYTES: u64 = 225_000_000;
 const SEEK_AHEAD: u64 = 64 << 20;
-const FILM_BYTES: usize = 900_000_000;
-const LIBRARY_BYTES: usize = 1_500_000_000;
+const FILM_SECONDS: usize = 36;
+pub const LIBRARY_BYTES: usize = 1_500_000_000;
 const SEEK_EVERY: Duration = Duration::from_millis(150);
 const SEEK_READ: usize = 2 << 20;
 const REPAIR_BYTES: usize = 420_000_000;
 const SOLVING_CORES: f64 = 2.0;
 const CLOCK_TICKS: f64 = 100.0;
 
-fn article_size() -> usize {
+pub fn article_size() -> usize {
     std::env::var("KOB_MEASURE_ARTICLE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(700_000)
+}
+
+fn link() -> u64 {
+    std::env::var("KOB_MEASURE_LINK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000_000)
+}
+
+fn film_bytes() -> usize {
+    link() as usize * FILM_SECONDS
+}
+
+fn seek_lead() -> Duration {
+    Duration::from_secs_f64(SEEK_LEAD_BYTES as f64 / link() as f64)
 }
 
 fn repairing() -> bool {
@@ -109,13 +123,13 @@ fn seeking() -> bool {
 }
 
 // The articles live in a child process so the parent's peak RSS is the engine's alone.
-struct Provider {
+pub struct Provider {
     child: Child,
-    port: u16,
+    pub port: u16,
 }
 
 impl Provider {
-    fn spawn() -> Self {
+    pub fn spawn() -> Self {
         let mut command = Command::new(std::env::current_exe().unwrap());
         if repairing() {
             command.env("KOB_MEASURE_NZB", repair_nzb_path());
@@ -153,7 +167,7 @@ impl Drop for Provider {
 #[ignore = "child process of the measurement scenario"]
 async fn serve() {
     let article = article_size();
-    let mut articles = post("film", "Film.2026.mkv", &media(FILM_BYTES, 239), article);
+    let mut articles = post("film", "Film.2026.mkv", &media(film_bytes(), 239), article);
     articles.extend(post(
         "lib",
         "Library.2026.mkv",
@@ -164,7 +178,7 @@ async fn serve() {
         articles.extend(damaged_release(article, std::path::Path::new(&path)));
     }
     let nntp = LoopbackServer::start(articles).await.unwrap();
-    let front = Link::new(LINK, ROUND_TRIP).front(nntp.addr()).await;
+    let front = Link::new(link(), ROUND_TRIP).front(nntp.addr()).await;
     println!("PORT={}", front.port());
     std::io::stdout().flush().unwrap();
     tokio::task::spawn_blocking(|| {
@@ -195,7 +209,7 @@ async fn seeks(
     done: Arc<AtomicBool>,
     position: Arc<AtomicU64>,
 ) -> Vec<(f64, f64)> {
-    tokio::time::sleep(SEEK_LEAD).await;
+    tokio::time::sleep(seek_lead()).await;
     let mut timings = Vec::new();
     let mut state = 0x9E37_79B9_u64;
     while !done.load(Ordering::Relaxed) {
@@ -262,9 +276,10 @@ async fn scenario() {
     let mut account = server("a", &LoopbackServer::start(Vec::new()).await.unwrap(), 0);
     account.port = provider.port;
     account.connections = CONNECTIONS;
-    let config = EngineConfig::new(dir.path().to_path_buf(), vec![account]);
+    let mut config = EngineConfig::new(dir.path().to_path_buf(), vec![account]);
+    config.download.disk = crate::model_disk::from_env();
     let engine = Arc::new(Engine::new(config).await.unwrap());
-    let film_parts = FILM_BYTES.div_ceil(article);
+    let film_parts = film_bytes().div_ceil(article);
     let film = engine
         .import(
             Some(&single_nzb("film", "Film.2026.mkv", film_parts, article)),

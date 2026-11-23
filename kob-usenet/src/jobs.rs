@@ -103,7 +103,7 @@ struct Shared {
     config: DownloadConfig,
     pipeline_depth: usize,
     store: JobStore,
-    gate: SpaceGate,
+    gate: Arc<SpaceGate>,
     slots: Arc<Semaphore>,
     status: Mutex<HashMap<String, (u64, JobStatus)>>,
     tasks: Mutex<HashMap<String, JoinHandle<()>>>,
@@ -143,7 +143,10 @@ impl Jobs {
         pipeline_depth: usize,
     ) -> Result<Self, Error> {
         let store = JobStore::open(root)?;
-        let gate = SpaceGate::new(Arc::clone(&config.free_space), config.free_space_floor);
+        let gate = Arc::new(SpaceGate::new(
+            Arc::clone(&config.free_space),
+            config.free_space_floor,
+        ));
         let slots = Arc::new(Semaphore::new(config.active_jobs.max(1)));
         let shared = Arc::new(Shared {
             client,

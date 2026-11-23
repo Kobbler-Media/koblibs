@@ -7,6 +7,7 @@ mod described;
 mod durable;
 mod fake;
 mod firsts;
+mod flowing;
 mod headless;
 mod hedge;
 mod hopeless;
