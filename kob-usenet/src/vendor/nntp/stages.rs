@@ -119,6 +119,26 @@ impl ConnectionRoute {
     }
 }
 
+/// Whether the connection a request took had moved body data within the last second, so
+/// its congestion window is still open on the provider's side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionPath {
+    Warm,
+    Cold,
+}
+
+impl ConnectionPath {
+    pub const ALL: [Self; 2] = [Self::Warm, Self::Cold];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Warm => "warm",
+            Self::Cold => "cold",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssignLoad {
     RequestsAhead,
@@ -210,6 +230,7 @@ impl HistogramSnapshot {
 struct WorkloadStages {
     stages: [Histogram<18>; StreamStage::ALL.len()],
     routes: [AtomicU64; ConnectionRoute::ALL.len()],
+    paths: [AtomicU64; ConnectionPath::ALL.len()],
     load: [Histogram<13>; AssignLoad::ALL.len()],
     body_bytes: AtomicU64,
     abandoned: AtomicU64,
@@ -220,6 +241,7 @@ pub struct WorkloadStageSnapshot {
     pub workload: Workload,
     pub stages: Vec<(StreamStage, HistogramSnapshot)>,
     pub routes: Vec<(ConnectionRoute, u64)>,
+    pub paths: Vec<(ConnectionPath, u64)>,
     pub load: Vec<(AssignLoad, HistogramSnapshot)>,
     pub body_bytes: u64,
     /// Assigned a connection but never delivered: cancelled by a seek, or failed.
@@ -235,6 +257,11 @@ impl WorkloadStageSnapshot {
     #[must_use]
     pub fn route(&self, route: ConnectionRoute) -> u64 {
         self.routes[route as usize].1
+    }
+
+    #[must_use]
+    pub fn path(&self, path: ConnectionPath) -> u64 {
+        self.paths[path as usize].1
     }
 
     #[must_use]
@@ -274,6 +301,10 @@ impl StageMetrics {
                 routes: ConnectionRoute::ALL
                     .iter()
                     .map(|&route| (route, stages.routes[route as usize].load(Ordering::Relaxed)))
+                    .collect(),
+                paths: ConnectionPath::ALL
+                    .iter()
+                    .map(|&path| (path, stages.paths[path as usize].load(Ordering::Relaxed)))
                     .collect(),
                 load: AssignLoad::ALL
                     .iter()
@@ -363,6 +394,7 @@ pub(crate) struct Assigned {
     pub(crate) connection: u32,
     pub(crate) provider: u16,
     pub(crate) opened: Option<ConnectTimes>,
+    pub(crate) warm: bool,
     pub(crate) load: Option<LoadAtAssign>,
 }
 
@@ -383,6 +415,7 @@ pub(crate) struct RequestTrace {
     assigned_at: Instant,
     assigned: Assigned,
     route: ConnectionRoute,
+    path: ConnectionPath,
     written: Option<Instant>,
     reply: Option<ReplyTimes>,
 }
@@ -400,6 +433,12 @@ impl RequestTrace {
             (None, _) => ConnectionRoute::Busy,
         };
         stages.routes[route as usize].fetch_add(1, Ordering::Relaxed);
+        let path = if assigned.warm {
+            ConnectionPath::Warm
+        } else {
+            ConnectionPath::Cold
+        };
+        stages.paths[path as usize].fetch_add(1, Ordering::Relaxed);
         let load = |which: AssignLoad, value: u64| {
             stages.load[which as usize].observe(&LOAD_BUCKETS, value);
         };
@@ -421,6 +460,7 @@ impl RequestTrace {
             assigned_at: Instant::now(),
             assigned,
             route,
+            path,
             written: None,
             reply: None,
         }))
@@ -508,6 +548,7 @@ impl RequestTrace {
             tracing::info!(
                 target: TRACE_TARGET,
                 route = self.route.label(),
+                path = self.path.label(),
                 provider = assigned.provider,
                 conn = assigned.connection,
                 ahead = assigned.ahead,

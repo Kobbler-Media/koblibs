@@ -171,11 +171,16 @@ impl Client {
     /// that is not among them any more is retired: requests already on it finish, then
     /// its connections close. Pass a [`Pool`] clone to keep it.
     pub fn replace(&self, providers: impl IntoIterator<Item = Provider>) {
+        let providers: Vec<Provider> = providers.into_iter().collect();
+        let primary = providers.iter().map(|p| p.priority).min();
         let next: Arc<[Entry]> = {
             let mut known = self.known.lock().unwrap_or_else(PoisonError::into_inner);
             providers
                 .into_iter()
                 .map(|mut provider| {
+                    provider
+                        .pool
+                        .set_keep_warm(Some(provider.priority) == primary);
                     let index = known
                         .iter()
                         .position(|k| k.key == provider.key)
@@ -264,6 +269,8 @@ impl Client {
                     connect_failures,
                     trips,
                     hedges: e.stats.hedges(),
+                    keep_warm_stats: e.stats.keep_warm_sent(),
+                    warm_connections: pool.warm_connections(),
                     open_for: e.breaker.open_for(),
                     connected,
                     connect_error,
@@ -739,6 +746,11 @@ impl Client {
         let providers = self.snapshot();
         if providers.is_empty() {
             return Err(Error::Unavailable);
+        }
+        if base.stages.is_some() {
+            for entry in providers.iter() {
+                entry.provider.pool.note_viewer(message_id);
+            }
         }
         let mut order: Vec<_> = providers.iter().collect();
         order.sort_by_cached_key(|entry| entry.preference(workload));

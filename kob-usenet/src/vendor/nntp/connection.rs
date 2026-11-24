@@ -89,6 +89,51 @@ struct Metered {
     usage: Option<Arc<Usage>>,
     unpaid: u64,
     link: Arc<Link>,
+    outbox: Outbox,
+    unflushed: bool,
+}
+
+/// Commands to write while the connection task is inside a read.
+pub(crate) type Outbox = Arc<std::sync::Mutex<Vec<u8>>>;
+
+impl Metered {
+    fn poll_outbox(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut outbox = self
+            .outbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !outbox.is_empty() {
+            match Pin::new(&mut self.inner).poll_write(cx, &outbox) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                }
+                Poll::Ready(Ok(written)) => {
+                    outbox.drain(..written);
+                    self.unflushed = true;
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        drop(outbox);
+        if self.unflushed {
+            match Pin::new(&mut self.inner).poll_flush(cx) {
+                Poll::Ready(Ok(())) => self.unflushed = false,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn outbox_empty(&self) -> bool {
+        !self.unflushed
+            && self
+                .outbox
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+    }
 }
 
 impl AsyncRead for Metered {
@@ -97,11 +142,17 @@ impl AsyncRead for Metered {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // Commands queued while a reply is being read go out here; a socket not ready to
+        // take them has registered this task, and the read carries on meanwhile.
+        if let Poll::Ready(Err(error)) = self.poll_outbox(cx) {
+            return Poll::Ready(Err(error));
+        }
         let before = buf.filled().len();
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
         let read = (buf.filled().len() - before) as u64;
         if read > 0 {
             self.link.last_byte.store(now_ns(), Ordering::Relaxed);
+            self.link.body_read.fetch_add(read, Ordering::Relaxed);
         }
         if let Some(usage) = &self.usage {
             usage.add(read);
@@ -181,6 +232,14 @@ pub(crate) struct Link {
     /// [`now_ns`] stamps: when `phase` began, and when the last byte arrived.
     since: AtomicU64,
     last_byte: AtomicU64,
+    /// When body data last arrived. A greeting does not count: it leaves the provider's
+    /// congestion window as small as a new connection's.
+    last_body: AtomicU64,
+    body_len: AtomicU64,
+    body_read: AtomicU64,
+    /// When a keep-warm STAT was last answered.
+    last_kept: AtomicU64,
+    kept: AtomicBool,
 }
 
 impl Link {
@@ -191,7 +250,51 @@ impl Link {
             phase: AtomicU8::new(Phase::Idle as u8),
             since: AtomicU64::new(now_ns()),
             last_byte: AtomicU64::new(0),
+            last_body: AtomicU64::new(0),
+            body_len: AtomicU64::new(0),
+            body_read: AtomicU64::new(0),
+            last_kept: AtomicU64::new(0),
+            kept: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn set_kept(&self, kept: bool) {
+        self.kept.store(kept, Ordering::Relaxed);
+    }
+
+    /// In the keep-warm set: left free for a seek.
+    pub(crate) fn kept(&self) -> bool {
+        self.kept.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_kept(&self) {
+        self.last_kept.store(now_ns(), Ordering::Relaxed);
+    }
+
+    /// How long since a body or a keep-warm reply last arrived.
+    pub(crate) fn since_traffic(&self) -> Option<Duration> {
+        let kept = age(self.last_kept.load(Ordering::Relaxed));
+        match (self.since_body(), kept) {
+            (Some(body), Some(kept)) => Some(body.min(kept)),
+            (body, kept) => body.or(kept),
+        }
+    }
+
+    pub(crate) fn start_body(&self, len: u64) {
+        self.body_read.store(0, Ordering::Relaxed);
+        self.body_len.store(len, Ordering::Relaxed);
+    }
+
+    /// Bytes of the body in progress not received yet, as far as its size is known.
+    pub(crate) fn body_left(&self) -> u64 {
+        self.body_len
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.body_read.load(Ordering::Relaxed))
+    }
+
+    /// How long since body data last arrived; `None` if it never has.
+    pub(crate) fn since_body(&self) -> Option<Duration> {
+        age(self.last_body.load(Ordering::Relaxed))
     }
 
     pub(crate) fn set(&self, phase: Phase) {
@@ -504,6 +607,8 @@ impl Connection {
                     usage: endpoint.usage.clone(),
                     unpaid: 0,
                     link: Arc::new(Link::new()),
+                    outbox: Outbox::default(),
+                    unflushed: false,
                 },
             ),
             line: Vec::with_capacity(1024),
@@ -581,6 +686,49 @@ impl Connection {
         Ok(())
     }
 
+    /// Queues a keep-warm STAT; [`read_keep_warm`](Self::read_keep_warm) takes its reply.
+    pub(crate) fn send_keep_warm(&mut self, message_id: &str) -> Result<(), Error> {
+        self.queue(b"STAT <", message_id)
+    }
+
+    /// Any answer keeps the connection warm, a 430 included. The reply is not the account's
+    /// traffic, so it comes off the quota and the bandwidth bill.
+    pub(crate) async fn read_keep_warm(&mut self) -> Result<(), Error> {
+        self.take_pending()?;
+        let code = self.read_status().await?;
+        let reply = self.line.len() as u64;
+        let metered = self.stream.get_mut();
+        metered.unpaid = metered.unpaid.saturating_sub(reply);
+        if let Some(usage) = &metered.usage {
+            usage.refund(reply);
+        }
+        if code == 400 {
+            return Err(self.unexpected(code));
+        }
+        self.link().mark_kept();
+        Ok(())
+    }
+
+    /// Resolves once reply bytes are in; safe to cancel, as it consumes none.
+    pub(crate) async fn reply_ready(&mut self) -> Result<(), Error> {
+        let buffered = timeout(self.timeout, self.stream.fill_buf())
+            .await
+            .map_err(|_| Error::Timeout)??;
+        if buffered.is_empty() {
+            return Err(Error::Closed);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn outbox(&self) -> Outbox {
+        Arc::clone(&self.stream.get_ref().outbox)
+    }
+
+    /// Counts commands written through the [`Outbox`] as awaiting their replies.
+    pub(crate) const fn adopt_sent(&mut self, commands: usize) {
+        self.pending += commands;
+    }
+
     /// Reads the reply to the oldest pending STAT request: `Ok` when the article exists.
     pub async fn read_stat(&mut self) -> Result<(), Error> {
         self.take_pending()?;
@@ -632,11 +780,13 @@ impl Connection {
 
     /// Sends all queued commands in one write.
     pub async fn flush(&mut self) -> Result<(), Error> {
-        if self.write_buf.is_empty() {
+        if self.write_buf.is_empty() && self.stream.get_ref().outbox_empty() {
             return Ok(());
         }
         let stream = self.stream.get_mut();
         timeout(self.timeout, async {
+            // Queued before anything in `write_buf`, and replies come back in that order.
+            std::future::poll_fn(|cx| stream.poll_outbox(cx)).await?;
             stream.write_all(&self.write_buf).await?;
             stream.flush().await
         })
@@ -736,7 +886,13 @@ impl Connection {
             if data.capacity() == data.len() {
                 data.reserve(READ_BUFFER_LEN);
             }
-            let buf = self.fill().await?;
+            self.fill().await?;
+            self.stream
+                .get_ref()
+                .link
+                .last_body
+                .store(now_ns(), Ordering::Relaxed);
+            let buf = self.stream.buffer();
             let decoded = data.len();
             let started = Instant::now();
             let (used, end) = decode_incremental(buf, &mut data, &mut state);

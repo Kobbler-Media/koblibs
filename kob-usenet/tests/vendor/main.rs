@@ -2,6 +2,7 @@ mod archive_encrypted;
 mod archive_rar;
 mod archive_sevenzip;
 mod nntp_client;
+mod nntp_keep_warm;
 mod nntp_loopback;
 mod nntp_patch;
 mod nntp_pool;

@@ -14,6 +14,15 @@ impl Usage {
         self.used.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Takes back bytes that were read but are not the account's to pay for.
+    pub(crate) fn refund(&self, bytes: u64) {
+        let _ = self
+            .used
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+
     #[must_use]
     pub fn used(&self) -> u64 {
         self.used.load(Ordering::Relaxed)

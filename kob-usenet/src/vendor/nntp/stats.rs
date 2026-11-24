@@ -72,6 +72,7 @@ const LOG_UNEXPECTED_EVERY: Duration = Duration::from_hours(1);
 
 #[derive(Default)]
 pub(crate) struct Stats {
+    keep_warm: AtomicU64,
     attempts: [[AtomicU64; OUTCOMES]; WORKLOADS],
     failed: [AtomicU64; WORKLOADS],
     bytes: [AtomicU64; WORKLOADS],
@@ -112,6 +113,14 @@ impl Stats {
 
     pub(crate) fn hedged(&self) {
         self.hedges.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn keep_warm(&self) {
+        self.keep_warm.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn keep_warm_sent(&self) -> u64 {
+        self.keep_warm.load(Ordering::Relaxed)
     }
 
     pub(crate) fn hedges(&self) -> u64 {
@@ -195,6 +204,10 @@ pub struct ProviderStats {
     pub trips: u64,
     /// Duplicate requests raced against a slow playback read.
     pub hedges: u64,
+    /// STATs sent only to keep an idle connection's congestion window open.
+    pub keep_warm_stats: u64,
+    /// Open connections that moved body data or a keep-warm STAT within the last second.
+    pub warm_connections: usize,
     /// Cooldown left while the circuit is open.
     pub open_for: Option<Duration>,
     /// A connection opened since the provider was (re)configured.

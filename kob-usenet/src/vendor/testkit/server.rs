@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -67,6 +67,8 @@ pub struct LoopbackServer {
     open: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
     bodies: Arc<AtomicUsize>,
+    stats: Arc<AtomicUsize>,
+    stats_miss: Arc<AtomicBool>,
 }
 
 /// Per message-id: BODY replies still to stall, for how long, and how many were.
@@ -87,6 +89,8 @@ struct Acceptor {
     open: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
     bodies: Arc<AtomicUsize>,
+    stats: Arc<AtomicUsize>,
+    stats_miss: Arc<AtomicBool>,
     stalls: Stalls,
     holds: Holds,
 }
@@ -104,6 +108,8 @@ impl Acceptor {
                     behavior: self.behavior,
                     rejected: now > self.behavior.max_connections,
                     bodies: Arc::clone(&self.bodies),
+                    stats: Arc::clone(&self.stats),
+                    stats_miss: Arc::clone(&self.stats_miss),
                     stalls: Arc::clone(&self.stalls),
                     holds: Arc::clone(&self.holds),
                 };
@@ -251,6 +257,8 @@ impl LoopbackServer {
             open: Arc::default(),
             peak: Arc::default(),
             bodies: Arc::default(),
+            stats: Arc::default(),
+            stats_miss: Arc::default(),
             stalls: Arc::default(),
             holds: Arc::default(),
         };
@@ -261,6 +269,8 @@ impl LoopbackServer {
             open: Arc::clone(&acceptor.open),
             peak: Arc::clone(&acceptor.peak),
             bodies: Arc::clone(&acceptor.bodies),
+            stats: Arc::clone(&acceptor.stats),
+            stats_miss: Arc::clone(&acceptor.stats_miss),
             acceptor,
         })
     }
@@ -308,6 +318,17 @@ impl LoopbackServer {
     #[must_use]
     pub fn body_commands(&self) -> usize {
         self.bodies.load(Ordering::SeqCst)
+    }
+
+    /// STAT commands received across all connections.
+    #[must_use]
+    pub fn stat_commands(&self) -> usize {
+        self.stats.load(Ordering::SeqCst)
+    }
+
+    /// Answers every STAT with 430 while on, whatever the articles.
+    pub fn miss_stats(&self, on: bool) {
+        self.stats_miss.store(on, Ordering::SeqCst);
     }
 
     /// Holds the next BODY reply until released; returns its arrival and release signals.
@@ -383,6 +404,8 @@ struct Limit {
     behavior: Behavior,
     rejected: bool,
     bodies: Arc<AtomicUsize>,
+    stats: Arc<AtomicUsize>,
+    stats_miss: Arc<AtomicBool>,
     stalls: Stalls,
     holds: Holds,
 }
@@ -523,9 +546,11 @@ async fn serve<S: AsyncRead + AsyncWrite>(
                 }
             }
             "STAT" => {
+                limit.stats.fetch_add(1, Ordering::SeqCst);
                 delay(impairment.response_delay).await;
                 let id = arg.trim().trim_start_matches('<').trim_end_matches('>');
-                let reply = if articles.contains_key(id) {
+                let reply = if articles.contains_key(id) && !limit.stats_miss.load(Ordering::SeqCst)
+                {
                     format!("223 0 <{id}>\r\n")
                 } else {
                     "430 no such article\r\n".to_owned()

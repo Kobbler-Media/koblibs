@@ -1,0 +1,1353 @@
+From 5e1b74d1794be6666ce4d019f7e684716d7f0659 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Tue, 24 Nov 2026 12:52:25 +1100
+Subject: [PATCH] While someone watches, a few connections stay warm on a STAT
+ every 250 ms, and the next command goes out during the current body
+
+---
+ crates/nntp/Cargo.toml          |   2 +-
+ crates/nntp/src/client.rs       |  12 ++
+ crates/nntp/src/connection.rs   | 126 ++++++++++++-
+ crates/nntp/src/keep_warm.rs    | 112 ++++++++++++
+ crates/nntp/src/lib.rs          |   1 +
+ crates/nntp/src/pool.rs         | 257 ++++++++++++++++++++++-----
+ crates/nntp/src/stats.rs        |  13 ++
+ crates/nntp/src/usage.rs        |   9 +
+ crates/nntp/src/viewers.rs      |  24 ++-
+ crates/nntp/tests/keep_warm.rs  | 302 ++++++++++++++++++++++++++++++++
+ crates/nntp/tests/seek_shape.rs |   8 +-
+ crates/testkit/src/server.rs    |  28 ++-
+ 12 files changed, 835 insertions(+), 59 deletions(-)
+ create mode 100644 crates/nntp/src/keep_warm.rs
+ create mode 100644 crates/nntp/tests/keep_warm.rs
+
+diff --git a/crates/nntp/Cargo.toml b/crates/nntp/Cargo.toml
+index c4d50353..d3e3d39e 100644
+--- a/crates/nntp/Cargo.toml
++++ b/crates/nntp/Cargo.toml
+@@ -17,7 +17,7 @@ sha2.workspace = true
+ rustls.workspace = true
+ socket2.workspace = true
+ thiserror.workspace = true
+-tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
++tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+ tokio-rustls.workspace = true
+ tokio-util = { workspace = true, features = ["io"] }
+ tracing.workspace = true
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index 6e044d21..31776545 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -171,11 +171,16 @@ impl Client {
+     /// that is not among them any more is retired: requests already on it finish, then
+     /// its connections close. Pass a [`Pool`] clone to keep it.
+     pub fn replace(&self, providers: impl IntoIterator<Item = Provider>) {
++        let providers: Vec<Provider> = providers.into_iter().collect();
++        let primary = providers.iter().map(|p| p.priority).min();
+         let next: Arc<[Entry]> = {
+             let mut known = self.known.lock().unwrap_or_else(PoisonError::into_inner);
+             providers
+                 .into_iter()
+                 .map(|mut provider| {
++                    provider
++                        .pool
++                        .set_keep_warm(Some(provider.priority) == primary);
+                     let index = known
+                         .iter()
+                         .position(|k| k.key == provider.key)
+@@ -261,6 +266,8 @@ impl Client {
+                     connect_failures,
+                     trips,
+                     hedges: e.stats.hedges(),
++                    keep_warm_stats: e.stats.keep_warm_sent(),
++                    warm_connections: pool.warm_connections(),
+                     open_for: e.breaker.open_for(),
+                     connected,
+                     connect_error,
+@@ -737,6 +744,11 @@ impl Client {
+         if providers.is_empty() {
+             return Err(Error::Unavailable);
+         }
++        if base.stages.is_some() {
++            for entry in providers.iter() {
++                entry.provider.pool.note_viewer(message_id);
++            }
++        }
+         let mut order: Vec<_> = providers.iter().collect();
+         order.sort_by_cached_key(|entry| entry.preference(workload));
+         let age = base.expected.posted.and_then(|posted| {
+diff --git a/crates/nntp/src/connection.rs b/crates/nntp/src/connection.rs
+index c3181ccc..4d1f3ae7 100644
+--- a/crates/nntp/src/connection.rs
++++ b/crates/nntp/src/connection.rs
+@@ -87,6 +87,51 @@ struct Metered {
+     usage: Option<Arc<Usage>>,
+     unpaid: u64,
+     link: Arc<Link>,
++    outbox: Outbox,
++    unflushed: bool,
++}
++
++/// Commands to write while the connection task is inside a read.
++pub(crate) type Outbox = Arc<std::sync::Mutex<Vec<u8>>>;
++
++impl Metered {
++    fn poll_outbox(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        let mut outbox = self
++            .outbox
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        while !outbox.is_empty() {
++            match Pin::new(&mut self.inner).poll_write(cx, &outbox) {
++                Poll::Ready(Ok(0)) => {
++                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
++                }
++                Poll::Ready(Ok(written)) => {
++                    outbox.drain(..written);
++                    self.unflushed = true;
++                }
++                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
++                Poll::Pending => return Poll::Pending,
++            }
++        }
++        drop(outbox);
++        if self.unflushed {
++            match Pin::new(&mut self.inner).poll_flush(cx) {
++                Poll::Ready(Ok(())) => self.unflushed = false,
++                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
++                Poll::Pending => return Poll::Pending,
++            }
++        }
++        Poll::Ready(Ok(()))
++    }
++
++    fn outbox_empty(&self) -> bool {
++        !self.unflushed
++            && self
++                .outbox
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .is_empty()
++    }
+ }
+ 
+ impl AsyncRead for Metered {
+@@ -95,6 +140,11 @@ impl AsyncRead for Metered {
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+     ) -> Poll<io::Result<()>> {
++        // Commands queued while a reply is being read go out here; a socket not ready to
++        // take them has registered this task, and the read carries on meanwhile.
++        if let Poll::Ready(Err(error)) = self.poll_outbox(cx) {
++            return Poll::Ready(Err(error));
++        }
+         let before = buf.filled().len();
+         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+         let read = (buf.filled().len() - before) as u64;
+@@ -185,6 +235,9 @@ pub(crate) struct Link {
+     last_body: AtomicU64,
+     body_len: AtomicU64,
+     body_read: AtomicU64,
++    /// When a keep-warm STAT was last answered.
++    last_kept: AtomicU64,
++    kept: AtomicBool,
+ }
+ 
+ impl Link {
+@@ -198,6 +251,30 @@ impl Link {
+             last_body: AtomicU64::new(0),
+             body_len: AtomicU64::new(0),
+             body_read: AtomicU64::new(0),
++            last_kept: AtomicU64::new(0),
++            kept: AtomicBool::new(false),
++        }
++    }
++
++    pub(crate) fn set_kept(&self, kept: bool) {
++        self.kept.store(kept, Ordering::Relaxed);
++    }
++
++    /// In the keep-warm set: left free for a seek.
++    pub(crate) fn kept(&self) -> bool {
++        self.kept.load(Ordering::Relaxed)
++    }
++
++    pub(crate) fn mark_kept(&self) {
++        self.last_kept.store(now_ns(), Ordering::Relaxed);
++    }
++
++    /// How long since a body or a keep-warm reply last arrived.
++    pub(crate) fn since_traffic(&self) -> Option<Duration> {
++        let kept = age(self.last_kept.load(Ordering::Relaxed));
++        match (self.since_body(), kept) {
++            (Some(body), Some(kept)) => Some(body.min(kept)),
++            (body, kept) => body.or(kept),
+         }
+     }
+ 
+@@ -528,6 +605,8 @@ impl Connection {
+                     usage: endpoint.usage.clone(),
+                     unpaid: 0,
+                     link: Arc::new(Link::new()),
++                    outbox: Outbox::default(),
++                    unflushed: false,
+                 },
+             ),
+             line: Vec::with_capacity(1024),
+@@ -605,6 +684,49 @@ impl Connection {
+         Ok(())
+     }
+ 
++    /// Queues a keep-warm STAT; [`read_keep_warm`](Self::read_keep_warm) takes its reply.
++    pub(crate) fn send_keep_warm(&mut self, message_id: &str) -> Result<(), Error> {
++        self.queue(b"STAT <", message_id)
++    }
++
++    /// Any answer keeps the connection warm, a 430 included. The reply is not the account's
++    /// traffic, so it comes off the quota and the bandwidth bill.
++    pub(crate) async fn read_keep_warm(&mut self) -> Result<(), Error> {
++        self.take_pending()?;
++        let code = self.read_status().await?;
++        let reply = self.line.len() as u64;
++        let metered = self.stream.get_mut();
++        metered.unpaid = metered.unpaid.saturating_sub(reply);
++        if let Some(usage) = &metered.usage {
++            usage.refund(reply);
++        }
++        if code == 400 {
++            return Err(self.unexpected(code));
++        }
++        self.link().mark_kept();
++        Ok(())
++    }
++
++    /// Resolves once reply bytes are in; safe to cancel, as it consumes none.
++    pub(crate) async fn reply_ready(&mut self) -> Result<(), Error> {
++        let buffered = timeout(self.timeout, self.stream.fill_buf())
++            .await
++            .map_err(|_| Error::Timeout)??;
++        if buffered.is_empty() {
++            return Err(Error::Closed);
++        }
++        Ok(())
++    }
++
++    pub(crate) fn outbox(&self) -> Outbox {
++        Arc::clone(&self.stream.get_ref().outbox)
++    }
++
++    /// Counts commands written through the [`Outbox`] as awaiting their replies.
++    pub(crate) const fn adopt_sent(&mut self, commands: usize) {
++        self.pending += commands;
++    }
++
+     /// Reads the reply to the oldest pending STAT request: `Ok` when the article exists.
+     pub async fn read_stat(&mut self) -> Result<(), Error> {
+         self.take_pending()?;
+@@ -656,11 +778,13 @@ impl Connection {
+ 
+     /// Sends all queued commands in one write.
+     pub async fn flush(&mut self) -> Result<(), Error> {
+-        if self.write_buf.is_empty() {
++        if self.write_buf.is_empty() && self.stream.get_ref().outbox_empty() {
+             return Ok(());
+         }
+         let stream = self.stream.get_mut();
+         timeout(self.timeout, async {
++            // Queued before anything in `write_buf`, and replies come back in that order.
++            std::future::poll_fn(|cx| stream.poll_outbox(cx)).await?;
+             stream.write_all(&self.write_buf).await?;
+             stream.flush().await
+         })
+diff --git a/crates/nntp/src/keep_warm.rs b/crates/nntp/src/keep_warm.rs
+new file mode 100644
+index 00000000..f2e7427c
+--- /dev/null
++++ b/crates/nntp/src/keep_warm.rs
+@@ -0,0 +1,112 @@
++//! A provider restarts TCP slow start on a connection left idle, which at a 210 ms round trip
++//! turns a 0.23 s article into 1.25 s. Measured on the primary provider, a STAT every 250 ms
++//! keeps the window open through 30 s of idling and one every second does not. So while
++//! someone watches, a few idle connections that have just moved a body get one.
++
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
++use std::time::Duration;
++
++use crate::connection::Link;
++use crate::stats::Stats;
++use crate::viewers::Viewers;
++
++pub(crate) const KEEP_WARM_CONNECTIONS: usize = 4;
++pub(crate) const KEEP_WARM_EVERY: Duration = Duration::from_millis(250);
++/// Longest since its last body a connection can join: by the one-second mark the provider
++/// has already collapsed its window, and a STAT would keep nothing.
++const JOIN_WITHIN: Duration = Duration::from_millis(500);
++
++pub(crate) struct KeepWarm {
++    viewers: Arc<Viewers>,
++    target: usize,
++    members: AtomicUsize,
++    primary: AtomicBool,
++    id: Mutex<Option<Arc<str>>>,
++    stats: Mutex<Arc<Stats>>,
++}
++
++impl KeepWarm {
++    pub(crate) fn new(viewers: Arc<Viewers>, target: usize) -> Self {
++        Self {
++            viewers,
++            target,
++            members: AtomicUsize::new(0),
++            primary: AtomicBool::new(false),
++            id: Mutex::new(None),
++            stats: Mutex::default(),
++        }
++    }
++
++    fn lock_id(&self) -> MutexGuard<'_, Option<Arc<str>>> {
++        self.id.lock().unwrap_or_else(PoisonError::into_inner)
++    }
++
++    pub(crate) fn set_primary(&self, primary: bool) {
++        self.primary.store(primary, Ordering::Relaxed);
++    }
++
++    pub(crate) fn set_stats(&self, stats: Arc<Stats>) {
++        *self.stats.lock().unwrap_or_else(PoisonError::into_inner) = stats;
++    }
++
++    /// Remembers an article a viewer is reading, whose id the keep-warm STATs ask about.
++    pub(crate) fn note(&self, message_id: &str) {
++        if !self.primary.load(Ordering::Relaxed) {
++            return;
++        }
++        let mut id = self.lock_id();
++        if id.as_deref() != Some(message_id) {
++            *id = Some(message_id.into());
++        }
++    }
++
++    pub(crate) fn id(&self) -> Option<Arc<str>> {
++        self.lock_id().clone()
++    }
++
++    pub(crate) fn active(&self) -> bool {
++        self.target > 0 && self.primary.load(Ordering::Relaxed) && self.viewers.watching()
++    }
++
++    /// Whether `link` moved a body recently enough to be worth keeping.
++    pub(crate) fn eligible(&self, link: &Link) -> bool {
++        self.active() && link.since_body().is_some_and(|age| age <= JOIN_WITHIN)
++    }
++
++    pub(crate) fn join(self: &Arc<Self>, link: &Arc<Link>) -> Option<KeptSlot> {
++        if !self.eligible(link) {
++            return None;
++        }
++        self.members
++            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
++                (n < self.target).then_some(n + 1)
++            })
++            .ok()?;
++        link.set_kept(true);
++        Some(KeptSlot {
++            keep: Arc::clone(self),
++            link: Arc::clone(link),
++        })
++    }
++
++    pub(crate) fn sent(&self) {
++        self.stats
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .keep_warm();
++    }
++}
++
++/// One connection's place in the kept set, given up the moment it has real work.
++pub(crate) struct KeptSlot {
++    keep: Arc<KeepWarm>,
++    link: Arc<Link>,
++}
++
++impl Drop for KeptSlot {
++    fn drop(&mut self) {
++        self.link.set_kept(false);
++        self.keep.members.fetch_sub(1, Ordering::Relaxed);
++    }
++}
+diff --git a/crates/nntp/src/lib.rs b/crates/nntp/src/lib.rs
+index 82a8324f..27ca7e22 100644
+--- a/crates/nntp/src/lib.rs
++++ b/crates/nntp/src/lib.rs
+@@ -7,6 +7,7 @@ pub mod catalog;
+ mod client;
+ mod connection;
+ mod downloads;
++mod keep_warm;
+ mod missing;
+ mod pace;
+ pub mod patch;
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index 2cbb8366..752697ca 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -14,6 +14,7 @@ use crate::article::Body;
+ use crate::client::{BodySink, Lane};
+ use crate::connection::{ConnectionStats, Link, Phase, Timing, validate_message_id};
+ use crate::downloads::{Downloads, Permit};
++use crate::keep_warm::{KEEP_WARM_CONNECTIONS, KEEP_WARM_EVERY, KeepWarm};
+ use crate::pace::{Flight, Pace};
+ use crate::stages::{Assigned, ConnectTimes, LoadAtAssign, ReplyTimes, RequestTrace, StageClock};
+ use crate::stats::{Stats, Workload, outcome};
+@@ -129,6 +130,7 @@ pub struct Pool {
+     /// some let theirs drain, or their backlog refills every slot before it is ever idle.
+     lanes_waiting: Arc<AtomicUsize>,
+     pace: Arc<Pace>,
++    keep: Arc<KeepWarm>,
+     /// Connection tasks running.
+     live: Arc<AtomicUsize>,
+     state: Arc<Mutex<State>>,
+@@ -440,10 +442,15 @@ impl Pool {
+         if config.max_connections == 0 || config.pipeline_depth == 0 {
+             return Err(Error::InvalidArgument("pool config"));
+         }
++        let keep = Arc::new(KeepWarm::new(
++            Arc::clone(downloads.viewers()),
++            KEEP_WARM_CONNECTIONS.min(seek_connections(config.max_connections)),
++        ));
+         Ok(Self {
+             endpoint,
+             config,
+             downloads,
++            keep,
+             busy: Arc::default(),
+             warm_busy: Arc::default(),
+             stream_waiting: Arc::default(),
+@@ -490,9 +497,29 @@ impl Pool {
+     }
+ 
+     pub(crate) fn set_stats(&mut self, stats: Arc<Stats>) {
++        self.keep.set_stats(Arc::clone(&stats));
+         self.stats = stats;
+     }
+ 
++    /// Whether this pool is on the first priority level, the only one kept warm.
++    pub(crate) fn set_keep_warm(&self, primary: bool) {
++        self.keep.set_primary(primary);
++    }
++
++    pub(crate) fn note_viewer(&self, message_id: &str) {
++        self.keep.note(message_id);
++    }
++
++    /// Open connections that moved a body or a keep-warm reply within [`WARM_WITHIN`].
++    pub(crate) fn warm_connections(&self) -> usize {
++        self.lock()
++            .workers
++            .iter()
++            .filter(|w| !w.tx.is_closed())
++            .filter(|w| w.link.since_traffic().is_some_and(|age| age <= WARM_WITHIN))
++            .count()
++    }
++
+     #[cfg(test)]
+     pub(crate) const fn with_stream_wait(mut self, wait: Duration) -> Self {
+         self.stream_wait = wait;
+@@ -730,7 +757,7 @@ impl Pool {
+         };
+         let viewers = self.downloads.viewers();
+         let _viewing = matches!(tag.workload, Workload::Stream | Workload::Cache)
+-            .then(|| viewers.enter(tag.workload == Workload::Cache));
++            .then(|| viewers.enter());
+         let held_back = !tag.light && tag.workload.rank().is_some_and(|rank| rank > 0);
+         let lane = if stream {
+             tag.lane.or(Some(Lane::STREAM))
+@@ -1098,7 +1125,12 @@ impl Pool {
+                 let paced = workload == Workload::Cache && self.pace.full(streaming);
+                 let spare = spare && !paced && !lets_lane_in;
+                 let moved = |worker: &Worker| worker.link.since_body();
+-                let is_warm = |worker: &Worker| moved(worker).is_some_and(|age| age <= WARM_WITHIN);
++                let is_warm = |worker: &Worker| {
++                    worker
++                        .link
++                        .since_traffic()
++                        .is_some_and(|age| age <= WARM_WITHIN)
++                };
+                 // A cold idle connection costs a seek about six round trips; the rest of one
+                 // body on a warm connection costs less. Only a body someone still wants
+                 // counts: an abandoned one may be followed by nothing but its own drain.
+@@ -1108,7 +1140,7 @@ impl Pool {
+                             .workers
+                             .iter()
+                             .filter(|w| !busy(w) && is_warm(w))
+-                            .min_by_key(|w| moved(w));
++                            .min_by_key(|w| (!w.link.kept(), w.link.since_traffic()));
+                         let behind_one = || {
+                             state
+                                 .workers
+@@ -1145,6 +1177,7 @@ impl Pool {
+                     .workers
+                     .iter()
+                     .filter(|_| !paced && !lets_lane_in)
++                    .filter(|worker| stream || !worker.link.kept())
+                     .filter(|worker| {
+                         !(outranked && depth_capped)
+                             || worker.load.load(Ordering::Relaxed) < own_depth
+@@ -1379,6 +1412,7 @@ impl Pool {
+         let live = Arc::clone(&self.live);
+         let stats = Arc::clone(&self.stats);
+         let account = Arc::clone(&self.account);
++        let keep = Arc::clone(&self.keep);
+         async move {
+             let started = Instant::now();
+             let limit = tokio::time::Instant::now() + endpoint.timeout();
+@@ -1499,6 +1533,7 @@ impl Pool {
+                 Live::acquire(&live),
+                 usage,
+                 endpoint.host().to_owned(),
++                keep,
+             ));
+             let mut state = connecting.lock();
+             if let Some(backoff) = state.backoff.take() {
+@@ -1687,35 +1722,106 @@ async fn run(
+     mut live: Live,
+     usage: Option<Arc<Usage>>,
+     host: String,
++    keep: Arc<KeepWarm>,
+ ) {
+     let mut in_flight = VecDeque::with_capacity(config.pipeline_depth);
++    // Keep-warm STATs on the wire ahead of everything in `in_flight`.
++    let mut owed = 0;
+     loop {
+         if in_flight.is_empty() {
+             conn.link().set(Phase::Idle);
+-            match timeout(config.idle_timeout, rx.recv()).await {
+-                Ok(Some(request)) => enqueue(&mut conn, &mut in_flight, request),
+-                // Retired or dropped: the account permit stays held until the provider
+-                // has let the connection go.
+-                Ok(None) => {
+-                    conn.quit().await;
+-                    return;
+-                }
+-                Err(_)
+-                    if live.retire(if usage.as_ref().is_some_and(|u| u.exhausted()) {
+-                        0
+-                    } else {
+-                        config.min_connections
+-                    }) =>
+-                {
+-                    drop(rx);
+-                    conn.quit().await;
+-                    return;
+-                }
+-                Err(_) => {
+-                    if conn.keepalive().await.is_err() {
++            let link = Arc::clone(conn.link());
++            let mut slot = None;
++            let mut keep_at = keep
++                .eligible(&link)
++                .then(|| tokio::time::Instant::now() + KEEP_WARM_EVERY);
++            let mut idle_until = tokio::time::Instant::now() + config.idle_timeout;
++            loop {
++                let woke = tokio::select! {
++                    biased;
++                    request = rx.recv() => Idle::Request(request),
++                    ready = conn.reply_ready(), if owed > 0 => Idle::Reply(ready),
++                    () = tokio::time::sleep_until(keep_at.unwrap_or(idle_until)),
++                        if owed == 0 && keep_at.is_some() => Idle::Keep,
++                    () = tokio::time::sleep_until(idle_until), if owed == 0 => Idle::Expired,
++                };
++                match woke {
++                    Idle::Request(Some(request)) => {
++                        enqueue(&mut conn, &mut in_flight, request);
++                        // Dropped unsent: nothing to read, so keep idling.
++                        if in_flight.is_empty() {
++                            continue;
++                        }
++                        break;
++                    }
++                    // Retired or dropped: the account permit stays held until the provider
++                    // has let the connection go.
++                    Idle::Request(None) => {
++                        while owed > 0 {
++                            if conn.read_keep_warm().await.is_err() {
++                                return;
++                            }
++                            owed -= 1;
++                        }
++                        conn.quit().await;
+                         return;
+                     }
+-                    continue;
++                    Idle::Reply(ready) => {
++                        if let Err(error) = match ready {
++                            Ok(()) => conn.read_keep_warm().await,
++                            Err(error) => Err(error),
++                        } {
++                            dropped(&host, &error, rx.len());
++                            return;
++                        }
++                        owed -= 1;
++                    }
++                    Idle::Keep => {
++                        if slot.is_none() {
++                            slot = keep.join(&link);
++                        }
++                        let id = keep.id().filter(|_| {
++                            keep.active() && !usage.as_ref().is_some_and(|u| u.exhausted())
++                        });
++                        let (Some(_), Some(id)) = (&slot, id) else {
++                            slot = None;
++                            keep_at = keep
++                                .eligible(&link)
++                                .then(|| tokio::time::Instant::now() + KEEP_WARM_EVERY);
++                            continue;
++                        };
++                        let sent = conn.send_keep_warm(&id);
++                        if let Err(error) = match sent {
++                            Ok(()) => conn.flush().await,
++                            Err(error) => Err(error),
++                        } {
++                            dropped(&host, &error, rx.len());
++                            return;
++                        }
++                        keep.sent();
++                        owed += 1;
++                        keep_at = Some(tokio::time::Instant::now() + KEEP_WARM_EVERY);
++                    }
++                    Idle::Expired if slot.is_some() => {
++                        idle_until = tokio::time::Instant::now() + config.idle_timeout;
++                    }
++                    Idle::Expired
++                        if live.retire(if usage.as_ref().is_some_and(|u| u.exhausted()) {
++                            0
++                        } else {
++                            config.min_connections
++                        }) =>
++                    {
++                        drop(rx);
++                        conn.quit().await;
++                        return;
++                    }
++                    Idle::Expired => {
++                        if conn.keepalive().await.is_err() {
++                            return;
++                        }
++                        idle_until = tokio::time::Instant::now() + config.idle_timeout;
++                    }
+                 }
+             }
+         }
+@@ -1739,6 +1845,13 @@ async fn run(
+                 trace.written(written);
+             }
+         }
++        while owed > 0 {
++            if let Err(error) = conn.read_keep_warm().await {
++                dropped(&host, &error, in_flight.len() + rx.len());
++                return;
++            }
++            owed -= 1;
++        }
+         let Some(mut request) = in_flight.pop_front() else {
+             continue;
+         };
+@@ -1765,22 +1878,50 @@ async fn run(
+         } else {
+             Phase::Reply
+         });
+-        let result = match request.command {
+-            Command::Body => {
+-                let read = conn
+-                    .read_body_with(request.tag.progress.as_ref(), request.tag.expected, || {
+-                        first_byte = Some(Instant::now());
+-                        request.tag.step(Step::Receiving { provider });
+-                    })
+-                    .await;
+-                read_end = Some(Instant::now());
+-                read.and_then(|body| {
+-                    request.tag.expected.validate(&body)?;
+-                    Ok(Some(body))
+-                })
+-            }
+-            Command::Stat => conn.read_stat().await.map(|()| None),
++        let outbox = conn.outbox();
++        let mut sent_late = 0;
++        let result = {
++            let read = async {
++                match request.command {
++                    Command::Body => {
++                        let read = conn
++                            .read_body_with(
++                                request.tag.progress.as_ref(),
++                                request.tag.expected,
++                                || {
++                                    first_byte = Some(Instant::now());
++                                    request.tag.step(Step::Receiving { provider });
++                                },
++                            )
++                            .await;
++                        read_end = Some(Instant::now());
++                        read.and_then(|body| {
++                            request.tag.expected.validate(&body)?;
++                            Ok(Some(body))
++                        })
++                    }
++                    Command::Stat => conn.read_stat().await.map(|()| None),
++                }
++            };
++            let mut read = pin!(read);
++            // The next request goes out during this read, so its first byte does not wait
++            // for this body plus a round trip. Only one: a sent command cannot be recalled,
++            // and one still queued is dropped unsent if its reader seeks away.
++            poll_fn(|cx| {
++                while in_flight.is_empty() && config.pipeline_depth > 1 {
++                    let Poll::Ready(Some(next)) = rx.poll_recv(cx) else {
++                        break;
++                    };
++                    if let Some(next) = send_late(&outbox, next) {
++                        in_flight.push_back(next);
++                        sent_late += 1;
++                    }
++                }
++                read.as_mut().poll(cx)
++            })
++            .await
+         };
++        conn.adopt_sent(sent_late);
+         let timing = match request.command {
+             Command::Body => conn.timing(),
+             Command::Stat => Timing::default(),
+@@ -1817,6 +1958,42 @@ fn dropped(host: &str, error: &Error, requeued: usize) {
+     tracing::debug!(host, reason = %error, requeued, "provider connection dropped");
+ }
+ 
++/// What woke an idle connection.
++enum Idle {
++    Request(Option<Request>),
++    Reply(Result<(), Error>),
++    Keep,
++    Expired,
++}
++
++/// Queues `request`'s command on the outbox; `None` if it needs no reply after all.
++fn send_late(outbox: &Mutex<Vec<u8>>, mut request: Request) -> Option<Request> {
++    if request
++        .reply
++        .as_ref()
++        .is_none_or(oneshot::Sender::is_closed)
++    {
++        return None;
++    }
++    if let Err(error) = validate_message_id(&request.message_id) {
++        request.answer(Err(error), Duration::ZERO);
++        return None;
++    }
++    let verb: &[u8] = match request.command {
++        Command::Body => b"BODY <",
++        Command::Stat => b"STAT <",
++    };
++    let mut commands = outbox.lock().unwrap_or_else(PoisonError::into_inner);
++    commands.extend_from_slice(verb);
++    commands.extend_from_slice(request.message_id.as_bytes());
++    commands.extend_from_slice(b">\r\n");
++    drop(commands);
++    if let Some(trace) = &mut request.trace {
++        trace.written(Instant::now());
++    }
++    Some(request)
++}
++
+ fn enqueue(conn: &mut Connection, in_flight: &mut VecDeque<Request>, request: Request) {
+     // The caller left while it was queued: sending it would only delay the requests
+     // behind it. Dropping records it cancelled.
+diff --git a/crates/nntp/src/stats.rs b/crates/nntp/src/stats.rs
+index 5bbef3b7..0ccbf620 100644
+--- a/crates/nntp/src/stats.rs
++++ b/crates/nntp/src/stats.rs
+@@ -72,6 +72,7 @@ const LOG_UNEXPECTED_EVERY: Duration = Duration::from_hours(1);
+ 
+ #[derive(Default)]
+ pub(crate) struct Stats {
++    keep_warm: AtomicU64,
+     attempts: [[AtomicU64; OUTCOMES]; WORKLOADS],
+     failed: [AtomicU64; WORKLOADS],
+     bytes: [AtomicU64; WORKLOADS],
+@@ -114,6 +115,14 @@ impl Stats {
+         self.hedges.fetch_add(1, Ordering::Relaxed);
+     }
+ 
++    pub(crate) fn keep_warm(&self) {
++        self.keep_warm.fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub(crate) fn keep_warm_sent(&self) -> u64 {
++        self.keep_warm.load(Ordering::Relaxed)
++    }
++
+     pub(crate) fn hedges(&self) -> u64 {
+         self.hedges.load(Ordering::Relaxed)
+     }
+@@ -195,6 +204,10 @@ pub struct ProviderStats {
+     pub trips: u64,
+     /// Duplicate requests raced against a slow playback read.
+     pub hedges: u64,
++    /// STATs sent only to keep an idle connection's congestion window open.
++    pub keep_warm_stats: u64,
++    /// Open connections that moved body data or a keep-warm STAT within the last second.
++    pub warm_connections: usize,
+     /// Cooldown left while the circuit is open.
+     pub open_for: Option<Duration>,
+     /// A connection opened since the provider was (re)configured.
+diff --git a/crates/nntp/src/usage.rs b/crates/nntp/src/usage.rs
+index 1d1faf8d..6ab32e0d 100644
+--- a/crates/nntp/src/usage.rs
++++ b/crates/nntp/src/usage.rs
+@@ -14,6 +14,15 @@ impl Usage {
+         self.used.fetch_add(bytes, Ordering::Relaxed);
+     }
+ 
++    /// Takes back bytes that were read but are not the account's to pay for.
++    pub(crate) fn refund(&self, bytes: u64) {
++        let _ = self
++            .used
++            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
++                Some(used.saturating_sub(bytes))
++            });
++    }
++
+     #[must_use]
+     pub fn used(&self) -> u64 {
+         self.used.load(Ordering::Relaxed)
+diff --git a/crates/nntp/src/viewers.rs b/crates/nntp/src/viewers.rs
+index 5660e900..883a68d0 100644
+--- a/crates/nntp/src/viewers.rs
++++ b/crates/nntp/src/viewers.rs
+@@ -13,7 +13,6 @@ use crate::pool::STREAM_LINGER;
+ #[derive(Debug, Default)]
+ struct Presence {
+     requests: usize,
+-    caches: usize,
+     busy_since: Option<Instant>,
+     until: Option<Instant>,
+ }
+@@ -43,19 +42,17 @@ impl Viewers {
+         self.presence.lock().unwrap_or_else(PoisonError::into_inner)
+     }
+ 
+-    pub(crate) fn enter(self: &Arc<Self>, cache: bool) -> Viewing {
++    pub(crate) fn enter(self: &Arc<Self>) -> Viewing {
+         let now = Instant::now();
+         let mut presence = self.lock();
+         if presence.requests == 0 && presence.until.is_none_or(|until| now >= until) {
+             presence.busy_since = Some(now);
+         }
+         presence.requests += 1;
+-        presence.caches += usize::from(cache);
+         drop(presence);
+         self.changed.notify_waiters();
+         Viewing {
+             viewers: Arc::clone(self),
+-            cache,
+         }
+     }
+ 
+@@ -94,8 +91,11 @@ impl Viewers {
+         self.hold(Instant::now()).is_some()
+     }
+ 
+-    pub(crate) fn caching(&self) -> bool {
+-        self.lock().caches > 0
++    /// A viewer request is outstanding or just ended. Unlike the hold on work below, this
++    /// has no ceiling: a long film stays watched.
++    pub(crate) fn watching(&self) -> bool {
++        let presence = self.lock();
++        presence.requests > 0 || presence.until.is_some_and(|until| Instant::now() < until)
+     }
+ 
+     /// A future that resolves on the next change, armed before the caller's own check.
+@@ -119,7 +119,6 @@ impl Viewers {
+ /// reader trickling a few articles leaves the link to downloads between them.
+ pub(crate) struct Viewing {
+     viewers: Arc<Viewers>,
+-    cache: bool,
+ }
+ 
+ impl Drop for Viewing {
+@@ -127,7 +126,6 @@ impl Drop for Viewing {
+         let now = Instant::now();
+         let mut presence = self.viewers.lock();
+         presence.requests -= 1;
+-        presence.caches -= usize::from(self.cache);
+         if presence.requests == 0 {
+             let burst = presence
+                 .busy_since
+@@ -147,11 +145,11 @@ mod tests {
+     async fn the_hold_ends_after_a_burst_as_long_as_it() {
+         let viewers = Arc::new(Viewers::default());
+         assert!(!viewers.holding());
+-        let request = viewers.enter(true);
+-        assert!(viewers.holding() && viewers.caching());
++        let request = viewers.enter();
++        assert!(viewers.holding());
+         tokio::time::sleep(Duration::from_millis(40)).await;
+         drop(request);
+-        assert!(viewers.holding() && !viewers.caching());
++        assert!(viewers.holding());
+         tokio::time::sleep(Duration::from_millis(60)).await;
+         assert!(!viewers.holding());
+     }
+@@ -159,7 +157,7 @@ mod tests {
+     #[tokio::test]
+     async fn work_below_waits_only_while_a_viewer_request_is_outstanding() {
+         let viewers = Arc::new(Viewers::default());
+-        let request = viewers.enter(true);
++        let request = viewers.enter();
+         assert!(viewers.demanded());
+         drop(request);
+         assert!(!viewers.demanded() && viewers.holding());
+@@ -174,7 +172,7 @@ mod tests {
+             max_hold: Duration::from_millis(60),
+             ..Viewers::default()
+         });
+-        let _request = viewers.enter(true);
++        let _request = viewers.enter();
+         assert!(viewers.holding());
+         tokio::time::timeout(Duration::from_secs(1), viewers.clear())
+             .await
+diff --git a/crates/nntp/tests/keep_warm.rs b/crates/nntp/tests/keep_warm.rs
+new file mode 100644
+index 00000000..ecc69108
+--- /dev/null
++++ b/crates/nntp/tests/keep_warm.rs
+@@ -0,0 +1,302 @@
++#![allow(clippy::unwrap_used)]
++
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++use infinidysk_nntp::{
++    Client, ConnectionPath, ConnectionRoute, Downloads, Endpoint, Error, Pool, PoolConfig,
++    Provider, TlsMode, Usage, Workload,
++};
++use infinidysk_testkit::{Article, Corpus, Impairment, LoopbackServer};
++use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
++use tokio::net::TcpListener;
++use tokio::sync::oneshot;
++use tokio::task::JoinHandle;
++use tokio::time::{sleep, timeout};
++
++const ARTICLE: usize = 16 * 1024;
++const TICKS_PER_SECOND: usize = 4;
++const KEPT: usize = 4;
++
++fn corpus() -> Corpus {
++    Corpus::generate(93, 32, ARTICLE)
++}
++
++fn endpoint(port: u16, tls: TlsMode) -> Endpoint {
++    Endpoint::new("127.0.0.1", port, tls, None, Duration::from_secs(5)).unwrap()
++}
++
++fn provider(endpoint: Endpoint, connections: usize, depth: usize, priority: u32) -> Provider {
++    let config = PoolConfig {
++        max_connections: connections,
++        pipeline_depth: depth,
++        idle_timeout: Duration::from_secs(60),
++        min_connections: 0,
++    };
++    Provider {
++        pool: Pool::new(endpoint, config, Downloads::new(connections * depth)).unwrap(),
++        key: format!("p{priority}"),
++        name: format!("p{priority}"),
++        priority,
++        backbone: None,
++    }
++}
++
++fn client_on(server: &LoopbackServer, connections: usize) -> Arc<Client> {
++    let endpoint = endpoint(server.addr().port(), TlsMode::Plain);
++    Arc::new(Client::new([provider(endpoint, connections, 4, 0)]))
++}
++
++fn read(client: &Arc<Client>, id: &str, workload: Workload) -> JoinHandle<Result<(), Error>> {
++    let (client, id) = (Arc::clone(client), id.to_owned());
++    tokio::spawn(async move { client.body(&id, workload, None).await.map(drop) })
++}
++
++/// Bodies moved at once, so that many connections are warm and idle.
++async fn warm(client: &Arc<Client>, articles: &[Article]) {
++    let reads: Vec<_> = articles
++        .iter()
++        .map(|a| read(client, &a.message_id, Workload::Stream))
++        .collect();
++    for read in reads {
++        read.await.unwrap().unwrap();
++    }
++}
++
++/// A playback read the provider sits on: a viewer stays active until released.
++async fn viewer(
++    client: &Arc<Client>,
++    server: &LoopbackServer,
++    id: &str,
++) -> (JoinHandle<Result<(), Error>>, oneshot::Sender<()>) {
++    let (arrived, release) = server.hold_article(id);
++    let read = read(client, id, Workload::Stream);
++    timeout(Duration::from_secs(1), arrived).await.unwrap().unwrap();
++    (read, release)
++}
++
++async fn stats_over(server: &LoopbackServer, span: Duration) -> usize {
++    let before = server.stat_commands();
++    sleep(span).await;
++    server.stat_commands() - before
++}
++
++#[tokio::test]
++async fn keep_warm_runs_only_while_a_viewer_is_active_and_stops_after() {
++    let corpus = corpus();
++    let server = LoopbackServer::start(corpus.articles.clone()).await.unwrap();
++    let client = client_on(&server, 16);
++
++    read(&client, &corpus.articles[20].message_id, Workload::Queue)
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(
++        stats_over(&server, Duration::from_millis(700)).await,
++        0,
++        "download-only work keeps nothing warm"
++    );
++
++    warm(&client, &corpus.articles[..3]).await;
++    let (held, release) = viewer(&client, &server, &corpus.articles[3].message_id).await;
++    assert!(stats_over(&server, Duration::from_millis(1100)).await >= TICKS_PER_SECOND);
++    release.send(()).unwrap();
++    held.await.unwrap().unwrap();
++    sleep(Duration::from_millis(2300)).await;
++    assert_eq!(
++        stats_over(&server, Duration::from_millis(700)).await,
++        0,
++        "nobody is watching"
++    );
++    assert!(client.stats()[0].keep_warm_stats > 0);
++}
++
++#[tokio::test]
++async fn keep_warm_holds_the_named_count_and_interval_and_opens_nothing() {
++    let corpus = corpus();
++    let server = LoopbackServer::start(corpus.articles.clone()).await.unwrap();
++    let client = client_on(&server, 16);
++    warm(&client, &corpus.articles[..8]).await;
++    let (held, release) = viewer(&client, &server, &corpus.articles[8].message_id).await;
++    sleep(Duration::from_millis(300)).await;
++    let open = server.open_connections();
++    let sent = stats_over(&server, Duration::from_secs(1)).await;
++    let wanted = KEPT * TICKS_PER_SECOND;
++    assert!((wanted - 4..=wanted + 4).contains(&sent), "{sent} STATs in a second");
++    assert_eq!(server.open_connections(), open);
++    assert!(client.stats()[0].warm_connections >= KEPT);
++    release.send(()).unwrap();
++    held.await.unwrap().unwrap();
++}
++
++#[tokio::test]
++async fn a_seek_takes_a_kept_connection_after_its_last_body_has_aged() {
++    let corpus = corpus();
++    let server = LoopbackServer::start(corpus.articles.clone()).await.unwrap();
++    let client = client_on(&server, 16);
++    warm(&client, &corpus.articles[..3]).await;
++    let (held, release) = viewer(&client, &server, &corpus.articles[3].message_id).await;
++    sleep(Duration::from_millis(1400)).await;
++    let before = client.stream_stages().snapshot()[0].path(ConnectionPath::Warm);
++    read(&client, &corpus.articles[4].message_id, Workload::Stream)
++        .await
++        .unwrap()
++        .unwrap();
++    let stream = client.stream_stages().snapshot().remove(0);
++    assert_eq!(stream.path(ConnectionPath::Warm), before + 1);
++    assert_eq!(stream.route(ConnectionRoute::Busy), 0);
++    release.send(()).unwrap();
++    held.await.unwrap().unwrap();
++}
++
++#[tokio::test]
++async fn a_backup_tier_is_never_kept_warm() {
++    let corpus = corpus();
++    let missing = &corpus.articles[0];
++    let primary = LoopbackServer::start(corpus.articles[1..].to_vec()).await.unwrap();
++    let backup = LoopbackServer::start(corpus.articles.clone()).await.unwrap();
++    let client = Arc::new(Client::new([
++        provider(endpoint(primary.addr().port(), TlsMode::Plain), 16, 4, 0),
++        provider(endpoint(backup.addr().port(), TlsMode::Plain), 16, 4, 1),
++    ]));
++    read(&client, &missing.message_id, Workload::Stream)
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(backup.body_commands(), 1);
++    warm(&client, &corpus.articles[1..4]).await;
++    let (held, release) = viewer(&client, &primary, &corpus.articles[4].message_id).await;
++    sleep(Duration::from_millis(900)).await;
++    assert!(primary.stat_commands() > 0);
++    assert_eq!(backup.stat_commands(), 0);
++    release.send(()).unwrap();
++    held.await.unwrap().unwrap();
++}
++
++#[tokio::test]
++async fn a_keep_warm_miss_touches_no_health_memory_or_quota() {
++    let corpus = corpus();
++    let server = LoopbackServer::start(corpus.articles.clone()).await.unwrap();
++    server.miss_stats(true);
++    let usage = Arc::new(Usage::default());
++    let endpoint = endpoint(server.addr().port(), TlsMode::Plain).with_usage(Arc::clone(&usage));
++    let client = Arc::new(Client::new([provider(endpoint, 16, 4, 0)]));
++    warm(&client, &corpus.articles[..3]).await;
++    let (held, release) = viewer(&client, &server, &corpus.articles[3].message_id).await;
++    sleep(Duration::from_millis(300)).await;
++    let used = usage.used();
++    let sent = stats_over(&server, Duration::from_millis(800)).await;
++    assert!(sent > 0);
++    assert_eq!(usage.used(), used, "keep-warm replies are not quota");
++    let before = client.stats().remove(0);
++    release.send(()).unwrap();
++    held.await.unwrap().unwrap();
++    for article in &corpus.articles[..3] {
++        client
++            .body(&article.message_id, Workload::Stream, None)
++            .await
++            .unwrap();
++    }
++    let after = client.stats().remove(0);
++    assert_eq!((after.trips, after.connect_failures), (0, 0));
++    assert_eq!(client.missing_hits(), 0);
++    assert_eq!(
++        before.workloads[Workload::ALL.iter().position(|w| *w == Workload::Stream).unwrap()]
++            .attempts
++            .iter()
++            .sum::<u64>()
++            + 3,
++        after.workloads[0].attempts.iter().sum::<u64>() - 1,
++        "only the released read and the three reads were counted"
++    );
++}
++
++#[tokio::test]
++async fn a_real_request_is_answered_correctly_and_promptly_beside_keep_warm() {
++    let corpus = corpus();
++    let delay = Duration::from_millis(40);
++    let server = LoopbackServer::start_impaired(
++        corpus.articles.clone(),
++        Impairment {
++            response_delay: delay,
++            ..Impairment::default()
++        },
++    )
++    .await
++    .unwrap();
++    let client = client_on(&server, 16);
++    warm(&client, &corpus.articles[..4]).await;
++    let (held, release) = viewer(&client, &server, &corpus.articles[4].message_id).await;
++    for round in 0..12 {
++        sleep(Duration::from_millis(83)).await;
++        let article = &corpus.articles[5 + round];
++        let started = Instant::now();
++        let body = client
++            .body(&article.message_id, Workload::Stream, None)
++            .await
++            .unwrap();
++        assert_eq!(body.data.len(), ARTICLE);
++        assert!(started.elapsed() < delay * 4, "{:?}", started.elapsed());
++    }
++    release.send(()).unwrap();
++    held.await.unwrap().unwrap();
++}
++
++#[tokio::test]
++async fn a_second_command_goes_out_while_the_first_body_is_being_read() {
++    let corpus = corpus();
++    let (first, second) = (corpus.articles[0].clone(), corpus.articles[1].clone());
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let port = listener.local_addr().unwrap().port();
++    let (a, b) = (first.clone(), second.clone());
++    let provider_side = tokio::spawn(async move {
++        let (stream, _) = listener.accept().await.unwrap();
++        let (read, mut write) = stream.into_split();
++        let mut lines = BufReader::new(read).lines();
++        write.write_all(b"200 ready\r\n").await.unwrap();
++        assert!(lines.next_line().await.unwrap().unwrap().contains(&a.message_id));
++        let (head, tail) = a.wire.split_at(a.wire.len() / 2);
++        write.write_all(b"222 0 <a> body\r\n").await.unwrap();
++        write.write_all(head).await.unwrap();
++        let next = timeout(Duration::from_secs(1), lines.next_line())
++            .await
++            .expect("the second command waited for the first body to finish")
++            .unwrap()
++            .unwrap();
++        assert!(next.contains(&b.message_id));
++        write.write_all(tail).await.unwrap();
++        write.write_all(b"222 0 <b> body\r\n").await.unwrap();
++        write.write_all(&b.wire).await.unwrap();
++        let _ = lines.next_line().await;
++    });
++    let client = Arc::new(Client::new([provider(endpoint(port, TlsMode::Plain), 1, 4, 0)]));
++    let head = read(&client, &first.message_id, Workload::Stream);
++    sleep(Duration::from_millis(60)).await;
++    let behind = client.body(&second.message_id, Workload::Stream, None);
++    let body = timeout(Duration::from_secs(3), behind).await.unwrap().unwrap();
++    assert_eq!(body.data.len(), ARTICLE);
++    head.await.unwrap().unwrap();
++    drop(client);
++    provider_side.await.unwrap();
++}
++
++#[tokio::test]
++async fn pipelined_requests_over_tls_stay_in_order_when_written_mid_body() {
++    let corpus = corpus();
++    let server = LoopbackServer::start_tls(corpus.articles.clone()).await.unwrap();
++    let endpoint = endpoint(server.addr().port(), TlsMode::Unverified);
++    let client = Arc::new(Client::new([provider(endpoint, 1, 4, 0)]));
++    let reads: Vec<_> = corpus.articles[..24]
++        .iter()
++        .map(|article| {
++            let (client, id) = (Arc::clone(&client), article.message_id.clone());
++            tokio::spawn(async move {
++                let body = client.body(&id, Workload::Stream, None).await.unwrap();
++                assert_eq!(body.data.len(), ARTICLE);
++            })
++        })
++        .collect();
++    for read in reads {
++        read.await.unwrap();
++    }
++}
+diff --git a/crates/nntp/tests/seek_shape.rs b/crates/nntp/tests/seek_shape.rs
+index 06caaeca..7fd60211 100644
+--- a/crates/nntp/tests/seek_shape.rs
++++ b/crates/nntp/tests/seek_shape.rs
+@@ -149,7 +149,7 @@ async fn a_seek_goes_to_a_free_connection_past_the_last_seeks_abandoned_read_ahe
+ }
+ 
+ #[tokio::test]
+-async fn read_ahead_abandoned_before_it_was_sent_is_never_sent() {
++async fn of_abandoned_read_ahead_only_the_one_command_on_the_wire_is_answered() {
+     let mut shape = Shape::new(1, 4, 1).await;
+     let head = shape.held(0, Workload::Stream, OLD_SEEK).await;
+     let queued = [
+@@ -163,7 +163,11 @@ async fn read_ahead_abandoned_before_it_was_sent_is_never_sent() {
+     shape.release();
+     finishes(head, "the head read").await;
+     finishes(shape.read(3, Workload::Stream, NEW_SEEK), "the seek").await;
+-    assert_eq!(shape.server.body_commands(), 2, "the head and the seek");
++    assert_eq!(
++        shape.server.body_commands(),
++        3,
++        "the head, the one command sent during it, and the seek"
++    );
+ }
+ 
+ #[tokio::test]
+diff --git a/crates/testkit/src/server.rs b/crates/testkit/src/server.rs
+index ce55cfd7..bd5e52b1 100644
+--- a/crates/testkit/src/server.rs
++++ b/crates/testkit/src/server.rs
+@@ -1,7 +1,7 @@
+ use std::collections::HashMap;
+ use std::io;
+ use std::net::SocketAddr;
+-use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex, PoisonError};
+ use std::time::Duration;
+ 
+@@ -67,6 +67,8 @@ pub struct LoopbackServer {
+     open: Arc<AtomicUsize>,
+     peak: Arc<AtomicUsize>,
+     bodies: Arc<AtomicUsize>,
++    stats: Arc<AtomicUsize>,
++    stats_miss: Arc<AtomicBool>,
+ }
+ 
+ /// Per message-id: BODY replies still to stall, for how long, and how many were.
+@@ -87,6 +89,8 @@ struct Acceptor {
+     open: Arc<AtomicUsize>,
+     peak: Arc<AtomicUsize>,
+     bodies: Arc<AtomicUsize>,
++    stats: Arc<AtomicUsize>,
++    stats_miss: Arc<AtomicBool>,
+     stalls: Stalls,
+     holds: Holds,
+ }
+@@ -104,6 +108,8 @@ impl Acceptor {
+                     behavior: self.behavior,
+                     rejected: now > self.behavior.max_connections,
+                     bodies: Arc::clone(&self.bodies),
++                    stats: Arc::clone(&self.stats),
++                    stats_miss: Arc::clone(&self.stats_miss),
+                     stalls: Arc::clone(&self.stalls),
+                     holds: Arc::clone(&self.holds),
+                 };
+@@ -250,6 +256,8 @@ impl LoopbackServer {
+             open: Arc::default(),
+             peak: Arc::default(),
+             bodies: Arc::default(),
++            stats: Arc::default(),
++            stats_miss: Arc::default(),
+             stalls: Arc::default(),
+             holds: Arc::default(),
+         };
+@@ -260,6 +268,8 @@ impl LoopbackServer {
+             open: Arc::clone(&acceptor.open),
+             peak: Arc::clone(&acceptor.peak),
+             bodies: Arc::clone(&acceptor.bodies),
++            stats: Arc::clone(&acceptor.stats),
++            stats_miss: Arc::clone(&acceptor.stats_miss),
+             acceptor,
+         })
+     }
+@@ -309,6 +319,17 @@ impl LoopbackServer {
+         self.bodies.load(Ordering::SeqCst)
+     }
+ 
++    /// STAT commands received across all connections.
++    #[must_use]
++    pub fn stat_commands(&self) -> usize {
++        self.stats.load(Ordering::SeqCst)
++    }
++
++    /// Answers every STAT with 430 while on, whatever the articles.
++    pub fn miss_stats(&self, on: bool) {
++        self.stats_miss.store(on, Ordering::SeqCst);
++    }
++
+     /// Holds the next BODY reply until released; returns its arrival and release signals.
+     pub fn hold_article(&self, message_id: &str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+         let (arrived, arrival) = oneshot::channel();
+@@ -382,6 +403,8 @@ struct Limit {
+     behavior: Behavior,
+     rejected: bool,
+     bodies: Arc<AtomicUsize>,
++    stats: Arc<AtomicUsize>,
++    stats_miss: Arc<AtomicBool>,
+     stalls: Stalls,
+     holds: Holds,
+ }
+@@ -522,9 +545,10 @@ async fn serve<S: AsyncRead + AsyncWrite>(
+                 }
+             }
+             "STAT" => {
++                limit.stats.fetch_add(1, Ordering::SeqCst);
+                 delay(impairment.response_delay).await;
+                 let id = arg.trim().trim_start_matches('<').trim_end_matches('>');
+-                let reply = if articles.contains_key(id) {
++                let reply = if articles.contains_key(id) && !limit.stats_miss.load(Ordering::SeqCst) {
+                     format!("223 0 <{id}>\r\n")
+                 } else {
+                     "430 no such article\r\n".to_owned()
+-- 
+2.56.1
+

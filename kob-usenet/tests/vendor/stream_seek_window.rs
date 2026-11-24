@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kob_usenet::vendor::nntp::{
-    BodyExpectation, Client, Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode,
+    BodyExpectation, Client, Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode, Workload,
 };
-use kob_usenet::vendor::stream::{Layout, Segment, SegmentReader};
+use kob_usenet::vendor::stream::{Budget, Layout, Segment, SegmentReader};
 use kob_usenet::vendor::testkit::{Corpus, LoopbackServer};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -17,6 +17,11 @@ const PREFETCH: usize = 44;
 const SEEK_READ: usize = 2 << 20;
 
 async fn reader() -> (SegmentReader, LoopbackServer) {
+    let (reader, _, server) = parts().await;
+    (reader, server)
+}
+
+async fn parts() -> (SegmentReader, Arc<Client>, LoopbackServer) {
     let corpus = Corpus::generate(92, ARTICLES, ARTICLE);
     let server = LoopbackServer::start(corpus.articles.clone())
         .await
@@ -54,7 +59,8 @@ async fn reader() -> (SegmentReader, LoopbackServer) {
             })
             .collect(),
     ));
-    (SegmentReader::new(client, layout, PREFETCH), server)
+    let reader = SegmentReader::new(Arc::clone(&client), layout, PREFETCH);
+    (reader, client, server)
 }
 
 async fn settled(server: &LoopbackServer) -> usize {
@@ -88,4 +94,30 @@ async fn a_seek_fetches_little_past_what_it_reads_until_the_reader_proves_sequen
         fetched >= ARTICLES - 12,
         "sequential reading opened only {fetched}"
     );
+}
+
+#[tokio::test]
+async fn a_download_runs_beside_a_cache_reader_whose_consumer_has_stopped() {
+    let corpus = Corpus::generate(92, ARTICLES, ARTICLE);
+    let (reader, client, server) = parts().await;
+    let mut reader = reader
+        .with_workload(Workload::Cache)
+        .with_budget(Budget::new(4 * ARTICLE));
+    reader.read_exact(&mut [0; 16]).await.unwrap();
+    let fetched = settled(&server).await;
+    assert!(
+        fetched < ARTICLES / 2,
+        "the budget bounds the window: {fetched}"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        client.body(
+            &corpus.articles[ARTICLES - 1].message_id,
+            Workload::Queue,
+            None,
+        ),
+    )
+    .await
+    .expect("a stopped reader holds no download")
+    .unwrap();
 }

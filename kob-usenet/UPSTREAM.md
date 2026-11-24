@@ -72,8 +72,10 @@ which drives upstream's database-backed queue service.
 | 38 | Cache-ahead's in-flight bound grows through a seek while it drains within half a second, so steady seeking cannot pin it below a fast link's bandwidth-delay product nor queue more ahead of a seek on a slow one | ours, reworks 37 |
 | 39 | Playback and cache-ahead requests record per-stage timing, how they got a connection and the pool's load at that moment, with an optional per-request log line; scheduling is unchanged | ours, for production seek diagnosis |
 | 40 | A seek takes an idle or openable connection instead of pipelining behind abandoned bodies, and an open-ended read fetches 4 MB ahead until 8 MB in order prove it sequential. Cache-ahead no longer yields free connections to a parked seek, and its bound grows on what it keeps in flight during one. Work below viewers runs while none of their requests waits for a connection, one body deep and on at most half the pool beside playback | ours, reworks 34, 37 and 38 |
+| 41 | A seek prefers a connection that moved body data within the last second: idle if one is, else behind the one wanted body on a depth-1 connection, never an abandoned one; cache-ahead reuses the connections it just used. Work below viewers starts nothing while a viewer request is outstanding, and keeps two bodies per connection on pools of 16 or more, where a job holding connections lets them drain for a job holding none | ours, reworks 40 |
+| 42 | While a Stream or Cache reader is active, up to 4 idle connections per primary provider that just moved a body get a STAT every 250 ms, outside health, miss, breaker and quota accounting; seeks prefer them. One command behind the current body is written during its read | ours, extends 41 |
 
-Patches 5–40 are candidates to offer upstream.
+Patches 5–42 are candidates to offer upstream.
 
 ## Monthly sync
 
