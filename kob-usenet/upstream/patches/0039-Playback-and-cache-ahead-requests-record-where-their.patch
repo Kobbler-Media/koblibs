@@ -1,0 +1,1258 @@
+From cd059b0f806324a7be2e7fdca03632b027a544b7 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Tue, 24 Nov 2026 10:51:42 +1100
+Subject: [PATCH] Playback and cache-ahead requests record where their time
+ goes
+
+---
+ crates/nntp/src/client.rs     |  16 +
+ crates/nntp/src/connection.rs |  12 +
+ crates/nntp/src/lib.rs        |   5 +
+ crates/nntp/src/pace.rs       |   6 +
+ crates/nntp/src/pool.rs       | 126 ++++++--
+ crates/nntp/src/stages.rs     | 535 ++++++++++++++++++++++++++++++++++
+ crates/nntp/tests/stages.rs   | 191 ++++++++++++
+ 7 files changed, 868 insertions(+), 23 deletions(-)
+ create mode 100644 crates/nntp/src/stages.rs
+ create mode 100644 crates/nntp/tests/stages.rs
+
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index c46dbbec..6e044d21 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -12,6 +12,7 @@ use crate::breaker::{Breaker, Outcome};
+ use crate::connection::validate_message_id;
+ use crate::missing::Missing;
+ use crate::pool::{Command, Failure, Load, Pool, Tag, join_all};
++use crate::stages::{StageClock, StageMetrics};
+ use crate::stats::{self, ProviderStats, Rescue, Stats, Workload};
+ use crate::{BodyExpectation, Error, Progress};
+ 
+@@ -83,6 +84,7 @@ pub struct Client {
+     admitted: Arc<AtomicUsize>,
+     foreground: Arc<AtomicUsize>,
+     warm_lane: Lane,
++    stages: Arc<StageMetrics>,
+ }
+ 
+ fn warm_target(floor: usize, held: usize, total: usize, free: usize, pressure: bool) -> usize {
+@@ -159,6 +161,7 @@ impl Client {
+             admitted: Arc::default(),
+             foreground: Arc::default(),
+             warm_lane: Lane::default(),
++            stages: Arc::default(),
+         };
+         client.replace(providers);
+         client
+@@ -209,6 +212,11 @@ impl Client {
+         }
+     }
+ 
++    #[must_use]
++    pub fn stream_stages(&self) -> Arc<StageMetrics> {
++        Arc::clone(&self.stages)
++    }
++
+     /// Sets the [`BodySink`]; only the first call takes effect.
+     pub fn set_sink(&self, sink: BodySink) {
+         let _ = self.sink.set(sink);
+@@ -720,6 +728,9 @@ impl Client {
+         }
+         validate_message_id(message_id)?;
+         let workload = base.workload;
++        if command == Command::Body && matches!(workload, Workload::Stream | Workload::Cache) {
++            base.stages = Some(StageClock::start(&self.stages));
++        }
+         let _foreground = (workload == Workload::Stream).then(|| Load::acquire(&self.foreground));
+         let _admitted = self.admit(workload).await;
+         let providers = self.snapshot();
+@@ -794,6 +805,11 @@ impl Client {
+                         ..base.clone()
+                     };
+                     let result = entry.provider.pool.fetch(command, message_id, &tag).await;
++                    if result.is_err()
++                        && let Some(clock) = &mut base.stages
++                    {
++                        clock.resume();
++                    }
+                     // No slot in time, or withdrawn while waiting, says nothing about the
+                     // provider: the attempt drops unrecorded.
+                     if matches!(result, Err(Failure::Request(Error::Unavailable))) {
+diff --git a/crates/nntp/src/connection.rs b/crates/nntp/src/connection.rs
+index 368e9422..e2e40df8 100644
+--- a/crates/nntp/src/connection.rs
++++ b/crates/nntp/src/connection.rs
+@@ -20,6 +20,7 @@ use tokio_rustls::client::TlsStream;
+ use tokio_util::either::Either;
+ 
+ use crate::article::{Body, BodyExpectation, MAX_DECODED_LEN, MISMATCH, crc_field, field};
++use crate::stages::ConnectTimes;
+ use crate::{Bandwidth, Credentials, Error, Usage, resolve, tls};
+ 
+ /// Socket read buffer; large enough that one TLS record batch fits per fill.
+@@ -393,6 +394,7 @@ pub struct Connection {
+     pending: usize,
+     timeout: Duration,
+     timing: Timing,
++    connect_times: ConnectTimes,
+     bandwidth: Option<Arc<Bandwidth>>,
+     // After `stream`: fields drop in order in every task state, so the socket is closed
+     // before the account can hand this permit to another connection.
+@@ -413,6 +415,10 @@ impl Connection {
+         self.timing
+     }
+ 
++    pub(crate) const fn connect_times(&self) -> ConnectTimes {
++        self.connect_times
++    }
++
+     pub(crate) fn hold(&mut self, permit: OwnedSemaphorePermit) {
+         self._account = Some(permit);
+     }
+@@ -503,6 +509,7 @@ impl Connection {
+             pending: 0,
+             timeout: timeout_after,
+             timing: Timing::default(),
++            connect_times: ConnectTimes::default(),
+             // Set after login, so the connect deadline never covers a local limit wait.
+             bandwidth: None,
+             _account: None,
+@@ -519,6 +526,11 @@ impl Connection {
+         }
+         // Login bytes stay unpaid until the first read after this.
+         conn.bandwidth = endpoint.bandwidth.clone();
++        conn.connect_times = ConnectTimes {
++            connect: connected.duration_since(started),
++            tls: secured.duration_since(connected),
++            auth: secured.elapsed(),
++        };
+         let ms = |from: Instant, to: Instant| to.duration_since(from).as_millis();
+         tracing::debug!(
+             host = endpoint.host.as_str(),
+diff --git a/crates/nntp/src/lib.rs b/crates/nntp/src/lib.rs
+index 612951b5..2cdce2d0 100644
+--- a/crates/nntp/src/lib.rs
++++ b/crates/nntp/src/lib.rs
+@@ -12,6 +12,7 @@ mod pace;
+ pub mod patch;
+ mod pool;
+ mod resolve;
++mod stages;
+ mod stats;
+ mod tls;
+ mod usage;
+@@ -31,6 +32,10 @@ pub use connection::{
+ };
+ pub use downloads::Downloads;
+ pub use pool::{Pool, PoolConfig};
++pub use stages::{
++    AssignLoad, ConnectionRoute, HistogramSnapshot, LOAD_BUCKETS, STAGE_BUCKETS, StageMetrics,
++    StreamStage, TIMED_WORKLOADS, TRACE_TARGET, WorkloadStageSnapshot,
++};
+ pub use stats::{LATENCY_BUCKETS, ProviderStats, Rescue, Workload, WorkloadStats};
+ pub use usage::Usage;
+ 
+diff --git a/crates/nntp/src/pace.rs b/crates/nntp/src/pace.rs
+index 962d322f..d9eb67d9 100644
+--- a/crates/nntp/src/pace.rs
++++ b/crates/nntp/src/pace.rs
+@@ -65,6 +65,12 @@ impl Pace {
+         full
+     }
+ 
++    /// Bytes in flight, and the bound they would face while a seek runs.
++    pub(crate) fn during_seek(&self) -> (u64, u64) {
++        let state = self.lock();
++        (state.in_flight, state.limit * SEEKING_SHARE / 4)
++    }
++
+     fn landed(&self, bytes: u64, now: Instant) {
+         let mut state = self.lock();
+         state.in_flight = state.in_flight.saturating_sub(bytes);
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index 06ad4133..6d515cfd 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -15,6 +15,7 @@ use crate::client::{BodySink, Lane};
+ use crate::connection::{ConnectionStats, Link, Phase, Timing, validate_message_id};
+ use crate::downloads::{Downloads, Permit};
+ use crate::pace::{Flight, Pace};
++use crate::stages::{Assigned, ConnectTimes, LoadAtAssign, ReplyTimes, RequestTrace, StageClock};
+ use crate::stats::{Stats, Workload, outcome};
+ use crate::{Connection, Endpoint, Error, Progress, Usage};
+ 
+@@ -233,6 +234,9 @@ struct Worker {
+     link: Arc<Link>,
+ }
+ 
++/// A connection's sender, load, requests ahead, id, and how long it took if newly opened.
++type Picked = (mpsc::Sender<Request>, Load, usize, u32, Option<ConnectTimes>);
++
+ #[derive(Clone, Copy, PartialEq, Eq)]
+ pub(crate) enum Command {
+     Body,
+@@ -259,6 +263,8 @@ pub(crate) struct Tag {
+     pub(crate) lane: Option<Lane>,
+     /// Skips admission and the hold for viewers; see [`Pool::light_worker`].
+     pub(crate) light: bool,
++    /// Set on playback and cache-ahead bodies.
++    pub(crate) stages: Option<StageClock>,
+ }
+ 
+ impl Tag {
+@@ -274,6 +280,7 @@ impl Tag {
+         remember: true,
+         lane: None,
+         light: false,
++        stages: None,
+     };
+ 
+     fn step(&self, step: Step) {
+@@ -296,6 +303,7 @@ struct Request {
+     tag: Tag,
+     started: Instant,
+     recorded: bool,
++    trace: Option<Box<RequestTrace>>,
+     _ticket: Ticket,
+ }
+ 
+@@ -312,6 +320,11 @@ impl Request {
+             Ok(_) => Outcome::Retrieved,
+             Err(error) => outcome(error),
+         };
++        if matches!((&ended, &result), (Outcome::Retrieved, Ok(Some(_))))
++            && let Some(trace) = self.trace.take()
++        {
++            trace.delivered(bytes);
++        }
+         self.record(ended, bytes, decode);
+         if let Some(reply) = reply.filter(|r| !r.is_closed()) {
+             let _ = reply.send(result);
+@@ -324,6 +337,9 @@ impl Request {
+ 
+     fn record(&mut self, outcome: Outcome, bytes: u32, decode: Duration) {
+         self.recorded = true;
++        if let Some(trace) = self.trace.take() {
++            trace.abandoned();
++        }
+         if let Some(stats) = &self.tag.stats {
+             stats.record(self.tag.workload, outcome, bytes, self.started.elapsed());
+         }
+@@ -674,6 +690,7 @@ impl Pool {
+         tag: &Tag,
+     ) -> Result<Option<Body>, Failure> {
+         let (mut failed, mut unanswered) = (0, 0);
++        let mut attempt_from = tag.stages.as_ref().map(StageClock::attempt_from);
+         let provider = tag.provider;
+         let stream = tag.workload == Workload::Stream;
+         // Shared by retries; only admission waits spend it, not transfers.
+@@ -722,6 +739,7 @@ impl Pool {
+                 }
+                 .ok_or(Failure::Request(Error::Closed))?
+             };
++            let permitted = Instant::now();
+             tag.step(Step::Permitted { provider });
+             let parked = match tag.workload {
+                 Workload::Stream => Some(Load::watched(&self.stream_parked, &self.changed)),
+@@ -737,13 +755,14 @@ impl Pool {
+                 Flight::default()
+             };
+             let picked = if tag.light {
+-                Some(self.light_worker().await?)
++                let (tx, load, ahead, connection) = self.light_worker().await?;
++                Some((tx, load, ahead, connection, None))
+             } else {
+                 self.worker(tag.workload, tag.fresh, deadline, lane, &mut flight)
+                     .await?
+             };
+             drop(parked);
+-            let Some((tx, load, ahead, connection)) = picked else {
++            let Some((tx, load, ahead, connection, opened)) = picked else {
+                 continue;
+             };
+             // Withdrawn while it waited: someone else asks for the article instead.
+@@ -761,6 +780,21 @@ impl Pool {
+                 ahead: u16::try_from(ahead).unwrap_or(u16::MAX),
+                 connection,
+             });
++            let trace = tag.stages.as_ref().zip(attempt_from).and_then(|(clock, from)| {
++                RequestTrace::assign(
++                    clock,
++                    tag.workload,
++                    Assigned {
++                        attempt_from: from,
++                        permitted,
++                        ahead,
++                        connection,
++                        provider,
++                        opened,
++                        load: stream.then(|| self.load_at_assign()),
++                    },
++                )
++            });
+             let ticket = Ticket {
+                 _flight: flight,
+                 _download: download,
+@@ -781,6 +815,7 @@ impl Pool {
+                 tag: tag.clone(),
+                 started: Instant::now(),
+                 recorded: false,
++                trace,
+                 _ticket: ticket,
+             };
+             match dispatch(&tx, request).await {
+@@ -798,6 +833,23 @@ impl Pool {
+                 None if unanswered < MAX_UNANSWERED => unanswered += 1,
+                 None => return Err(Failure::Request(Error::Closed)),
+             }
++            attempt_from = tag.stages.is_some().then(Instant::now);
++        }
++    }
++
++    fn load_at_assign(&self) -> LoadAtAssign {
++        let busy_connections = self
++            .lock()
++            .workers
++            .iter()
++            .filter(|w| w.load.load(Ordering::Relaxed) > 0)
++            .count();
++        let (pace_in_flight, pace_bound) = self.pace.during_seek();
++        LoadAtAssign {
++            busy_connections,
++            requests_in_flight: self.busy(),
++            pace_in_flight,
++            pace_bound,
+         }
+     }
+ 
+@@ -820,7 +872,7 @@ impl Pool {
+         deadline: Option<tokio::time::Instant>,
+         lane: Option<Lane>,
+         flight: &mut Flight,
+-    ) -> Result<Option<(mpsc::Sender<Request>, Load, usize, u32)>, Failure> {
++    ) -> Result<Option<Picked>, Failure> {
+         let stream = workload == Workload::Stream;
+         let outranked = workload.rank().is_some_and(|rank| rank > 0);
+         let cached = workload.rank() == Some(0) && lane.is_some();
+@@ -1003,6 +1055,7 @@ impl Pool {
+                             Load::watched(&w.load, &self.changed),
+                             ahead,
+                             w.link.id,
++                            None,
+                         )));
+                     }
+                     _ if deadline
+@@ -1053,8 +1106,8 @@ impl Pool {
+                 } else {
+                     open.await
+                 };
+-                if let Some((tx, load, id)) = opened? {
+-                    return Ok(Some((tx, load, 0, id)));
++                if let Some((tx, load, id, times)) = opened? {
++                    return Ok(Some((tx, load, 0, id, Some(times))));
+                 }
+                 continue;
+             }
+@@ -1136,7 +1189,7 @@ impl Pool {
+                 reserved
+             };
+             if reserved {
+-                if let Some((tx, load, id)) =
++                if let Some((tx, load, id, _)) =
+                     self.open(self.connecting(), None, None, false).await?
+                 {
+                     return Ok((tx, load, 0, id));
+@@ -1159,7 +1212,9 @@ impl Pool {
+         until: Option<tokio::time::Instant>,
+         lane: Option<Lane>,
+         cached: bool,
+-    ) -> impl Future<Output = Result<Option<(mpsc::Sender<Request>, Load, u32)>, Failure>> + Send + 'static
++    ) -> impl Future<Output = Result<Option<(mpsc::Sender<Request>, Load, u32, ConnectTimes)>, Failure>>
++    + Send
++    + 'static
+     {
+         let (endpoint, config) = (self.endpoint.clone(), self.config);
+         let usage = endpoint.usage().cloned();
+@@ -1272,6 +1327,7 @@ impl Pool {
+                 }
+             };
+             conn.hold(permit);
++            let times = conn.connect_times();
+             let (tx, rx) = mpsc::channel(config.pipeline_depth);
+             let load = Arc::new(AtomicUsize::new(0));
+             let acquired = Load::watched(&load, &connecting.changed);
+@@ -1315,7 +1371,7 @@ impl Pool {
+             }
+             drop(state);
+             drop(connecting);
+-            Ok(Some((tx, acquired, id)))
++            Ok(Some((tx, acquired, id, times)))
+         }
+     }
+ 
+@@ -1517,9 +1573,18 @@ async fn run(
+             }
+             return;
+         }
+-        let Some(request) = in_flight.pop_front() else {
++        let written = Instant::now();
++        for request in &mut in_flight {
++            if let Some(trace) = &mut request.trace {
++                trace.written(written);
++            }
++        }
++        let Some(mut request) = in_flight.pop_front() else {
+             continue;
+         };
++        let head = Instant::now();
++        let mut first_byte = None;
++        let mut read_end = None;
+         let provider = request.tag.provider;
+         request.tag.step(Step::Reading { provider });
+         let abandoned = request
+@@ -1532,15 +1597,19 @@ async fn run(
+             Phase::Reply
+         });
+         let result = match request.command {
+-            Command::Body => conn
+-                .read_body_with(request.tag.progress.as_ref(), request.tag.expected, || {
+-                    request.tag.step(Step::Receiving { provider });
+-                })
+-                .await
+-                .and_then(|body| {
++            Command::Body => {
++                let read = conn
++                    .read_body_with(request.tag.progress.as_ref(), request.tag.expected, || {
++                        first_byte = Some(Instant::now());
++                        request.tag.step(Step::Receiving { provider });
++                    })
++                    .await;
++                read_end = Some(Instant::now());
++                read.and_then(|body| {
+                     request.tag.expected.validate(&body)?;
+                     Ok(Some(body))
+-                }),
++                })
++            }
+             Command::Stat => conn.read_stat().await.map(|()| None),
+         };
+         let timing = match request.command {
+@@ -1555,6 +1624,17 @@ async fn run(
+         {
+             dropped(&host, error, in_flight.len() + rx.len());
+         }
++        if let (Some(trace), Some(first_byte), Some(read_end)) =
++            (&mut request.trace, first_byte, read_end)
++        {
++            trace.replied(ReplyTimes {
++                head,
++                first_byte,
++                read_end,
++                end: Instant::now(),
++                decode: timing.decode,
++            });
++        }
+         // A dropped receiver means the caller was cancelled; the reply is drained anyway.
+         request.answer(result, timing.decode);
+         if !reusable {
+@@ -1663,12 +1743,12 @@ mod tests {
+         assert_eq!(server.peak_connections(), 0);
+         assert_eq!(pool.lock().connecting, 0);
+ 
+-        let Ok(Some((_, load, _, connection))) = pool.worker(Workload::Stream, false, None, None, &mut Flight::default()).await
++        let Ok(Some((_, load, _, connection, _))) = pool.worker(Workload::Stream, false, None, None, &mut Flight::default()).await
+         else {
+             panic!("a connection opens before admission expires");
+         };
+         drop(load);
+-        let Ok(Some((_, load, _, reused))) = pool.worker(Workload::Stream, false, deadline, None, &mut Flight::default()).await
++        let Ok(Some((_, load, _, reused, _))) = pool.worker(Workload::Stream, false, deadline, None, &mut Flight::default()).await
+         else {
+             panic!("an idle connection is reusable after admission expires");
+         };
+@@ -1736,7 +1816,7 @@ mod tests {
+         let mut flight = Flight::default();
+         let ((stream, client), opened) =
+             tokio::join!(accept, pool.worker(Workload::Stream, false, None, None, &mut flight));
+-        let Ok(Some((_, load, _, _))) = opened else {
++        let Ok(Some((_, load, _, _, _))) = opened else {
+             panic!("the connection opens");
+         };
+         drop(load);
+@@ -1890,7 +1970,7 @@ mod tests {
+         let (pool, _server) = loopback_pool(2).await;
+         let mut held = Vec::new();
+         for _ in 0..2 {
+-            let Ok(Some((_, load, _, _))) = pool.worker(Workload::Queue, false, None, None, &mut Flight::default()).await else {
++            let Ok(Some((_, load, _, _, _))) = pool.worker(Workload::Queue, false, None, None, &mut Flight::default()).await else {
+                 panic!("a connection opens");
+             };
+             held.push(load);
+@@ -1912,7 +1992,7 @@ mod tests {
+ 
+     async fn below_viewers(
+         pool: &Pool,
+-    ) -> Result<Option<(mpsc::Sender<Request>, Load, usize, u32)>, Failure> {
++    ) -> Result<Option<Picked>, Failure> {
+         loop {
+             pool.downloads.viewers().clear().await;
+             match pool.worker(Workload::Queue, false, None, None, &mut Flight::default()).await {
+@@ -1925,7 +2005,7 @@ mod tests {
+     async fn saturate(pool: &Pool, workload: Workload, lane: Option<Lane>, n: usize) -> Vec<Load> {
+         let mut loads = Vec::new();
+         for _ in 0..n {
+-            let Ok(Some((_, load, _, _))) = pool.worker(workload, false, None, lane, &mut Flight::default()).await else {
++            let Ok(Some((_, load, _, _, _))) = pool.worker(workload, false, None, lane, &mut Flight::default()).await else {
+                 panic!("a connection is available");
+             };
+             loads.push(load);
+@@ -1951,7 +2031,7 @@ mod tests {
+             assert_eq!(pool.lock().workers.len(), opened, "{limit} {workload:?}");
+             if workload == Workload::Queue && limit >= CACHE_HEADROOM_MIN_CONNECTIONS {
+                 let lane = Some(Lane::reader(1));
+-                let Ok(Some((_, cache, ahead, _))) =
++                let Ok(Some((_, cache, ahead, _, _))) =
+                     pool.worker(Workload::Cache, false, None, lane, &mut Flight::default()).await
+                 else {
+                     panic!("the cache reader gets the slot left for it");
+diff --git a/crates/nntp/src/stages.rs b/crates/nntp/src/stages.rs
+new file mode 100644
+index 00000000..9a12b7d7
+--- /dev/null
++++ b/crates/nntp/src/stages.rs
+@@ -0,0 +1,535 @@
++//! Where playback and cache-ahead requests spend their time, cheap enough to keep on in
++//! production. A delivered request's additive stages partition its `total` exactly;
++//! `connect`, `tls` and `auth` are nested inside `connection_wait`.
++
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::time::{Duration, Instant};
++
++use crate::stats::Workload;
++
++pub const STAGE_BUCKETS: [f64; 17] = [
++    0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0,
++];
++const STAGE_BOUNDS_NS: [u64; 17] = [
++    10_000_000,
++    20_000_000,
++    50_000_000,
++    100_000_000,
++    200_000_000,
++    350_000_000,
++    500_000_000,
++    750_000_000,
++    1_000_000_000,
++    1_500_000_000,
++    2_000_000_000,
++    3_000_000_000,
++    4_000_000_000,
++    6_000_000_000,
++    8_000_000_000,
++    12_000_000_000,
++    16_000_000_000,
++];
++pub const LOAD_BUCKETS: [u64; 12] = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
++
++pub const TIMED_WORKLOADS: [Workload; 2] = [Workload::Stream, Workload::Cache];
++
++const fn slot(workload: Workload) -> Option<usize> {
++    match workload {
++        Workload::Stream => Some(0),
++        Workload::Cache => Some(1),
++        _ => None,
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum StreamStage {
++    Retry,
++    Admission,
++    ConnectionWait,
++    Connect,
++    Tls,
++    Auth,
++    SendQueue,
++    PipelineWait,
++    ProviderFirstByte,
++    BodyTransfer,
++    Decode,
++    Total,
++    Service,
++    ServiceFirstRead,
++}
++
++impl StreamStage {
++    pub const ALL: [Self; 14] = [
++        Self::Retry,
++        Self::Admission,
++        Self::ConnectionWait,
++        Self::Connect,
++        Self::Tls,
++        Self::Auth,
++        Self::SendQueue,
++        Self::PipelineWait,
++        Self::ProviderFirstByte,
++        Self::BodyTransfer,
++        Self::Decode,
++        Self::Total,
++        Self::Service,
++        Self::ServiceFirstRead,
++    ];
++
++    #[must_use]
++    pub const fn label(self) -> &'static str {
++        match self {
++            Self::Retry => "retry",
++            Self::Admission => "admission",
++            Self::ConnectionWait => "connection_wait",
++            Self::Connect => "connect",
++            Self::Tls => "tls",
++            Self::Auth => "auth",
++            Self::SendQueue => "send_queue",
++            Self::PipelineWait => "pipeline_wait",
++            Self::ProviderFirstByte => "provider_first_byte",
++            Self::BodyTransfer => "body_transfer",
++            Self::Decode => "decode",
++            Self::Total => "total",
++            Self::Service => "service",
++            Self::ServiceFirstRead => "service_first_read",
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ConnectionRoute {
++    Idle,
++    Busy,
++    New,
++}
++
++impl ConnectionRoute {
++    pub const ALL: [Self; 3] = [Self::Idle, Self::Busy, Self::New];
++
++    #[must_use]
++    pub const fn label(self) -> &'static str {
++        match self {
++            Self::Idle => "idle",
++            Self::Busy => "busy",
++            Self::New => "new",
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum AssignLoad {
++    RequestsAhead,
++    BusyConnections,
++    RequestsInFlight,
++    PaceInFlightMib,
++    PaceBoundMib,
++}
++
++impl AssignLoad {
++    pub const ALL: [Self; 5] = [
++        Self::RequestsAhead,
++        Self::BusyConnections,
++        Self::RequestsInFlight,
++        Self::PaceInFlightMib,
++        Self::PaceBoundMib,
++    ];
++
++    #[must_use]
++    pub const fn label(self) -> &'static str {
++        match self {
++            Self::RequestsAhead => "requests_ahead",
++            Self::BusyConnections => "busy_connections",
++            Self::RequestsInFlight => "requests_in_flight",
++            Self::PaceInFlightMib => "pace_in_flight_mib",
++            Self::PaceBoundMib => "pace_bound_mib",
++        }
++    }
++}
++
++struct Histogram<const N: usize> {
++    buckets: [AtomicU64; N],
++    sum: AtomicU64,
++}
++
++impl<const N: usize> Default for Histogram<N> {
++    fn default() -> Self {
++        Self {
++            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
++            sum: AtomicU64::new(0),
++        }
++    }
++}
++
++impl<const N: usize> Histogram<N> {
++    fn observe(&self, bounds: &[u64], value: u64) {
++        let bucket = bounds.partition_point(|&bound| bound < value);
++        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
++        self.sum.fetch_add(value, Ordering::Relaxed);
++    }
++
++    fn snapshot(&self) -> HistogramSnapshot {
++        let mut count = 0;
++        let cumulative = self
++            .buckets
++            .iter()
++            .map(|bucket| {
++                count += bucket.load(Ordering::Relaxed);
++                count
++            })
++            .collect();
++        HistogramSnapshot {
++            cumulative,
++            sum: self.sum.load(Ordering::Relaxed),
++        }
++    }
++}
++
++/// Cumulative counts per bucket bound, `+Inf` last. `sum` is in the observed unit.
++#[derive(Clone, Debug, Default)]
++pub struct HistogramSnapshot {
++    pub cumulative: Vec<u64>,
++    pub sum: u64,
++}
++
++impl HistogramSnapshot {
++    #[must_use]
++    pub fn count(&self) -> u64 {
++        self.cumulative.last().copied().unwrap_or(0)
++    }
++
++    #[must_use]
++    pub fn sum_seconds(&self) -> f64 {
++        self.sum as f64 / 1e9
++    }
++}
++
++#[derive(Default)]
++struct WorkloadStages {
++    stages: [Histogram<18>; StreamStage::ALL.len()],
++    routes: [AtomicU64; ConnectionRoute::ALL.len()],
++    load: [Histogram<13>; AssignLoad::ALL.len()],
++    body_bytes: AtomicU64,
++    abandoned: AtomicU64,
++}
++
++#[derive(Clone, Debug)]
++pub struct WorkloadStageSnapshot {
++    pub workload: Workload,
++    pub stages: Vec<(StreamStage, HistogramSnapshot)>,
++    pub routes: Vec<(ConnectionRoute, u64)>,
++    pub load: Vec<(AssignLoad, HistogramSnapshot)>,
++    pub body_bytes: u64,
++    /// Assigned a connection but never delivered: cancelled by a seek, or failed.
++    pub abandoned: u64,
++}
++
++impl WorkloadStageSnapshot {
++    #[must_use]
++    pub fn stage(&self, stage: StreamStage) -> &HistogramSnapshot {
++        &self.stages[stage as usize].1
++    }
++
++    #[must_use]
++    pub fn route(&self, route: ConnectionRoute) -> u64 {
++        self.routes[route as usize].1
++    }
++
++    #[must_use]
++    pub fn load(&self, load: AssignLoad) -> &HistogramSnapshot {
++        &self.load[load as usize].1
++    }
++}
++
++#[derive(Default)]
++pub struct StageMetrics {
++    workloads: [WorkloadStages; TIMED_WORKLOADS.len()],
++    trace: AtomicBool,
++}
++
++impl StageMetrics {
++    /// Logs one `info` line per playback request while on.
++    pub fn set_trace(&self, on: bool) {
++        self.trace.store(on, Ordering::Relaxed);
++    }
++
++    #[must_use]
++    pub fn tracing(&self) -> bool {
++        self.trace.load(Ordering::Relaxed)
++    }
++
++    #[must_use]
++    pub fn snapshot(&self) -> Vec<WorkloadStageSnapshot> {
++        TIMED_WORKLOADS
++            .iter()
++            .zip(&self.workloads)
++            .map(|(&workload, stages)| WorkloadStageSnapshot {
++                workload,
++                stages: StreamStage::ALL
++                    .iter()
++                    .map(|&stage| (stage, stages.stages[stage as usize].snapshot()))
++                    .collect(),
++                routes: ConnectionRoute::ALL
++                    .iter()
++                    .map(|&route| (route, stages.routes[route as usize].load(Ordering::Relaxed)))
++                    .collect(),
++                load: AssignLoad::ALL
++                    .iter()
++                    .map(|&load| (load, stages.load[load as usize].snapshot()))
++                    .collect(),
++                body_bytes: stages.body_bytes.load(Ordering::Relaxed),
++                abandoned: stages.abandoned.load(Ordering::Relaxed),
++            })
++            .collect()
++    }
++
++    /// One HTTP read: `first_read` is when its first bytes came back from the engine,
++    /// `ready` when the response carrying them was handed over.
++    pub fn record_service(&self, workload: Workload, first_read: Duration, ready: Duration) {
++        let Some(stages) = slot(workload).map(|slot| &self.workloads[slot]) else {
++            return;
++        };
++        stages.observe(StreamStage::ServiceFirstRead, first_read);
++        stages.observe(StreamStage::Service, ready);
++        if workload == Workload::Stream && self.tracing() {
++            tracing::info!(
++                target: TRACE_TARGET,
++                first_read_ms = first_read.as_millis() as u64,
++                service_ms = ready.as_millis() as u64,
++                "stream service"
++            );
++        }
++    }
++}
++
++pub const TRACE_TARGET: &str = "usenet_stream_trace";
++
++impl WorkloadStages {
++    fn observe(&self, stage: StreamStage, took: Duration) {
++        let nanos = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
++        self.stages[stage as usize].observe(&STAGE_BOUNDS_NS, nanos);
++    }
++}
++
++/// When one request entered the client, carried across its attempts.
++#[derive(Clone)]
++pub(crate) struct StageClock {
++    metrics: Arc<StageMetrics>,
++    entered: Instant,
++    resumed: Option<Instant>,
++}
++
++impl StageClock {
++    pub(crate) fn start(metrics: &Arc<StageMetrics>) -> Self {
++        Self {
++            metrics: Arc::clone(metrics),
++            entered: Instant::now(),
++            resumed: None,
++        }
++    }
++
++    /// The last attempt failed; time until the next one starts counts as `retry`.
++    pub(crate) fn resume(&mut self) {
++        self.resumed = Some(Instant::now());
++    }
++
++    pub(crate) fn attempt_from(&self) -> Instant {
++        self.resumed.unwrap_or(self.entered)
++    }
++}
++
++/// What the pool looked like when a playback request took its connection.
++#[derive(Clone, Copy, Debug, Default)]
++pub(crate) struct LoadAtAssign {
++    pub(crate) busy_connections: usize,
++    pub(crate) requests_in_flight: usize,
++    pub(crate) pace_in_flight: u64,
++    pub(crate) pace_bound: u64,
++}
++
++#[derive(Clone, Copy, Debug, Default)]
++pub(crate) struct ConnectTimes {
++    pub(crate) connect: Duration,
++    pub(crate) tls: Duration,
++    pub(crate) auth: Duration,
++}
++
++pub(crate) struct Assigned {
++    pub(crate) attempt_from: Instant,
++    pub(crate) permitted: Instant,
++    pub(crate) ahead: usize,
++    pub(crate) connection: u32,
++    pub(crate) provider: u16,
++    pub(crate) opened: Option<ConnectTimes>,
++    pub(crate) load: Option<LoadAtAssign>,
++}
++
++/// The reply's timestamps, read on the connection task.
++#[derive(Clone, Copy)]
++pub(crate) struct ReplyTimes {
++    pub(crate) head: Instant,
++    pub(crate) first_byte: Instant,
++    pub(crate) read_end: Instant,
++    pub(crate) end: Instant,
++    pub(crate) decode: Duration,
++}
++
++/// One body attempt from the moment it holds a connection.
++pub(crate) struct RequestTrace {
++    clock: StageClock,
++    workload: Workload,
++    assigned_at: Instant,
++    assigned: Assigned,
++    route: ConnectionRoute,
++    written: Option<Instant>,
++    reply: Option<ReplyTimes>,
++}
++
++impl RequestTrace {
++    pub(crate) fn assign(
++        clock: &StageClock,
++        workload: Workload,
++        assigned: Assigned,
++    ) -> Option<Box<Self>> {
++        let stages = &clock.metrics.workloads[slot(workload)?];
++        let route = match (assigned.opened, assigned.ahead) {
++            (Some(_), _) => ConnectionRoute::New,
++            (None, 0) => ConnectionRoute::Idle,
++            (None, _) => ConnectionRoute::Busy,
++        };
++        stages.routes[route as usize].fetch_add(1, Ordering::Relaxed);
++        let load = |which: AssignLoad, value: u64| {
++            stages.load[which as usize].observe(&LOAD_BUCKETS, value);
++        };
++        load(AssignLoad::RequestsAhead, assigned.ahead as u64);
++        if let Some(at) = assigned.load {
++            load(AssignLoad::BusyConnections, at.busy_connections as u64);
++            load(AssignLoad::RequestsInFlight, at.requests_in_flight as u64);
++            load(AssignLoad::PaceInFlightMib, at.pace_in_flight >> 20);
++            load(AssignLoad::PaceBoundMib, at.pace_bound >> 20);
++        }
++        if let Some(opened) = assigned.opened {
++            stages.observe(StreamStage::Connect, opened.connect);
++            stages.observe(StreamStage::Tls, opened.tls);
++            stages.observe(StreamStage::Auth, opened.auth);
++        }
++        Some(Box::new(Self {
++            clock: clock.clone(),
++            workload,
++            assigned_at: Instant::now(),
++            assigned,
++            route,
++            written: None,
++            reply: None,
++        }))
++    }
++
++    pub(crate) fn written(&mut self, at: Instant) {
++        self.written.get_or_insert(at);
++    }
++
++    pub(crate) const fn replied(&mut self, reply: ReplyTimes) {
++        self.reply = Some(reply);
++    }
++
++    pub(crate) fn abandoned(self) {
++        if let Some(slot) = slot(self.workload) {
++            self.clock.metrics.workloads[slot]
++                .abandoned
++                .fetch_add(1, Ordering::Relaxed);
++        }
++    }
++
++    pub(crate) fn delivered(self, bytes: u32) {
++        let (Some(slot), Some(reply)) = (slot(self.workload), self.reply) else {
++            return self.abandoned();
++        };
++        let metrics = &self.clock.metrics;
++        let stages = &metrics.workloads[slot];
++        let assigned = &self.assigned;
++        let written = self.written.unwrap_or(reply.head);
++        let read = reply.read_end.saturating_duration_since(reply.first_byte);
++        let timings = [
++            (
++                StreamStage::Retry,
++                assigned
++                    .attempt_from
++                    .saturating_duration_since(self.clock.entered),
++            ),
++            (
++                StreamStage::Admission,
++                assigned
++                    .permitted
++                    .saturating_duration_since(assigned.attempt_from),
++            ),
++            (
++                StreamStage::ConnectionWait,
++                self.assigned_at
++                    .saturating_duration_since(assigned.permitted),
++            ),
++            (
++                StreamStage::SendQueue,
++                written.saturating_duration_since(self.assigned_at),
++            ),
++            (
++                StreamStage::PipelineWait,
++                reply.head.saturating_duration_since(written),
++            ),
++            (
++                StreamStage::ProviderFirstByte,
++                reply.first_byte.saturating_duration_since(reply.head),
++            ),
++            (StreamStage::BodyTransfer, read.saturating_sub(reply.decode)),
++            (
++                StreamStage::Decode,
++                reply.decode + reply.end.saturating_duration_since(reply.read_end),
++            ),
++            (
++                StreamStage::Total,
++                reply.end.saturating_duration_since(self.clock.entered),
++            ),
++        ];
++        for (stage, took) in timings {
++            stages.observe(stage, took);
++        }
++        stages
++            .body_bytes
++            .fetch_add(u64::from(bytes), Ordering::Relaxed);
++        if self.workload == Workload::Stream && metrics.tracing() {
++            let ms = |stage: StreamStage| {
++                timings
++                    .iter()
++                    .find(|(s, _)| *s == stage)
++                    .map_or(0, |(_, took)| took.as_millis() as u64)
++            };
++            let load = assigned.load.unwrap_or_default();
++            tracing::info!(
++                target: TRACE_TARGET,
++                route = self.route.label(),
++                provider = assigned.provider,
++                conn = assigned.connection,
++                ahead = assigned.ahead,
++                busy_conns = load.busy_connections,
++                in_flight = load.requests_in_flight,
++                pace_in_flight = load.pace_in_flight,
++                pace_bound = load.pace_bound,
++                bytes,
++                retry_ms = ms(StreamStage::Retry),
++                admission_ms = ms(StreamStage::Admission),
++                conn_wait_ms = ms(StreamStage::ConnectionWait),
++                connect_ms = assigned.opened.map(|o| o.connect.as_millis() as u64),
++                tls_ms = assigned.opened.map(|o| o.tls.as_millis() as u64),
++                auth_ms = assigned.opened.map(|o| o.auth.as_millis() as u64),
++                send_queue_ms = ms(StreamStage::SendQueue),
++                pipeline_ms = ms(StreamStage::PipelineWait),
++                first_byte_ms = ms(StreamStage::ProviderFirstByte),
++                body_ms = ms(StreamStage::BodyTransfer),
++                decode_ms = ms(StreamStage::Decode),
++                total_ms = ms(StreamStage::Total),
++                "stream stages"
++            );
++        }
++    }
++}
+diff --git a/crates/nntp/tests/stages.rs b/crates/nntp/tests/stages.rs
+new file mode 100644
+index 00000000..24576088
+--- /dev/null
++++ b/crates/nntp/tests/stages.rs
+@@ -0,0 +1,191 @@
++#![allow(clippy::unwrap_used)]
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use infinidysk_nntp::{
++    AssignLoad, Client, ConnectionRoute, Downloads, Endpoint, Pool, PoolConfig, Provider,
++    StageMetrics, StreamStage, TlsMode, Workload, WorkloadStageSnapshot,
++};
++use infinidysk_testkit::{Corpus, Impairment, LoopbackServer};
++
++const ARTICLE: usize = 64 * 1024;
++const REPLY_DELAY: Duration = Duration::from_millis(60);
++const HANDSHAKE_DELAY: Duration = Duration::from_millis(15);
++const ADDITIVE: [StreamStage; 8] = [
++    StreamStage::Retry,
++    StreamStage::Admission,
++    StreamStage::ConnectionWait,
++    StreamStage::SendQueue,
++    StreamStage::PipelineWait,
++    StreamStage::ProviderFirstByte,
++    StreamStage::BodyTransfer,
++    StreamStage::Decode,
++];
++
++async fn delayed(connections: usize, depth: usize) -> (Arc<Corpus>, Client, LoopbackServer) {
++    let corpus = Arc::new(Corpus::generate(77, 6, ARTICLE));
++    let server = LoopbackServer::start_impaired(
++        corpus.articles.clone(),
++        Impairment {
++            handshake_delay: HANDSHAKE_DELAY,
++            response_delay: REPLY_DELAY,
++            bandwidth: None,
++        },
++    )
++    .await
++    .unwrap();
++    let client = client_of(&server, connections, depth);
++    (corpus, client, server)
++}
++
++fn client_of(server: &LoopbackServer, connections: usize, depth: usize) -> Client {
++    let endpoint = Endpoint::new(
++        "127.0.0.1",
++        server.addr().port(),
++        TlsMode::Plain,
++        None,
++        Duration::from_secs(5),
++    )
++    .unwrap();
++    let config = PoolConfig {
++        max_connections: connections,
++        pipeline_depth: depth,
++        idle_timeout: Duration::from_secs(60),
++        min_connections: 0,
++    };
++    let pool = Pool::new(endpoint, config, Downloads::new(connections * depth)).unwrap();
++    Client::new([Provider {
++        pool,
++        key: "loopback".into(),
++        name: "loopback".into(),
++        priority: 0,
++        backbone: None,
++    }])
++}
++
++fn of(metrics: &StageMetrics, workload: Workload) -> WorkloadStageSnapshot {
++    metrics
++        .snapshot()
++        .into_iter()
++        .find(|s| s.workload == workload)
++        .unwrap()
++}
++
++fn additive_sum(snapshot: &WorkloadStageSnapshot) -> f64 {
++    ADDITIVE
++        .iter()
++        .map(|&stage| snapshot.stage(stage).sum_seconds())
++        .sum()
++}
++
++#[tokio::test]
++async fn a_delivered_read_partitions_its_time_into_stages() {
++    let (corpus, client, _server) = delayed(2, 1).await;
++    let id = &corpus.articles[0].message_id;
++    client.body(id, Workload::Stream, None).await.unwrap();
++    client.body(id, Workload::Stream, None).await.unwrap();
++
++    let metrics = client.stream_stages();
++    let stream = of(&metrics, Workload::Stream);
++    let total = stream.stage(StreamStage::Total);
++    assert_eq!(total.count(), 2);
++    assert_eq!(stream.route(ConnectionRoute::New), 1);
++    assert_eq!(stream.route(ConnectionRoute::Idle), 1);
++    assert_eq!(stream.abandoned, 0);
++    assert_eq!(stream.body_bytes, 2 * ARTICLE as u64);
++    assert_eq!(stream.load(AssignLoad::BusyConnections).count(), 2);
++    assert_eq!(stream.stage(StreamStage::Connect).count(), 1);
++    assert!(stream.stage(StreamStage::Auth).count() == 1);
++    assert!(
++        stream.stage(StreamStage::ProviderFirstByte).sum_seconds()
++            >= 2.0 * REPLY_DELAY.as_secs_f64() * 0.9
++    );
++    let drift = (additive_sum(&stream) - total.sum_seconds()).abs();
++    assert!(drift < 0.002, "stages miss the total by {drift}s");
++    assert_eq!(
++        of(&metrics, Workload::Cache)
++            .stage(StreamStage::Total)
++            .count(),
++        0
++    );
++}
++
++#[tokio::test]
++async fn cache_reads_are_labelled_apart_and_a_pipelined_read_counts_as_busy() {
++    let (corpus, client, _server) = delayed(1, 4).await;
++    let client = Arc::new(client);
++    client
++        .body(&corpus.articles[0].message_id, Workload::Cache, None)
++        .await
++        .unwrap();
++    let reads: Vec<_> = corpus.articles[1..4]
++        .iter()
++        .map(|article| {
++            let (client, id) = (Arc::clone(&client), article.message_id.clone());
++            tokio::spawn(async move { client.body(&id, Workload::Stream, None).await })
++        })
++        .collect();
++    for read in reads {
++        read.await.unwrap().unwrap();
++    }
++    let metrics = client.stream_stages();
++    assert_eq!(
++        of(&metrics, Workload::Cache)
++            .stage(StreamStage::Total)
++            .count(),
++        1
++    );
++    let stream = of(&metrics, Workload::Stream);
++    assert_eq!(stream.stage(StreamStage::Total).count(), 3);
++    assert!(stream.route(ConnectionRoute::Busy) >= 1);
++    assert!(stream.load(AssignLoad::RequestsAhead).sum >= 1);
++}
++
++#[tokio::test]
++async fn a_read_abandoned_before_its_reply_is_counted_and_not_timed() {
++    let (corpus, client, _server) = delayed(1, 1).await;
++    let id = corpus.articles[0].message_id.clone();
++    let _ = tokio::time::timeout(
++        REPLY_DELAY / 4 + HANDSHAKE_DELAY * 4,
++        client.body(&id, Workload::Stream, None),
++    )
++    .await;
++    let metrics = client.stream_stages();
++    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
++    while of(&metrics, Workload::Stream).abandoned == 0 {
++        assert!(tokio::time::Instant::now() < deadline, "never counted");
++        tokio::time::sleep(Duration::from_millis(5)).await;
++    }
++    assert_eq!(
++        of(&metrics, Workload::Stream)
++            .stage(StreamStage::Total)
++            .count(),
++        0
++    );
++}
++
++#[tokio::test]
++async fn a_retried_read_keeps_its_stages_partitioned() {
++    let corpus = Corpus::generate(78, 3, ARTICLE);
++    let server = LoopbackServer::start_dropping(corpus.articles.clone(), 1)
++        .await
++        .unwrap();
++    let client = client_of(&server, 1, 1);
++    for article in &corpus.articles[..2] {
++        client
++            .body(&article.message_id, Workload::Stream, None)
++            .await
++            .unwrap();
++    }
++    let metrics = client.stream_stages();
++    let stream = of(&metrics, Workload::Stream);
++    let total = stream.stage(StreamStage::Total);
++    assert_eq!(total.count(), 2);
++    assert_eq!(stream.abandoned, 1, "the attempt on the dropped connection");
++    assert!(stream.stage(StreamStage::Retry).sum > 0);
++    let routes: u64 = stream.routes.iter().map(|(_, n)| n).sum();
++    assert_eq!(routes, total.count() + stream.abandoned);
++    let drift = (additive_sum(&stream) - total.sum_seconds()).abs();
++    assert!(drift < 0.002, "stages miss the total by {drift}s");
++}
+-- 
+2.56.1
+

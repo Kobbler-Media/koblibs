@@ -22,6 +22,7 @@ use tokio_util::either::Either;
 use crate::vendor::nntp::article::{
     Body, BodyExpectation, MAX_DECODED_LEN, MISMATCH, crc_field, field,
 };
+use crate::vendor::nntp::stages::ConnectTimes;
 use crate::vendor::nntp::{Bandwidth, Credentials, Error, Usage, resolve, tls};
 
 /// Socket read buffer; large enough that one TLS record batch fits per fill.
@@ -395,6 +396,7 @@ pub struct Connection {
     pending: usize,
     timeout: Duration,
     timing: Timing,
+    connect_times: ConnectTimes,
     bandwidth: Option<Arc<Bandwidth>>,
     // After `stream`: fields drop in order in every task state, so the socket is closed
     // before the account can hand this permit to another connection.
@@ -413,6 +415,10 @@ impl Connection {
     #[must_use]
     pub const fn timing(&self) -> Timing {
         self.timing
+    }
+
+    pub(crate) const fn connect_times(&self) -> ConnectTimes {
+        self.connect_times
     }
 
     pub(crate) fn hold(&mut self, permit: OwnedSemaphorePermit) {
@@ -505,6 +511,7 @@ impl Connection {
             pending: 0,
             timeout: timeout_after,
             timing: Timing::default(),
+            connect_times: ConnectTimes::default(),
             // Set after login, so the connect deadline never covers a local limit wait.
             bandwidth: None,
             _account: None,
@@ -521,6 +528,11 @@ impl Connection {
         }
         // Login bytes stay unpaid until the first read after this.
         conn.bandwidth = endpoint.bandwidth.clone();
+        conn.connect_times = ConnectTimes {
+            connect: connected.duration_since(started),
+            tls: secured.duration_since(connected),
+            auth: secured.elapsed(),
+        };
         let ms = |from: Instant, to: Instant| to.duration_since(from).as_millis();
         tracing::debug!(
             host = endpoint.host.as_str(),

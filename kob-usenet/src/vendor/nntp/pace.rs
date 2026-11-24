@@ -69,6 +69,12 @@ impl Pace {
         full
     }
 
+    /// Bytes in flight, and the bound they would face while a seek runs.
+    pub(crate) fn during_seek(&self) -> (u64, u64) {
+        let state = self.lock();
+        (state.in_flight, state.limit * SEEKING_SHARE / 4)
+    }
+
     fn landed(&self, bytes: u64, now: Instant) {
         let mut state = self.lock();
         state.in_flight = state.in_flight.saturating_sub(bytes);

@@ -11,6 +11,7 @@ mod pace;
 pub mod patch;
 mod pool;
 mod resolve;
+mod stages;
 mod stats;
 mod tls;
 mod usage;
@@ -30,6 +31,10 @@ pub use connection::{
 };
 pub use downloads::Downloads;
 pub use pool::{Pool, PoolConfig};
+pub use stages::{
+    AssignLoad, ConnectionRoute, HistogramSnapshot, LOAD_BUCKETS, STAGE_BUCKETS, StageMetrics,
+    StreamStage, TIMED_WORKLOADS, TRACE_TARGET, WorkloadStageSnapshot,
+};
 pub use stats::{LATENCY_BUCKETS, ProviderStats, Rescue, Workload, WorkloadStats};
 pub use usage::Usage;
 

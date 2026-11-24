@@ -5,6 +5,7 @@ mod nntp_client;
 mod nntp_loopback;
 mod nntp_patch;
 mod nntp_pool;
+mod nntp_stages;
 mod nntp_stream_first;
 mod par2_par2;
 mod par2_plan;

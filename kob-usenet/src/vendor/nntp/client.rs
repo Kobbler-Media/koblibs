@@ -12,6 +12,7 @@ use crate::vendor::nntp::breaker::{Breaker, Outcome};
 use crate::vendor::nntp::connection::validate_message_id;
 use crate::vendor::nntp::missing::Missing;
 use crate::vendor::nntp::pool::{Command, Failure, Load, Pool, Tag, join_all};
+use crate::vendor::nntp::stages::{StageClock, StageMetrics};
 use crate::vendor::nntp::stats::{self, ProviderStats, Rescue, Stats, Workload};
 use crate::vendor::nntp::{BodyExpectation, Error, Progress};
 
@@ -83,6 +84,7 @@ pub struct Client {
     admitted: Arc<AtomicUsize>,
     foreground: Arc<AtomicUsize>,
     warm_lane: Lane,
+    stages: Arc<StageMetrics>,
 }
 
 fn warm_target(floor: usize, held: usize, total: usize, free: usize, pressure: bool) -> usize {
@@ -159,6 +161,7 @@ impl Client {
             admitted: Arc::default(),
             foreground: Arc::default(),
             warm_lane: Lane::default(),
+            stages: Arc::default(),
         };
         client.replace(providers);
         client
@@ -210,6 +213,11 @@ impl Client {
                 entry.provider.pool.retire();
             }
         }
+    }
+
+    #[must_use]
+    pub fn stream_stages(&self) -> Arc<StageMetrics> {
+        Arc::clone(&self.stages)
     }
 
     /// Sets the [`BodySink`]; only the first call takes effect.
@@ -723,6 +731,9 @@ impl Client {
         }
         validate_message_id(message_id)?;
         let workload = base.workload;
+        if command == Command::Body && matches!(workload, Workload::Stream | Workload::Cache) {
+            base.stages = Some(StageClock::start(&self.stages));
+        }
         let _foreground = (workload == Workload::Stream).then(|| Load::acquire(&self.foreground));
         let _admitted = self.admit(workload).await;
         let providers = self.snapshot();
@@ -797,6 +808,11 @@ impl Client {
                         ..base.clone()
                     };
                     let result = entry.provider.pool.fetch(command, message_id, &tag).await;
+                    if result.is_err()
+                        && let Some(clock) = &mut base.stages
+                    {
+                        clock.resume();
+                    }
                     // No slot in time, or withdrawn while waiting, says nothing about the
                     // provider: the attempt drops unrecorded.
                     if matches!(result, Err(Failure::Request(Error::Unavailable))) {

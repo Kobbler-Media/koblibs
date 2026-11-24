@@ -15,6 +15,9 @@ use crate::vendor::nntp::client::{BodySink, Lane};
 use crate::vendor::nntp::connection::{ConnectionStats, Link, Phase, Timing, validate_message_id};
 use crate::vendor::nntp::downloads::{Downloads, Permit};
 use crate::vendor::nntp::pace::{Flight, Pace};
+use crate::vendor::nntp::stages::{
+    Assigned, ConnectTimes, LoadAtAssign, ReplyTimes, RequestTrace, StageClock,
+};
 use crate::vendor::nntp::stats::{Stats, Workload, outcome};
 use crate::vendor::nntp::{Connection, Endpoint, Error, Progress, Usage};
 
@@ -233,6 +236,15 @@ struct Worker {
     link: Arc<Link>,
 }
 
+/// A connection's sender, load, requests ahead, id, and how long it took if newly opened.
+type Picked = (
+    mpsc::Sender<Request>,
+    Load,
+    usize,
+    u32,
+    Option<ConnectTimes>,
+);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Command {
     Body,
@@ -259,6 +271,8 @@ pub(crate) struct Tag {
     pub(crate) lane: Option<Lane>,
     /// Skips admission and the hold for viewers; see [`Pool::light_worker`].
     pub(crate) light: bool,
+    /// Set on playback and cache-ahead bodies.
+    pub(crate) stages: Option<StageClock>,
 }
 
 impl Tag {
@@ -274,6 +288,7 @@ impl Tag {
         remember: true,
         lane: None,
         light: false,
+        stages: None,
     };
 
     fn step(&self, step: Step) {
@@ -296,6 +311,7 @@ struct Request {
     tag: Tag,
     started: Instant,
     recorded: bool,
+    trace: Option<Box<RequestTrace>>,
     _ticket: Ticket,
 }
 
@@ -312,6 +328,11 @@ impl Request {
             Ok(_) => Outcome::Retrieved,
             Err(error) => outcome(error),
         };
+        if matches!((&ended, &result), (Outcome::Retrieved, Ok(Some(_))))
+            && let Some(trace) = self.trace.take()
+        {
+            trace.delivered(bytes);
+        }
         self.record(ended, bytes, decode);
         if let Some(reply) = reply.filter(|r| !r.is_closed()) {
             let _ = reply.send(result);
@@ -324,6 +345,9 @@ impl Request {
 
     fn record(&mut self, outcome: Outcome, bytes: u32, decode: Duration) {
         self.recorded = true;
+        if let Some(trace) = self.trace.take() {
+            trace.abandoned();
+        }
         if let Some(stats) = &self.tag.stats {
             stats.record(self.tag.workload, outcome, bytes, self.started.elapsed());
         }
@@ -674,6 +698,7 @@ impl Pool {
         tag: &Tag,
     ) -> Result<Option<Body>, Failure> {
         let (mut failed, mut unanswered) = (0, 0);
+        let mut attempt_from = tag.stages.as_ref().map(StageClock::attempt_from);
         let provider = tag.provider;
         let stream = tag.workload == Workload::Stream;
         // Shared by retries; only admission waits spend it, not transfers.
@@ -722,6 +747,7 @@ impl Pool {
                 }
                 .ok_or(Failure::Request(Error::Closed))?
             };
+            let permitted = Instant::now();
             tag.step(Step::Permitted { provider });
             let parked = match tag.workload {
                 Workload::Stream => Some(Load::watched(&self.stream_parked, &self.changed)),
@@ -737,13 +763,14 @@ impl Pool {
                 Flight::default()
             };
             let picked = if tag.light {
-                Some(self.light_worker().await?)
+                let (tx, load, ahead, connection) = self.light_worker().await?;
+                Some((tx, load, ahead, connection, None))
             } else {
                 self.worker(tag.workload, tag.fresh, deadline, lane, &mut flight)
                     .await?
             };
             drop(parked);
-            let Some((tx, load, ahead, connection)) = picked else {
+            let Some((tx, load, ahead, connection, opened)) = picked else {
                 continue;
             };
             // Withdrawn while it waited: someone else asks for the article instead.
@@ -761,6 +788,25 @@ impl Pool {
                 ahead: u16::try_from(ahead).unwrap_or(u16::MAX),
                 connection,
             });
+            let trace = tag
+                .stages
+                .as_ref()
+                .zip(attempt_from)
+                .and_then(|(clock, from)| {
+                    RequestTrace::assign(
+                        clock,
+                        tag.workload,
+                        Assigned {
+                            attempt_from: from,
+                            permitted,
+                            ahead,
+                            connection,
+                            provider,
+                            opened,
+                            load: stream.then(|| self.load_at_assign()),
+                        },
+                    )
+                });
             let ticket = Ticket {
                 _flight: flight,
                 _download: download,
@@ -781,6 +827,7 @@ impl Pool {
                 tag: tag.clone(),
                 started: Instant::now(),
                 recorded: false,
+                trace,
                 _ticket: ticket,
             };
             match dispatch(&tx, request).await {
@@ -798,6 +845,23 @@ impl Pool {
                 None if unanswered < MAX_UNANSWERED => unanswered += 1,
                 None => return Err(Failure::Request(Error::Closed)),
             }
+            attempt_from = tag.stages.is_some().then(Instant::now);
+        }
+    }
+
+    fn load_at_assign(&self) -> LoadAtAssign {
+        let busy_connections = self
+            .lock()
+            .workers
+            .iter()
+            .filter(|w| w.load.load(Ordering::Relaxed) > 0)
+            .count();
+        let (pace_in_flight, pace_bound) = self.pace.during_seek();
+        LoadAtAssign {
+            busy_connections,
+            requests_in_flight: self.busy(),
+            pace_in_flight,
+            pace_bound,
         }
     }
 
@@ -820,7 +884,7 @@ impl Pool {
         deadline: Option<tokio::time::Instant>,
         lane: Option<Lane>,
         flight: &mut Flight,
-    ) -> Result<Option<(mpsc::Sender<Request>, Load, usize, u32)>, Failure> {
+    ) -> Result<Option<Picked>, Failure> {
         let stream = workload == Workload::Stream;
         let outranked = workload.rank().is_some_and(|rank| rank > 0);
         let cached = workload.rank() == Some(0) && lane.is_some();
@@ -1004,6 +1068,7 @@ impl Pool {
                             Load::watched(&w.load, &self.changed),
                             ahead,
                             w.link.id,
+                            None,
                         )));
                     }
                     _ if deadline
@@ -1054,8 +1119,8 @@ impl Pool {
                 } else {
                     open.await
                 };
-                if let Some((tx, load, id)) = opened? {
-                    return Ok(Some((tx, load, 0, id)));
+                if let Some((tx, load, id, times)) = opened? {
+                    return Ok(Some((tx, load, 0, id, Some(times))));
                 }
                 continue;
             }
@@ -1137,7 +1202,7 @@ impl Pool {
                 reserved
             };
             if reserved {
-                if let Some((tx, load, id)) =
+                if let Some((tx, load, id, _)) =
                     self.open(self.connecting(), None, None, false).await?
                 {
                     return Ok((tx, load, 0, id));
@@ -1160,8 +1225,10 @@ impl Pool {
         until: Option<tokio::time::Instant>,
         lane: Option<Lane>,
         cached: bool,
-    ) -> impl Future<Output = Result<Option<(mpsc::Sender<Request>, Load, u32)>, Failure>> + Send + 'static
-    {
+    ) -> impl Future<
+        Output = Result<Option<(mpsc::Sender<Request>, Load, u32, ConnectTimes)>, Failure>,
+    > + Send
+    + 'static {
         let (endpoint, config) = (self.endpoint.clone(), self.config);
         let usage = endpoint.usage().cloned();
         let live = Arc::clone(&self.live);
@@ -1273,6 +1340,7 @@ impl Pool {
                 }
             };
             conn.hold(permit);
+            let times = conn.connect_times();
             let (tx, rx) = mpsc::channel(config.pipeline_depth);
             let load = Arc::new(AtomicUsize::new(0));
             let acquired = Load::watched(&load, &connecting.changed);
@@ -1316,7 +1384,7 @@ impl Pool {
             }
             drop(state);
             drop(connecting);
-            Ok(Some((tx, acquired, id)))
+            Ok(Some((tx, acquired, id, times)))
         }
     }
 
@@ -1518,9 +1586,18 @@ async fn run(
             }
             return;
         }
-        let Some(request) = in_flight.pop_front() else {
+        let written = Instant::now();
+        for request in &mut in_flight {
+            if let Some(trace) = &mut request.trace {
+                trace.written(written);
+            }
+        }
+        let Some(mut request) = in_flight.pop_front() else {
             continue;
         };
+        let head = Instant::now();
+        let mut first_byte = None;
+        let mut read_end = None;
         let provider = request.tag.provider;
         request.tag.step(Step::Reading { provider });
         let abandoned = request
@@ -1533,15 +1610,19 @@ async fn run(
             Phase::Reply
         });
         let result = match request.command {
-            Command::Body => conn
-                .read_body_with(request.tag.progress.as_ref(), request.tag.expected, || {
-                    request.tag.step(Step::Receiving { provider });
-                })
-                .await
-                .and_then(|body| {
+            Command::Body => {
+                let read = conn
+                    .read_body_with(request.tag.progress.as_ref(), request.tag.expected, || {
+                        first_byte = Some(Instant::now());
+                        request.tag.step(Step::Receiving { provider });
+                    })
+                    .await;
+                read_end = Some(Instant::now());
+                read.and_then(|body| {
                     request.tag.expected.validate(&body)?;
                     Ok(Some(body))
-                }),
+                })
+            }
             Command::Stat => conn.read_stat().await.map(|()| None),
         };
         let timing = match request.command {
@@ -1555,6 +1636,17 @@ async fn run(
             && !reusable
         {
             dropped(&host, error, in_flight.len() + rx.len());
+        }
+        if let (Some(trace), Some(first_byte), Some(read_end)) =
+            (&mut request.trace, first_byte, read_end)
+        {
+            trace.replied(ReplyTimes {
+                head,
+                first_byte,
+                read_end,
+                end: Instant::now(),
+                decode: timing.decode,
+            });
         }
         // A dropped receiver means the caller was cancelled; the reply is drained anyway.
         request.answer(result, timing.decode);
@@ -1671,14 +1763,14 @@ mod tests {
         assert_eq!(server.peak_connections(), 0);
         assert_eq!(pool.lock().connecting, 0);
 
-        let Ok(Some((_, load, _, connection))) = pool
+        let Ok(Some((_, load, _, connection, _))) = pool
             .worker(Workload::Stream, false, None, None, &mut Flight::default())
             .await
         else {
             panic!("a connection opens before admission expires");
         };
         drop(load);
-        let Ok(Some((_, load, _, reused))) = pool
+        let Ok(Some((_, load, _, reused, _))) = pool
             .worker(
                 Workload::Stream,
                 false,
@@ -1756,7 +1848,7 @@ mod tests {
             accept,
             pool.worker(Workload::Stream, false, None, None, &mut flight)
         );
-        let Ok(Some((_, load, _, _))) = opened else {
+        let Ok(Some((_, load, _, _, _))) = opened else {
             panic!("the connection opens");
         };
         drop(load);
@@ -1912,7 +2004,7 @@ mod tests {
         let (pool, _server) = loopback_pool(2).await;
         let mut held = Vec::new();
         for _ in 0..2 {
-            let Ok(Some((_, load, _, _))) = pool
+            let Ok(Some((_, load, _, _, _))) = pool
                 .worker(Workload::Queue, false, None, None, &mut Flight::default())
                 .await
             else {
@@ -1935,9 +2027,7 @@ mod tests {
         pool.abort();
     }
 
-    async fn below_viewers(
-        pool: &Pool,
-    ) -> Result<Option<(mpsc::Sender<Request>, Load, usize, u32)>, Failure> {
+    async fn below_viewers(pool: &Pool) -> Result<Option<Picked>, Failure> {
         loop {
             pool.downloads.viewers().clear().await;
             match pool
@@ -1953,7 +2043,7 @@ mod tests {
     async fn saturate(pool: &Pool, workload: Workload, lane: Option<Lane>, n: usize) -> Vec<Load> {
         let mut loads = Vec::new();
         for _ in 0..n {
-            let Ok(Some((_, load, _, _))) = pool
+            let Ok(Some((_, load, _, _, _))) = pool
                 .worker(workload, false, None, lane, &mut Flight::default())
                 .await
             else {
@@ -1982,7 +2072,7 @@ mod tests {
             assert_eq!(pool.lock().workers.len(), opened, "{limit} {workload:?}");
             if workload == Workload::Queue && limit >= CACHE_HEADROOM_MIN_CONNECTIONS {
                 let lane = Some(Lane::reader(1));
-                let Ok(Some((_, cache, ahead, _))) = pool
+                let Ok(Some((_, cache, ahead, _, _))) = pool
                     .worker(Workload::Cache, false, None, lane, &mut Flight::default())
                     .await
                 else {

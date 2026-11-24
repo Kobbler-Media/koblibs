@@ -16,7 +16,7 @@ use crate::providers::Shape;
 use crate::reader::OutputReader;
 use crate::release::{OutputInfo, Release, ReleaseKey};
 use crate::store::{Layout, Store};
-use crate::vendor::nntp::ProviderStats;
+use crate::vendor::nntp::{ProviderStats, StageMetrics};
 use crate::vendor::queue::import::{Error as ImportError, Imported, Progress, Rules, import};
 use crate::vendor::queue::nzb;
 use crate::{Error, ImportMode, Purpose, verify};
@@ -284,6 +284,11 @@ impl Engine {
     #[must_use]
     pub fn stats(&self) -> Vec<ProviderStats> {
         self.providers.client.stats()
+    }
+
+    #[must_use]
+    pub fn stream_stages(&self) -> Arc<StageMetrics> {
+        self.providers.client.stream_stages()
     }
 
     fn known(&self, key: &ReleaseKey) -> Result<Option<Release>, Error> {

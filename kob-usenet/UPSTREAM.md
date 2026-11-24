@@ -70,8 +70,9 @@ which drives upstream's database-backed queue service.
 | 36 | An inspection reports the files the block list dropped, and whether they were all it found | ours, for refusing executable-only releases before download |
 | 37 | Cache-ahead keeps in flight only what fills the link: a byte bound from 20 MiB that grows while it buys throughput, three quarters of it during a seek, at most 16 pipelined requests across the pool, and connections chosen in request order | ours, reworks 34's cache-ahead |
 | 38 | Cache-ahead's in-flight bound grows through a seek while it drains within half a second, so steady seeking cannot pin it below a fast link's bandwidth-delay product nor queue more ahead of a seek on a slow one | ours, reworks 37 |
+| 39 | Playback and cache-ahead requests record per-stage timing, how they got a connection and the pool's load at that moment, with an optional per-request log line; scheduling is unchanged | ours, for production seek diagnosis |
 
-Patches 5–38 are candidates to offer upstream.
+Patches 5–39 are candidates to offer upstream.
 
 ## Monthly sync
 
