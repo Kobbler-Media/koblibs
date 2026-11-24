@@ -71,8 +71,9 @@ which drives upstream's database-backed queue service.
 | 37 | Cache-ahead keeps in flight only what fills the link: a byte bound from 20 MiB that grows while it buys throughput, three quarters of it during a seek, at most 16 pipelined requests across the pool, and connections chosen in request order | ours, reworks 34's cache-ahead |
 | 38 | Cache-ahead's in-flight bound grows through a seek while it drains within half a second, so steady seeking cannot pin it below a fast link's bandwidth-delay product nor queue more ahead of a seek on a slow one | ours, reworks 37 |
 | 39 | Playback and cache-ahead requests record per-stage timing, how they got a connection and the pool's load at that moment, with an optional per-request log line; scheduling is unchanged | ours, for production seek diagnosis |
+| 40 | A seek takes an idle or openable connection instead of pipelining behind abandoned bodies, and an open-ended read fetches 4 MB ahead until 8 MB in order prove it sequential. Cache-ahead no longer yields free connections to a parked seek, and its bound grows on what it keeps in flight during one. Work below viewers runs while none of their requests waits for a connection, one body deep and on at most half the pool beside playback | ours, reworks 34, 37 and 38 |
 
-Patches 5–39 are candidates to offer upstream.
+Patches 5–40 are candidates to offer upstream.
 
 ## Monthly sync
 

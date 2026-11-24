@@ -1,0 +1,733 @@
+From a435953e3dfe44e783e8434bb1777dd3a7131944 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Tue, 24 Nov 2026 11:32:01 +1100
+Subject: [PATCH] A seek takes a free connection, cache-ahead keeps the rest of
+ the line, and downloads use what viewers leave
+
+---
+ crates/nntp/src/pace.rs            |   9 +-
+ crates/nntp/src/pool.rs            | 101 ++++++++++----
+ crates/nntp/src/viewers.rs         |  65 ++++++++-
+ crates/nntp/tests/seek_shape.rs    | 211 +++++++++++++++++++++++++++++
+ crates/stream/src/lib.rs           |  12 ++
+ crates/stream/tests/reader.rs      |  10 +-
+ crates/stream/tests/seek_window.rs |  86 ++++++++++++
+ 7 files changed, 453 insertions(+), 41 deletions(-)
+ create mode 100644 crates/nntp/tests/seek_shape.rs
+ create mode 100644 crates/stream/tests/seek_window.rs
+
+diff --git a/crates/nntp/src/pace.rs b/crates/nntp/src/pace.rs
+index d9eb67d9..f038ab8e 100644
+--- a/crates/nntp/src/pace.rs
++++ b/crates/nntp/src/pace.rs
+@@ -81,7 +81,8 @@ impl Pace {
+             return;
+         }
+         let rate = state.landed as f64 / elapsed.as_secs_f64();
+-        let queued = state.seeking && state.limit as f64 > rate * SEEK_DRAIN_SECS;
++        let seek_limit = state.limit * SEEKING_SHARE / 4;
++        let queued = state.seeking && seek_limit as f64 > rate * SEEK_DRAIN_SECS;
+         if state.bound && !state.settled && !queued {
+             match state.tried {
+                 Some((limit, best)) if rate < best * GAIN => {
+@@ -177,7 +178,11 @@ mod tests {
+ 
+     #[test]
+     fn a_seek_grows_the_bound_only_while_it_drains_quickly() {
+-        for (rate, grown) in [(100 << 20, INITIAL * 3 / 2), (25 << 20, INITIAL)] {
++        for (rate, grown) in [
++            (100 << 20, INITIAL * 3 / 2),
++            (35 << 20, INITIAL * 3 / 2),
++            (25 << 20, INITIAL),
++        ] {
+             let pace = Pace::default();
+             let mut at = pace.lock().window;
+             assert!(!pace.full(true));
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index 6d515cfd..3de766b2 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -55,8 +55,10 @@ const STREAM_SPARE: usize = 4;
+ /// reads from pipelining behind downloads, so without idle connections they wait for
+ /// whole pipelines to drain.
+ const CACHE_SPARE: usize = 4;
+-/// Connections a seek may take from a running cache-ahead, which keeps the rest.
+-const SEEK_CONNECTIONS: usize = 2;
++/// Connections kept idle for seeks beside a cache-ahead, up to a quarter of the limit: a 2 MB
++/// seek is three or four 722 KB articles, and the previous seek's abandoned bodies can still
++/// be draining on as many again.
++const SEEK_CONNECTIONS: usize = 8;
+ /// Cache requests in flight across the pool, at least one per connection: what is pipelined
+ /// on a shared link is what a seek has to wait for.
+ const CACHE_FLIGHT: usize = 16;
+@@ -701,7 +703,7 @@ impl Pool {
+             _ => None,
+         };
+         let viewers = self.downloads.viewers();
+-        let _viewing = matches!(tag.workload, Workload::Stream | Workload::Cache)
++        let mut viewing = matches!(tag.workload, Workload::Stream | Workload::Cache)
+             .then(|| viewers.enter(tag.workload == Workload::Cache));
+         let held_back = !tag.light && tag.workload.rank().is_some_and(|rank| rank > 0);
+         let lane = if stream {
+@@ -765,6 +767,12 @@ impl Pool {
+             let Some((tx, load, ahead, connection, opened)) = picked else {
+                 continue;
+             };
++            if let Some(viewing) = &mut viewing {
++                viewing.set_waiting(false);
++            }
++            if stream {
++                self.keep_warm();
++            }
+             // Withdrawn while it waited: someone else asks for the article instead.
+             if tag
+                 .probe
+@@ -834,6 +842,39 @@ impl Pool {
+                 None => return Err(Failure::Request(Error::Closed)),
+             }
+             attempt_from = tag.stages.is_some().then(Instant::now);
++            if let Some(viewing) = &mut viewing {
++                viewing.set_waiting(true);
++            }
++        }
++    }
++
++    /// Opens connections until a seek's share sits idle, so the next seek skips the
++    /// handshakes, which cost several round trips.
++    fn keep_warm(&self) {
++        let reserved = {
++            let mut state = self.lock();
++            state.workers.retain(|w| !w.tx.is_closed());
++            let open = state.workers.len() + state.connecting;
++            let limit = self.limit(&state);
++            if state.retired || state.held(open).is_some() {
++                return;
++            }
++            let idle = state
++                .workers
++                .iter()
++                .filter(|w| w.load.load(Ordering::Relaxed) == 0)
++                .count();
++            let reserved = seek_connections(limit)
++                .saturating_sub(idle + state.connecting)
++                .min(limit.saturating_sub(open));
++            state.connecting += reserved;
++            reserved
++        };
++        for _ in 0..reserved {
++            let open = self.open(self.connecting(), None, None, false);
++            tokio::spawn(async move {
++                let _ = open.await;
++            });
+         }
+     }
+ 
+@@ -887,7 +928,7 @@ impl Pool {
+             let viewer_arrived = viewers.changed();
+             let mut viewer_arrived = pin!(viewer_arrived);
+             viewer_arrived.as_mut().enable();
+-            if outranked && viewers.holding() {
++            if outranked && viewers.demanded() {
+                 return Ok(None);
+             }
+             // A spent budget still takes a connection that is free right away.
+@@ -924,7 +965,8 @@ impl Pool {
+                                 })
+                         });
+                         let most = seek_connections(limit);
+-                        if reading { most } else { most.min(1) }
++                        let parked = self.stream_parked.load(Ordering::Relaxed);
++                        parked + if reading { most } else { most.min(1) }
+                     }
+                     Some(_) => 1,
+                 };
+@@ -975,13 +1017,20 @@ impl Pool {
+                         usize::from(outranked && limit >= CACHE_HEADROOM_MIN_CONNECTIONS)
+                     };
+                     let busy = state.workers.iter().filter(background).count();
+-                    (
+-                        busy + state.connecting,
+-                        limit.saturating_sub(stream_reserve + cache_reserve),
+-                    )
++                    let room = limit.saturating_sub(stream_reserve + cache_reserve);
++                    // Connections split one line evenly, so a running seek's share of it
++                    // is set by how many flows run beside it.
++                    let room = if outranked && streaming && viewers.holding() {
++                        room.min(limit / 2)
++                    } else {
++                        room
++                    };
++                    (busy + state.connecting, room)
+                 });
+                 // Over its share, background work lets connections drain for playback.
+-                let starved = streaming && self.stream_parked.load(Ordering::Relaxed) > 0
++                let starved = streaming
++                    && workload != Workload::Cache
++                    && self.stream_parked.load(Ordering::Relaxed) > 0
+                     || share.is_some_and(|(busy, room)| busy > room);
+                 // Below cache work, background work lets connections drain for a waiting
+                 // cache request, which never pipelines behind it.
+@@ -990,34 +1039,25 @@ impl Pool {
+                 let spare =
+                     open < limit && !hold_headroom && !capped && !yielding && held.is_none();
+                 let live = !state.workers.is_empty();
+-                // Beside a cache-ahead a seek keeps to its few connections, pipelining on
+-                // them, so the file's sequential fetch never loses more than those.
+-                let seek_capped = stream && viewers.caching() && {
+-                    let most = seek_connections(limit).max(1);
+-                    state
+-                        .workers
+-                        .iter()
+-                        .filter(|w| busy(w) && playing(w))
+-                        .count()
+-                        >= most
++                // What runs beside a viewer stays one body deep, so it drains fast when they
++                // need the line.
++                let room_beside = if outranked && viewers.holding() {
++                    1
++                } else {
++                    self.config.pipeline_depth
+                 };
+                 let cache_room = cache_depth(limit, self.config.pipeline_depth);
+                 let paced = workload == Workload::Cache && self.pace.full(streaming);
+-                let spare = spare && !seek_capped && !paced;
++                let spare = spare && !paced;
+                 let best = state
+                     .workers
+                     .iter()
+-                    .filter(|worker| !seek_capped || (busy(worker) && playing(worker)))
+                     .filter(|_| !paced)
+-                    .filter(|worker| {
+-                        !seek_capped
+-                            || worker.load.load(Ordering::Relaxed) < self.config.pipeline_depth
+-                    })
+                     .filter(|worker| {
+                         let load = worker.load.load(Ordering::Relaxed);
+                         !bounded
+                             || (load == 0 && !capped)
+-                            || (!starved && load < self.config.pipeline_depth && background(worker))
++                            || (!starved && load < room_beside && background(worker))
+                     })
+                     .filter(|_| !yielding)
+                     // A cache reader past a full pipeline parks instead, so work below it
+@@ -1079,7 +1119,8 @@ impl Pool {
+                     _ => false,
+                 };
+                 drop(state);
+-                (reserved, live, held.into_iter().chain(linger).min())
++                let beside = viewers.held_until(now).filter(|_| outranked);
++                (reserved, live, held.into_iter().chain(linger).chain(beside).min())
+             };
+             if reserved {
+                 // Connects run side by side; only choosing a connection is in order.
+@@ -2018,7 +2059,7 @@ mod tests {
+         for (limit, workload, opened) in [
+             (15, Workload::Queue, 14),
+             (16, Workload::Queue, 14),
+-            (16, Workload::Cache, 14),
++            (16, Workload::Cache, 12),
+             (24, Workload::Queue, 22),
+         ] {
+             let (pool, _server) = loopback_pool(limit).await;
+@@ -2051,7 +2092,7 @@ mod tests {
+         // Two download connections sit under the share a cache reader leaves them, with
+         // pipeline room, so only the waiting cache request holds them back.
+         let queue = saturate(&pool, Workload::Queue, None, 2).await;
+-        let cache = saturate(&pool, Workload::Cache, Some(lane), 12).await;
++        let cache = saturate(&pool, Workload::Cache, Some(lane), 10).await;
+         let tag = Tag {
+             workload: Workload::Cache,
+             lane: Some(lane),
+diff --git a/crates/nntp/src/viewers.rs b/crates/nntp/src/viewers.rs
+index d4616c77..fb52adfa 100644
+--- a/crates/nntp/src/viewers.rs
++++ b/crates/nntp/src/viewers.rs
+@@ -1,5 +1,6 @@
+-//! Whether someone is watching: while a playback or cache-ahead request is in flight, and
+-//! shortly after, work below them starts nothing on any provider.
++//! Whether someone is watching, and whether they are waiting: work below playback and
++//! cache-ahead starts nothing while one of their requests has no connection yet, and uses
++//! what they leave free otherwise, so a slow or stalled reader never idles the line.
+ 
+ use std::pin::pin;
+ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+@@ -13,6 +14,8 @@ use crate::pool::STREAM_LINGER;
+ struct Presence {
+     requests: usize,
+     caches: usize,
++    /// Requests without a connection yet.
++    waiting: usize,
+     busy_since: Option<Instant>,
+     until: Option<Instant>,
+ }
+@@ -50,11 +53,13 @@ impl Viewers {
+         }
+         presence.requests += 1;
+         presence.caches += usize::from(cache);
++        presence.waiting += 1;
+         drop(presence);
+         self.changed.notify_waiters();
+         Viewing {
+             viewers: Arc::clone(self),
+             cache,
++            waiting: true,
+         }
+     }
+ 
+@@ -74,6 +79,21 @@ impl Viewers {
+             .map(|until| until.min(longest))
+     }
+ 
++    /// Until when a waiting viewer holds work below; `None` when none waits.
++    fn demand(&self, now: Instant) -> Option<Instant> {
++        let presence = self.lock();
++        let longest = presence.busy_since? + self.max_hold;
++        (presence.waiting > 0 && now < longest).then_some(longest)
++    }
++
++    pub(crate) fn demanded(&self) -> bool {
++        self.demand(Instant::now()).is_some()
++    }
++
++    pub(crate) fn held_until(&self, now: Instant) -> Option<Instant> {
++        self.hold(now)
++    }
++
+     pub(crate) fn holding(&self) -> bool {
+         self.hold(Instant::now()).is_some()
+     }
+@@ -91,7 +111,7 @@ impl Viewers {
+         loop {
+             let mut changed = pin!(self.changed());
+             changed.as_mut().enable();
+-            let Some(until) = self.hold(Instant::now()) else {
++            let Some(until) = self.demand(Instant::now()) else {
+                 return;
+             };
+             let _ = tokio::time::timeout_at(until.into(), changed).await;
+@@ -104,6 +124,24 @@ impl Viewers {
+ pub(crate) struct Viewing {
+     viewers: Arc<Viewers>,
+     cache: bool,
++    waiting: bool,
++}
++
++impl Viewing {
++    pub(crate) fn set_waiting(&mut self, waiting: bool) {
++        if self.waiting == waiting {
++            return;
++        }
++        self.waiting = waiting;
++        let mut presence = self.viewers.lock();
++        if waiting {
++            presence.waiting += 1;
++        } else {
++            presence.waiting -= 1;
++        }
++        drop(presence);
++        self.viewers.changed.notify_waiters();
++    }
+ }
+ 
+ impl Drop for Viewing {
+@@ -112,6 +150,7 @@ impl Drop for Viewing {
+         let mut presence = self.viewers.lock();
+         presence.requests -= 1;
+         presence.caches -= usize::from(self.cache);
++        presence.waiting -= usize::from(self.waiting);
+         if presence.requests == 0 {
+             let burst = presence
+                 .busy_since
+@@ -136,12 +175,26 @@ mod tests {
+         tokio::time::sleep(Duration::from_millis(40)).await;
+         drop(request);
+         assert!(viewers.holding() && !viewers.caching());
+-        tokio::time::timeout(Duration::from_millis(500), viewers.clear())
+-            .await
+-            .expect("a short burst holds work below only briefly");
++        tokio::time::sleep(Duration::from_millis(60)).await;
+         assert!(!viewers.holding());
+     }
+ 
++    #[tokio::test]
++    async fn work_below_waits_only_while_a_viewer_has_no_connection() {
++        let viewers = Arc::new(Viewers::default());
++        let mut request = viewers.enter(true);
++        assert!(viewers.demanded());
++        request.set_waiting(false);
++        assert!(!viewers.demanded() && viewers.holding());
++        tokio::time::timeout(Duration::from_millis(50), viewers.clear())
++            .await
++            .expect("a viewer holding a connection leaves the rest of the line");
++        request.set_waiting(true);
++        assert!(viewers.demanded());
++        drop(request);
++        assert!(!viewers.demanded());
++    }
++
+     #[tokio::test]
+     async fn a_viewer_that_never_stops_cannot_hold_work_below_forever() {
+         let viewers = Arc::new(Viewers {
+diff --git a/crates/nntp/tests/seek_shape.rs b/crates/nntp/tests/seek_shape.rs
+new file mode 100644
+index 00000000..39b32935
+--- /dev/null
++++ b/crates/nntp/tests/seek_shape.rs
+@@ -0,0 +1,211 @@
++#![allow(clippy::unwrap_used)]
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use infinidysk_core::trace::Probe;
++use infinidysk_nntp::{
++    Client, ConnectionRoute, Downloads, Endpoint, Error, Pool, PoolConfig, Provider, StreamStage,
++    TlsMode, Workload, WorkloadStageSnapshot,
++};
++use infinidysk_testkit::{Corpus, LoopbackServer};
++use tokio::sync::oneshot;
++use tokio::task::JoinHandle;
++use tokio::time::timeout;
++
++const ARTICLE: usize = 16 * 1024;
++const PROMPT: Duration = Duration::from_secs(1);
++const CACHE_READER: u64 = 1_000_001;
++const OLD_SEEK: u64 = 1_000_002;
++const NEW_SEEK: u64 = 1_000_003;
++
++struct Shape {
++    client: Arc<Client>,
++    server: LoopbackServer,
++    ids: Vec<String>,
++    releases: Vec<oneshot::Sender<()>>,
++}
++
++impl Shape {
++    async fn new(connections: usize, depth: usize, warm: usize) -> Self {
++        let corpus = Corpus::generate(91, 32, ARTICLE);
++        let server = LoopbackServer::start(corpus.articles.clone()).await.unwrap();
++        let endpoint = Endpoint::new(
++            "127.0.0.1",
++            server.addr().port(),
++            TlsMode::Plain,
++            None,
++            Duration::from_secs(10),
++        )
++        .unwrap();
++        let config = PoolConfig {
++            max_connections: connections,
++            pipeline_depth: depth,
++            idle_timeout: Duration::from_secs(60),
++            min_connections: 0,
++        };
++        let pool = Pool::new(endpoint, config, Downloads::new(connections * depth)).unwrap();
++        let client = Arc::new(Client::new([Provider {
++            pool,
++            key: "loopback".into(),
++            name: "loopback".into(),
++            priority: 0,
++            backbone: None,
++        }]));
++        client.prewarm(warm).await;
++        Self {
++            client,
++            server,
++            ids: corpus.articles.iter().map(|a| a.message_id.clone()).collect(),
++            releases: Vec::new(),
++        }
++    }
++
++    fn read(&self, at: usize, workload: Workload, reader: u64) -> JoinHandle<Result<(), Error>> {
++        let (client, id) = (Arc::clone(&self.client), self.ids[at].clone());
++        tokio::spawn(async move {
++            let probe = probe(reader);
++            client.body(&id, workload, Some(&probe)).await.map(drop)
++        })
++    }
++
++    /// A read whose body the provider sits on, already sent when this returns.
++    async fn held(&mut self, at: usize, workload: Workload, reader: u64) -> JoinHandle<Result<(), Error>> {
++        let (arrived, release) = self.server.hold_article(&self.ids[at]);
++        self.releases.push(release);
++        let read = self.read(at, workload, reader);
++        timeout(PROMPT, arrived).await.unwrap().unwrap();
++        read
++    }
++
++    fn stream(&self) -> WorkloadStageSnapshot {
++        self.client
++            .stream_stages()
++            .snapshot()
++            .into_iter()
++            .find(|s| s.workload == Workload::Stream)
++            .unwrap()
++    }
++
++    fn release(&mut self) {
++        for release in self.releases.drain(..) {
++            let _ = release.send(());
++        }
++    }
++}
++
++fn probe(reader: u64) -> Probe {
++    Probe {
++        trace: None,
++        wait: None,
++        watch: None,
++        segment: 0,
++        hedge: false,
++        size: ARTICLE as u32,
++        reader,
++    }
++}
++
++async fn finishes(read: JoinHandle<Result<(), Error>>, what: &str) {
++    timeout(PROMPT, read)
++        .await
++        .unwrap_or_else(|_| panic!("{what} stayed queued with connections free"))
++        .unwrap()
++        .unwrap();
++}
++
++async fn abandon(read: JoinHandle<Result<(), Error>>) {
++    read.abort();
++    let _ = read.await;
++}
++
++#[tokio::test]
++async fn a_seek_goes_to_a_free_connection_past_the_last_seeks_abandoned_read_ahead() {
++    for warm in [8, 3] {
++        let mut shape = Shape::new(8, 4, warm).await;
++        let cache = shape.held(0, Workload::Cache, CACHE_READER).await;
++        for at in 1..=2 {
++            let stale = shape.held(at, Workload::Stream, OLD_SEEK).await;
++            abandon(stale).await;
++        }
++        let seek = shape.read(3, Workload::Stream, NEW_SEEK);
++        finishes(seek, "the seek").await;
++
++        let stream = shape.stream();
++        assert_eq!(stream.route(ConnectionRoute::Busy), 0, "{warm} warm");
++        assert_eq!(stream.stage(StreamStage::Total).count(), 1);
++        assert!(shape.server.peak_connections() <= 8);
++        shape.release();
++        finishes(cache, "the cache read").await;
++    }
++}
++
++#[tokio::test]
++async fn read_ahead_abandoned_before_it_was_sent_is_never_sent() {
++    let mut shape = Shape::new(1, 4, 1).await;
++    let head = shape.held(0, Workload::Stream, OLD_SEEK).await;
++    let queued = [
++        shape.read(1, Workload::Stream, OLD_SEEK),
++        shape.read(2, Workload::Stream, OLD_SEEK),
++    ];
++    tokio::time::sleep(Duration::from_millis(30)).await;
++    for read in queued {
++        abandon(read).await;
++    }
++    shape.release();
++    finishes(head, "the head read").await;
++    finishes(shape.read(3, Workload::Stream, NEW_SEEK), "the seek").await;
++    assert_eq!(shape.server.body_commands(), 2, "the head and the seek");
++}
++
++#[tokio::test]
++async fn cache_takes_a_free_connection_while_playback_is_busy() {
++    let mut shape = Shape::new(8, 1, 8).await;
++    let cache = shape.held(0, Workload::Cache, CACHE_READER).await;
++    let first = shape.held(1, Workload::Stream, OLD_SEEK).await;
++    let second = shape.held(2, Workload::Stream, OLD_SEEK).await;
++    let third = shape.read(3, Workload::Stream, OLD_SEEK);
++    tokio::time::sleep(Duration::from_millis(30)).await;
++    let more_cache = shape.read(4, Workload::Cache, CACHE_READER);
++    finishes(more_cache, "the cache read").await;
++    finishes(third, "the third playback read").await;
++    shape.release();
++    for read in [cache, first, second] {
++        finishes(read, "a released read").await;
++    }
++}
++
++#[tokio::test]
++async fn a_download_uses_the_line_while_a_cache_reader_is_consumer_limited() {
++    let mut shape = Shape::new(8, 4, 8).await;
++    let cache = shape.held(0, Workload::Cache, CACHE_READER).await;
++    let job = shape.read(1, Workload::Queue, 0);
++    finishes(job, "the download").await;
++    shape.release();
++    finishes(cache, "the cache read").await;
++}
++
++#[tokio::test]
++async fn a_download_uses_the_line_while_playback_trickles() {
++    let mut shape = Shape::new(8, 4, 8).await;
++    let play = shape.held(0, Workload::Stream, OLD_SEEK).await;
++    let job = shape.read(1, Workload::Queue, 0);
++    finishes(job, "the download").await;
++    shape.release();
++    finishes(play, "the playback read").await;
++}
++
++#[tokio::test]
++async fn an_active_stream_keeps_warm_connections_within_the_cap() {
++    for (limit, wanted) in [(3, 1), (8, 3), (16, 5), (49, 9)] {
++        let shape = Shape::new(limit, 4, 0).await;
++        let play = shape.read(0, Workload::Stream, OLD_SEEK);
++        finishes(play, "the playback read").await;
++        let deadline = tokio::time::Instant::now() + PROMPT;
++        while shape.server.open_connections() < wanted && tokio::time::Instant::now() < deadline {
++            tokio::time::sleep(Duration::from_millis(5)).await;
++        }
++        assert_eq!(shape.server.open_connections(), wanted, "limit {limit}");
++        assert!(shape.server.peak_connections() <= limit);
++    }
++}
+diff --git a/crates/stream/src/lib.rs b/crates/stream/src/lib.rs
+index b4b05a46..b383f0f1 100644
+--- a/crates/stream/src/lib.rs
++++ b/crates/stream/src/lib.rs
+@@ -33,6 +33,11 @@ const MIN_INITIAL_AHEAD: usize = 8;
+ const INITIAL_AHEAD_BYTES: u64 = 16 * 1024 * 1024;
+ /// Segments at least this large ramp the window up per segment read.
+ const RAMP_SEGMENT_BYTES: u64 = 1024 * 1024;
++/// Playback fetches this much ahead after opening or a far seek: what it fetches past a
++/// seek's read is abandoned at the next one and still has to drain from its connection.
++const SEEK_AHEAD_BYTES: u64 = 4 << 20;
++/// Bytes read in a row that prove playback sequential, opening the full window.
++const SEQUENTIAL_BYTES: u64 = 8 << 20;
+ /// Reads shorter than this (to end of file) do not prewarm connections.
+ const MIN_PREWARM_BYTES: u64 = 8 * 1024 * 1024;
+ /// A head fetch slower than this multiple of the reader's median fetch time, and at
+@@ -659,6 +664,13 @@ impl SegmentReader {
+             return self.prefetch;
+         }
+         let step = self.layout.segments.first().map_or(1, |s| s.size.max(1));
++        if self.workload == Workload::Stream
++            && (self.consumed as u64).saturating_mul(step) < SEQUENTIAL_BYTES
++        {
++            return usize::try_from((SEEK_AHEAD_BYTES / step).max(2))
++                .unwrap_or(usize::MAX)
++                .min(self.prefetch);
++        }
+         if step >= RAMP_SEGMENT_BYTES {
+             let base = usize::try_from((INITIAL_AHEAD_BYTES / step).max(4))
+                 .unwrap_or(usize::MAX)
+diff --git a/crates/stream/tests/reader.rs b/crates/stream/tests/reader.rs
+index 31c2c70a..ecc6728f 100644
+--- a/crates/stream/tests/reader.rs
++++ b/crates/stream/tests/reader.rs
+@@ -240,9 +240,13 @@ async fn the_window_opens_fully_when_the_reader_keeps_up_with_streaming_bodies()
+     let trace = Arc::new(Trace::new(10_000));
+     let mut reader = SegmentReader::new(client, layout, 32).with_trace(Arc::clone(&trace));
+     reader.read_exact(&mut [0; 10]).await.unwrap();
+-    reader.seek(SeekFrom::Start(SIZE as u64)).await.unwrap();
+-    reader.read_exact(&mut [0; 10]).await.unwrap();
+-    assert_eq!(last_queued(&trace), 32, "segment 1 plus a full window");
++    assert_eq!(last_queued(&trace), 15, "a sixteen-segment opening window");
++    for segment in [8, 16, 24, 32] {
++        let at = u64::try_from(segment * SIZE).unwrap();
++        reader.seek(SeekFrom::Start(at)).await.unwrap();
++        reader.read_exact(&mut [0; 10]).await.unwrap();
++    }
++    assert_eq!(last_queued(&trace), 47, "8 MB read in order opens the full window");
+ }
+ 
+ #[tokio::test]
+diff --git a/crates/stream/tests/seek_window.rs b/crates/stream/tests/seek_window.rs
+new file mode 100644
+index 00000000..ab5ca6a2
+--- /dev/null
++++ b/crates/stream/tests/seek_window.rs
+@@ -0,0 +1,86 @@
++#![allow(clippy::unwrap_used)]
++
++use std::io::SeekFrom;
++use std::sync::Arc;
++use std::time::Duration;
++
++use infinidysk_nntp::{
++    BodyExpectation, Client, Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode,
++};
++use infinidysk_stream::{Layout, Segment, SegmentReader};
++use infinidysk_testkit::{Corpus, LoopbackServer};
++use tokio::io::{AsyncReadExt, AsyncSeekExt};
++
++const ARTICLE: usize = 722 * 1024;
++const ARTICLES: usize = 48;
++const PREFETCH: usize = 44;
++const SEEK_READ: usize = 2 << 20;
++
++async fn reader() -> (SegmentReader, LoopbackServer) {
++    let corpus = Corpus::generate(92, ARTICLES, ARTICLE);
++    let server = LoopbackServer::start(corpus.articles.clone()).await.unwrap();
++    let endpoint = Endpoint::new(
++        "127.0.0.1",
++        server.addr().port(),
++        TlsMode::Plain,
++        None,
++        Duration::from_secs(10),
++    )
++    .unwrap();
++    let config = PoolConfig {
++        max_connections: 16,
++        pipeline_depth: 4,
++        idle_timeout: Duration::from_secs(60),
++        min_connections: 0,
++    };
++    let pool = Pool::new(endpoint, config, Downloads::new(64)).unwrap();
++    let client = Arc::new(Client::new([Provider {
++        pool,
++        key: "loopback".into(),
++        name: "loopback".into(),
++        priority: 0,
++        backbone: None,
++    }]));
++    let layout = Arc::new(Layout::new(
++        corpus
++            .articles
++            .iter()
++            .map(|a| Segment {
++                message_id: a.message_id.clone(),
++                size: ARTICLE as u64,
++                expected: BodyExpectation::NONE,
++            })
++            .collect(),
++    ));
++    (SegmentReader::new(client, layout, PREFETCH), server)
++}
++
++async fn settled(server: &LoopbackServer) -> usize {
++    let mut seen = server.body_commands();
++    loop {
++        tokio::time::sleep(Duration::from_millis(60)).await;
++        let now = server.body_commands();
++        if now == seen {
++            return now;
++        }
++        seen = now;
++    }
++}
++
++#[tokio::test]
++async fn a_seek_fetches_little_past_what_it_reads_until_the_reader_proves_sequential() {
++    let (mut reader, server) = reader().await;
++    reader
++        .seek(SeekFrom::Start(10 * ARTICLE as u64))
++        .await
++        .unwrap();
++    let mut buf = vec![0; SEEK_READ];
++    reader.read_exact(&mut buf).await.unwrap();
++    let fetched = settled(&server).await;
++    assert!(fetched <= 8, "a 2 MB seek asked for {fetched} articles");
++
++    let mut rest = vec![0; 16 << 20];
++    reader.read_exact(&mut rest).await.unwrap();
++    let fetched = settled(&server).await;
++    assert!(fetched >= ARTICLES - 12, "sequential reading opened only {fetched}");
++}
+-- 
+2.56.1
+

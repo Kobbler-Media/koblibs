@@ -31,7 +31,7 @@ async fn finishes(engine: &Engine) -> Duration {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn continuous_playback_holds_the_download_until_it_stops() {
+async fn slow_continuous_playback_leaves_the_spare_line_to_the_download() {
     let _serial = crate::rig::serial().await;
     let rig = Loaded::new(post(
         "film",
@@ -76,8 +76,8 @@ async fn continuous_playback_holds_the_download_until_it_stops() {
     done.store(true, Ordering::Relaxed);
     player.await.unwrap();
     assert!(
-        during <= (CONNECTIONS * ARTICLE) as u64,
-        "the download moved {during} bytes during playback"
+        during > (CONNECTIONS * ARTICLE) as u64,
+        "the download moved only {during} bytes beside a 5 Mbit/s player"
     );
     finishes(&engine).await;
 }

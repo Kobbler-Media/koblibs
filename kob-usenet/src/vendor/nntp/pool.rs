@@ -57,8 +57,10 @@ const STREAM_SPARE: usize = 4;
 /// reads from pipelining behind downloads, so without idle connections they wait for
 /// whole pipelines to drain.
 const CACHE_SPARE: usize = 4;
-/// Connections a seek may take from a running cache-ahead, which keeps the rest.
-const SEEK_CONNECTIONS: usize = 2;
+/// Connections kept idle for seeks beside a cache-ahead, up to a quarter of the limit: a 2 MB
+/// seek is three or four 722 KB articles, and the previous seek's abandoned bodies can still
+/// be draining on as many again.
+const SEEK_CONNECTIONS: usize = 8;
 /// Cache requests in flight across the pool, at least one per connection: what is pipelined
 /// on a shared link is what a seek has to wait for.
 const CACHE_FLIGHT: usize = 16;
@@ -709,7 +711,7 @@ impl Pool {
             _ => None,
         };
         let viewers = self.downloads.viewers();
-        let _viewing = matches!(tag.workload, Workload::Stream | Workload::Cache)
+        let mut viewing = matches!(tag.workload, Workload::Stream | Workload::Cache)
             .then(|| viewers.enter(tag.workload == Workload::Cache));
         let held_back = !tag.light && tag.workload.rank().is_some_and(|rank| rank > 0);
         let lane = if stream {
@@ -773,6 +775,12 @@ impl Pool {
             let Some((tx, load, ahead, connection, opened)) = picked else {
                 continue;
             };
+            if let Some(viewing) = &mut viewing {
+                viewing.set_waiting(false);
+            }
+            if stream {
+                self.keep_warm();
+            }
             // Withdrawn while it waited: someone else asks for the article instead.
             if tag
                 .probe
@@ -846,6 +854,39 @@ impl Pool {
                 None => return Err(Failure::Request(Error::Closed)),
             }
             attempt_from = tag.stages.is_some().then(Instant::now);
+            if let Some(viewing) = &mut viewing {
+                viewing.set_waiting(true);
+            }
+        }
+    }
+
+    /// Opens connections until a seek's share sits idle, so the next seek skips the
+    /// handshakes, which cost several round trips.
+    fn keep_warm(&self) {
+        let reserved = {
+            let mut state = self.lock();
+            state.workers.retain(|w| !w.tx.is_closed());
+            let open = state.workers.len() + state.connecting;
+            let limit = self.limit(&state);
+            if state.retired || state.held(open).is_some() {
+                return;
+            }
+            let idle = state
+                .workers
+                .iter()
+                .filter(|w| w.load.load(Ordering::Relaxed) == 0)
+                .count();
+            let reserved = seek_connections(limit)
+                .saturating_sub(idle + state.connecting)
+                .min(limit.saturating_sub(open));
+            state.connecting += reserved;
+            reserved
+        };
+        for _ in 0..reserved {
+            let open = self.open(self.connecting(), None, None, false);
+            tokio::spawn(async move {
+                let _ = open.await;
+            });
         }
     }
 
@@ -899,7 +940,7 @@ impl Pool {
             let viewer_arrived = viewers.changed();
             let mut viewer_arrived = pin!(viewer_arrived);
             viewer_arrived.as_mut().enable();
-            if outranked && viewers.holding() {
+            if outranked && viewers.demanded() {
                 return Ok(None);
             }
             // A spent budget still takes a connection that is free right away.
@@ -937,7 +978,8 @@ impl Pool {
                                     })
                             });
                         let most = seek_connections(limit);
-                        if reading { most } else { most.min(1) }
+                        let parked = self.stream_parked.load(Ordering::Relaxed);
+                        parked + if reading { most } else { most.min(1) }
                     }
                     Some(_) => 1,
                 };
@@ -988,13 +1030,20 @@ impl Pool {
                         usize::from(outranked && limit >= CACHE_HEADROOM_MIN_CONNECTIONS)
                     };
                     let busy = state.workers.iter().filter(background).count();
-                    (
-                        busy + state.connecting,
-                        limit.saturating_sub(stream_reserve + cache_reserve),
-                    )
+                    let room = limit.saturating_sub(stream_reserve + cache_reserve);
+                    // Connections split one line evenly, so a running seek's share of it
+                    // is set by how many flows run beside it.
+                    let room = if outranked && streaming && viewers.holding() {
+                        room.min(limit / 2)
+                    } else {
+                        room
+                    };
+                    (busy + state.connecting, room)
                 });
                 // Over its share, background work lets connections drain for playback.
-                let starved = streaming && self.stream_parked.load(Ordering::Relaxed) > 0
+                let starved = streaming
+                    && workload != Workload::Cache
+                    && self.stream_parked.load(Ordering::Relaxed) > 0
                     || share.is_some_and(|(busy, room)| busy > room);
                 // Below cache work, background work lets connections drain for a waiting
                 // cache request, which never pipelines behind it.
@@ -1003,34 +1052,25 @@ impl Pool {
                 let spare =
                     open < limit && !hold_headroom && !capped && !yielding && held.is_none();
                 let live = !state.workers.is_empty();
-                // Beside a cache-ahead a seek keeps to its few connections, pipelining on
-                // them, so the file's sequential fetch never loses more than those.
-                let seek_capped = stream && viewers.caching() && {
-                    let most = seek_connections(limit).max(1);
-                    state
-                        .workers
-                        .iter()
-                        .filter(|w| busy(w) && playing(w))
-                        .count()
-                        >= most
+                // What runs beside a viewer stays one body deep, so it drains fast when they
+                // need the line.
+                let room_beside = if outranked && viewers.holding() {
+                    1
+                } else {
+                    self.config.pipeline_depth
                 };
                 let cache_room = cache_depth(limit, self.config.pipeline_depth);
                 let paced = workload == Workload::Cache && self.pace.full(streaming);
-                let spare = spare && !seek_capped && !paced;
+                let spare = spare && !paced;
                 let best = state
                     .workers
                     .iter()
-                    .filter(|worker| !seek_capped || (busy(worker) && playing(worker)))
                     .filter(|_| !paced)
-                    .filter(|worker| {
-                        !seek_capped
-                            || worker.load.load(Ordering::Relaxed) < self.config.pipeline_depth
-                    })
                     .filter(|worker| {
                         let load = worker.load.load(Ordering::Relaxed);
                         !bounded
                             || (load == 0 && !capped)
-                            || (!starved && load < self.config.pipeline_depth && background(worker))
+                            || (!starved && load < room_beside && background(worker))
                     })
                     .filter(|_| !yielding)
                     // A cache reader past a full pipeline parks instead, so work below it
@@ -1092,7 +1132,12 @@ impl Pool {
                     _ => false,
                 };
                 drop(state);
-                (reserved, live, held.into_iter().chain(linger).min())
+                let beside = viewers.held_until(now).filter(|_| outranked);
+                (
+                    reserved,
+                    live,
+                    held.into_iter().chain(linger).chain(beside).min(),
+                )
             };
             if reserved {
                 // Connects run side by side; only choosing a connection is in order.
@@ -2059,7 +2104,7 @@ mod tests {
         for (limit, workload, opened) in [
             (15, Workload::Queue, 14),
             (16, Workload::Queue, 14),
-            (16, Workload::Cache, 14),
+            (16, Workload::Cache, 12),
             (24, Workload::Queue, 22),
         ] {
             let (pool, _server) = loopback_pool(limit).await;
@@ -2093,7 +2138,7 @@ mod tests {
         // Two download connections sit under the share a cache reader leaves them, with
         // pipeline room, so only the waiting cache request holds them back.
         let queue = saturate(&pool, Workload::Queue, None, 2).await;
-        let cache = saturate(&pool, Workload::Cache, Some(lane), 12).await;
+        let cache = saturate(&pool, Workload::Cache, Some(lane), 10).await;
         let tag = Tag {
             workload: Workload::Cache,
             lane: Some(lane),

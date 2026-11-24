@@ -33,6 +33,11 @@ const MIN_INITIAL_AHEAD: usize = 8;
 const INITIAL_AHEAD_BYTES: u64 = 16 * 1024 * 1024;
 /// Segments at least this large ramp the window up per segment read.
 const RAMP_SEGMENT_BYTES: u64 = 1024 * 1024;
+/// Playback fetches this much ahead after opening or a far seek: what it fetches past a
+/// seek's read is abandoned at the next one and still has to drain from its connection.
+const SEEK_AHEAD_BYTES: u64 = 4 << 20;
+/// Bytes read in a row that prove playback sequential, opening the full window.
+const SEQUENTIAL_BYTES: u64 = 8 << 20;
 /// Reads shorter than this (to end of file) do not prewarm connections.
 const MIN_PREWARM_BYTES: u64 = 8 * 1024 * 1024;
 /// A head fetch slower than this multiple of the reader's median fetch time, and at
@@ -659,6 +664,13 @@ impl SegmentReader {
             return self.prefetch;
         }
         let step = self.layout.segments.first().map_or(1, |s| s.size.max(1));
+        if self.workload == Workload::Stream
+            && (self.consumed as u64).saturating_mul(step) < SEQUENTIAL_BYTES
+        {
+            return usize::try_from((SEEK_AHEAD_BYTES / step).max(2))
+                .unwrap_or(usize::MAX)
+                .min(self.prefetch);
+        }
         if step >= RAMP_SEGMENT_BYTES {
             let base = usize::try_from((INITIAL_AHEAD_BYTES / step).max(4))
                 .unwrap_or(usize::MAX)

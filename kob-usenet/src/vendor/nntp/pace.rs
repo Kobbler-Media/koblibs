@@ -85,7 +85,8 @@ impl Pace {
             return;
         }
         let rate = state.landed as f64 / elapsed.as_secs_f64();
-        let queued = state.seeking && state.limit as f64 > rate * SEEK_DRAIN_SECS;
+        let seek_limit = state.limit * SEEKING_SHARE / 4;
+        let queued = state.seeking && seek_limit as f64 > rate * SEEK_DRAIN_SECS;
         if state.bound && !state.settled && !queued {
             match state.tried {
                 Some((limit, best)) if rate < best * GAIN => {
@@ -184,7 +185,11 @@ mod tests {
 
     #[test]
     fn a_seek_grows_the_bound_only_while_it_drains_quickly() {
-        for (rate, grown) in [(100 << 20, INITIAL * 3 / 2), (25 << 20, INITIAL)] {
+        for (rate, grown) in [
+            (100 << 20, INITIAL * 3 / 2),
+            (35 << 20, INITIAL * 3 / 2),
+            (25 << 20, INITIAL),
+        ] {
             let pace = Pace::default();
             let mut at = pace.lock().window;
             assert!(!pace.full(true));

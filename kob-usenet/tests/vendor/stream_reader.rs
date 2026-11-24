@@ -240,9 +240,17 @@ async fn the_window_opens_fully_when_the_reader_keeps_up_with_streaming_bodies()
     let trace = Arc::new(Trace::new(10_000));
     let mut reader = SegmentReader::new(client, layout, 32).with_trace(Arc::clone(&trace));
     reader.read_exact(&mut [0; 10]).await.unwrap();
-    reader.seek(SeekFrom::Start(SIZE as u64)).await.unwrap();
-    reader.read_exact(&mut [0; 10]).await.unwrap();
-    assert_eq!(last_queued(&trace), 32, "segment 1 plus a full window");
+    assert_eq!(last_queued(&trace), 15, "a sixteen-segment opening window");
+    for segment in [8, 16, 24, 32] {
+        let at = u64::try_from(segment * SIZE).unwrap();
+        reader.seek(SeekFrom::Start(at)).await.unwrap();
+        reader.read_exact(&mut [0; 10]).await.unwrap();
+    }
+    assert_eq!(
+        last_queued(&trace),
+        47,
+        "8 MB read in order opens the full window"
+    );
 }
 
 #[tokio::test]
