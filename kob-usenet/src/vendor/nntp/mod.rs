@@ -7,6 +7,7 @@ mod client;
 mod connection;
 mod downloads;
 mod keep_warm;
+mod lines;
 mod missing;
 mod pace;
 pub mod patch;

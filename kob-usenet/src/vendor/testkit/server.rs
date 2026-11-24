@@ -77,9 +77,11 @@ type Stalls = Arc<Mutex<HashMap<String, (usize, Duration, usize)>>>;
 struct HeldBody {
     arrived: oneshot::Sender<()>,
     release: oneshot::Receiver<()>,
+    /// Body bytes sent before holding; `None` holds the status line too.
+    after: Option<usize>,
 }
 
-type Holds = Arc<Mutex<HashMap<String, HeldBody>>>;
+type Holds = Arc<Mutex<HashMap<String, Vec<HeldBody>>>>;
 
 #[derive(Clone)]
 struct Acceptor {
@@ -333,19 +335,38 @@ impl LoopbackServer {
 
     /// Holds the next BODY reply until released; returns its arrival and release signals.
     pub fn hold_article(&self, message_id: &str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        self.hold(message_id, None)
+    }
+
+    /// Sends the next BODY reply's status line and its first `bytes` body bytes, then
+    /// holds the rest until released; returns its arrival and release signals. Holds
+    /// placed before that reply all apply to it, in order of `bytes`.
+    pub fn hold_article_after(
+        &self,
+        message_id: &str,
+        bytes: usize,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        self.hold(message_id, Some(bytes))
+    }
+
+    fn hold(
+        &self,
+        message_id: &str,
+        after: Option<usize>,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (arrived, arrival) = oneshot::channel();
         let (release, released) = oneshot::channel();
         self.acceptor
             .holds
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                message_id.to_owned(),
-                HeldBody {
-                    arrived,
-                    release: released,
-                },
-            );
+            .entry(message_id.to_owned())
+            .or_default()
+            .push(HeldBody {
+                arrived,
+                release: released,
+                after,
+            });
         (arrival, release)
     }
 
@@ -491,15 +512,19 @@ async fn serve<S: AsyncRead + AsyncWrite>(
                 }
                 delay(impairment.response_delay).await;
                 let id = arg.trim().trim_start_matches('<').trim_end_matches('>');
-                let hold = limit
+                let (before, mut midway): (Vec<_>, Vec<_>) = limit
                     .holds
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .remove(id);
-                if let Some(hold) = hold {
+                    .remove(id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .partition(|hold| hold.after.is_none());
+                for hold in before {
                     let _ = hold.arrived.send(());
                     let _ = hold.release.await;
                 }
+                midway.sort_by_key(|hold| hold.after);
                 let held = limit
                     .stalls
                     .lock()
@@ -519,6 +544,16 @@ async fn serve<S: AsyncRead + AsyncWrite>(
                         .write_all(format!("222 0 <{id}> body follows\r\n").as_bytes())
                         .await?;
                     let mut wire = wire.as_slice();
+                    let mut sent = 0;
+                    for hold in midway {
+                        let at = hold.after.unwrap_or(0).clamp(sent, sent + wire.len());
+                        let (head, tail) = wire.split_at(at - sent);
+                        write.write_all(head).await?;
+                        write.flush().await?;
+                        let _ = hold.arrived.send(());
+                        let _ = hold.release.await;
+                        (wire, sent) = (tail, at);
+                    }
                     if let Some((_, duration, true)) = stall {
                         let (head, tail) = wire.split_at(wire.len() / 2);
                         write.write_all(head).await?;

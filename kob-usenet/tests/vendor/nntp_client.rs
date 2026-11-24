@@ -435,6 +435,7 @@ async fn another_files_first_part_fails_over_before_any_byte_streams() {
     let progress = Progress {
         tx,
         wanted: Arc::new(AtomicBool::new(true)),
+        strict: false,
     };
 
     let result = only_wrong
@@ -607,6 +608,7 @@ async fn check_identity(chunks: Vec<Vec<u8>>, data: &[u8], begin: u64, wrong: u6
     let progress = Progress {
         tx,
         wanted: Arc::new(AtomicBool::new(true)),
+        strict: false,
     };
     let fetch = |begin| {
         client.body_with(
@@ -723,6 +725,7 @@ async fn progress_copies_nothing_until_wanted_then_sends_from_the_start() {
     let progress = Progress {
         tx,
         wanted: Arc::new(AtomicBool::new(false)),
+        strict: false,
     };
     let id = &corpus.articles[0].message_id;
 

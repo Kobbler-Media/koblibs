@@ -21,7 +21,9 @@
 //! whose segments may have an empty id (an article the NZB never listed), so older readers
 //! refuse it instead of asking providers for ""; 4 = (v2 metadata, recovery-set IDs), with
 //! one optional ID per source file/volume; 5 = (v4, posted sizes), with one
-//! [`Segments::posted_size`](crate::vendor::core::Segments::posted_size) per source file/volume. Writers
+//! [`Segments::posted_size`](crate::vendor::core::Segments::posted_size) per source file/volume; 6 = (v5,
+//! name CRCs), with one [`Segments::name_crc`](crate::vendor::core::Segments::name_crc) per source
+//! file/volume. Writers
 //! emit the lowest version that holds the data, so files without newer features stay
 //! readable by older readers.
 
@@ -33,7 +35,7 @@ use crate::vendor::core::{FileMeta, FilePart, MultipartFile, NzbFile};
 const MAGIC: &[u8; 3] = b"IDB";
 const HEADER_LEN: usize = 6;
 /// Current metadata layout.
-pub const META_VERSION: u16 = 5;
+pub const META_VERSION: u16 = 6;
 /// Current NZB layout.
 pub const NZB_VERSION: u16 = 1;
 const ZSTD_LEVEL: i32 = 3;
@@ -131,6 +133,17 @@ pub fn encode_meta(meta: &FileMeta) -> Result<Vec<u8>, Error> {
         FileMeta::Nzb(file) => vec![file.segments.posted_size],
         FileMeta::Multipart(file) => file.parts.iter().map(|p| p.segments.posted_size).collect(),
     };
+    let names: Vec<_> = match meta {
+        FileMeta::Nzb(file) => vec![file.segments.name_crc],
+        FileMeta::Multipart(file) => file.parts.iter().map(|p| p.segments.name_crc).collect(),
+    };
+    if names.iter().any(Option::is_some) {
+        return encode(
+            Kind::Meta,
+            6,
+            &postcard::to_stdvec(&(meta, sets, posted, names))?,
+        );
+    }
     if posted.iter().any(Option::is_some) {
         return encode(Kind::Meta, 5, &postcard::to_stdvec(&(meta, sets, posted))?);
     }
@@ -178,18 +191,22 @@ pub fn decode_meta_limited(bytes: &[u8], limit: usize) -> Result<FileMeta, Error
             let (mut meta, sets, posted): (FileMeta, Vec<Option<[u8; 16]>>, Vec<Option<u64>>) =
                 postcard::from_bytes(&payload)?;
             apply_sets(&mut meta, sets)?;
-            let segments: Vec<_> = match &mut meta {
-                FileMeta::Nzb(file) => vec![&mut file.segments],
-                FileMeta::Multipart(file) => {
-                    file.parts.iter_mut().map(|p| &mut p.segments).collect()
-                }
-            };
-            if segments.len() != posted.len() {
+            apply_posted(&mut meta, posted, Vec::new())?;
+            Ok(meta)
+        }
+        6 => {
+            type V6 = (
+                FileMeta,
+                Vec<Option<[u8; 16]>>,
+                Vec<Option<u64>>,
+                Vec<Option<u32>>,
+            );
+            let (mut meta, sets, posted, names): V6 = postcard::from_bytes(&payload)?;
+            if names.len() != posted.len() {
                 return Err(Error::PostedSizes);
             }
-            for (segments, posted) in segments.into_iter().zip(posted) {
-                segments.posted_size = posted;
-            }
+            apply_sets(&mut meta, sets)?;
+            apply_posted(&mut meta, posted, names)?;
             Ok(meta)
         }
         version => Err(Error::UnsupportedVersion {
@@ -197,6 +214,27 @@ pub fn decode_meta_limited(bytes: &[u8], limit: usize) -> Result<FileMeta, Error
             version,
         }),
     }
+}
+
+/// Sets each source's posted size and, when `names` is not empty, its name CRC.
+fn apply_posted(
+    meta: &mut FileMeta,
+    posted: Vec<Option<u64>>,
+    names: Vec<Option<u32>>,
+) -> Result<(), Error> {
+    let segments: Vec<_> = match meta {
+        FileMeta::Nzb(file) => vec![&mut file.segments],
+        FileMeta::Multipart(file) => file.parts.iter_mut().map(|p| &mut p.segments).collect(),
+    };
+    if segments.len() != posted.len() {
+        return Err(Error::PostedSizes);
+    }
+    let names = names.into_iter().chain(std::iter::repeat(None));
+    for ((segments, posted), name) in segments.into_iter().zip(posted).zip(names) {
+        segments.posted_size = posted;
+        segments.name_crc = name;
+    }
+    Ok(())
 }
 
 fn apply_sets(meta: &mut FileMeta, sets: Vec<Option<[u8; 16]>>) -> Result<(), Error> {
@@ -279,6 +317,7 @@ mod tests {
             missing: vec![2],
             corrupt: vec![],
             posted_size: None,
+            name_crc: None,
         }
     }
 
@@ -480,6 +519,43 @@ mod tests {
         for meta in metas {
             let bytes = encode_meta(&meta).unwrap();
             assert_eq!(Blob::parse(&bytes).unwrap().version, 5);
+            assert_eq!(decode_meta(&bytes).unwrap(), meta);
+        }
+    }
+
+    #[test]
+    fn a_name_crc_survives_only_in_version_6() {
+        let mut named = segments(2);
+        named.name_crc = Some(0xDEAD_BEEF);
+        named.posted_size = Some(1_000_000);
+        let metas = [
+            FileMeta::Nzb(NzbFile {
+                segments: named.clone(),
+                proof: None,
+            }),
+            FileMeta::Multipart(MultipartFile {
+                parts: vec![
+                    FilePart {
+                        segments: segments(1),
+                        offset: 0,
+                        data: ByteRange { start: 0, end: 10 },
+                        split_after: true,
+                        proof: None,
+                    },
+                    FilePart {
+                        segments: named,
+                        offset: 0,
+                        data: ByteRange { start: 0, end: 10 },
+                        split_after: false,
+                        proof: None,
+                    },
+                ],
+                crypt: None,
+            }),
+        ];
+        for meta in metas {
+            let bytes = encode_meta(&meta).unwrap();
+            assert_eq!(Blob::parse(&bytes).unwrap().version, 6);
             assert_eq!(decode_meta(&bytes).unwrap(), meta);
         }
     }

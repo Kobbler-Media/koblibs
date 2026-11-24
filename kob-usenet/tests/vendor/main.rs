@@ -17,3 +17,4 @@ mod queue_nzb;
 mod stream_fairness;
 mod stream_reader;
 mod stream_seek_window;
+mod stream_unverified;

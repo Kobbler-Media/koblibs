@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 const TTL: Duration = Duration::from_secs(300);
+/// The group for articles that must not stream; not a provider key.
+pub(crate) const UNSTREAMABLE: &str = "";
 const MAX_ENTRIES: usize = 10_000;
 
 #[derive(Default)]

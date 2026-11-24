@@ -1,0 +1,330 @@
+From d1bcb42f06e827284b25b21f71cc3cebd5610e67 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Tue, 24 Nov 2026 16:25:22 +1100
+Subject: [PATCH 50/51] Imports record each posted file's yEnc name as a CRC
+ (blob version 6)
+
+---
+ crates/core/src/blob.rs             | 100 ++++++++++++++++++++++++----
+ crates/core/src/meta.rs             |   3 +
+ crates/import/src/apply.rs          |   1 +
+ crates/import/src/legacy_repairs.rs |   1 +
+ crates/nntp/src/article.rs          |  13 ++++
+ crates/nntp/src/connection.rs       |   8 ++-
+ crates/nntp/src/patch/mod.rs        |   1 +
+ crates/queue/src/import.rs          |   3 +
+ 8 files changed, 116 insertions(+), 14 deletions(-)
+
+diff --git a/crates/core/src/blob.rs b/crates/core/src/blob.rs
+index faf23eda..eae56e12 100644
+--- a/crates/core/src/blob.rs
++++ b/crates/core/src/blob.rs
+@@ -21,7 +21,9 @@
+ //! whose segments may have an empty id (an article the NZB never listed), so older readers
+ //! refuse it instead of asking providers for ""; 4 = (v2 metadata, recovery-set IDs), with
+ //! one optional ID per source file/volume; 5 = (v4, posted sizes), with one
+-//! [`Segments::posted_size`](crate::Segments::posted_size) per source file/volume. Writers
++//! [`Segments::posted_size`](crate::Segments::posted_size) per source file/volume; 6 = (v5,
++//! name CRCs), with one [`Segments::name_crc`](crate::Segments::name_crc) per source
++//! file/volume. Writers
+ //! emit the lowest version that holds the data, so files without newer features stay
+ //! readable by older readers.
+ 
+@@ -33,7 +35,7 @@ use crate::{FileMeta, FilePart, MultipartFile, NzbFile};
+ const MAGIC: &[u8; 3] = b"IDB";
+ const HEADER_LEN: usize = 6;
+ /// Current metadata layout.
+-pub const META_VERSION: u16 = 5;
++pub const META_VERSION: u16 = 6;
+ /// Current NZB layout.
+ pub const NZB_VERSION: u16 = 1;
+ const ZSTD_LEVEL: i32 = 3;
+@@ -131,6 +133,17 @@ pub fn encode_meta(meta: &FileMeta) -> Result<Vec<u8>, Error> {
+         FileMeta::Nzb(file) => vec![file.segments.posted_size],
+         FileMeta::Multipart(file) => file.parts.iter().map(|p| p.segments.posted_size).collect(),
+     };
++    let names: Vec<_> = match meta {
++        FileMeta::Nzb(file) => vec![file.segments.name_crc],
++        FileMeta::Multipart(file) => file.parts.iter().map(|p| p.segments.name_crc).collect(),
++    };
++    if names.iter().any(Option::is_some) {
++        return encode(
++            Kind::Meta,
++            6,
++            &postcard::to_stdvec(&(meta, sets, posted, names))?,
++        );
++    }
+     if posted.iter().any(Option::is_some) {
+         return encode(Kind::Meta, 5, &postcard::to_stdvec(&(meta, sets, posted))?);
+     }
+@@ -178,18 +191,22 @@ pub fn decode_meta_limited(bytes: &[u8], limit: usize) -> Result<FileMeta, Error
+             let (mut meta, sets, posted): (FileMeta, Vec<Option<[u8; 16]>>, Vec<Option<u64>>) =
+                 postcard::from_bytes(&payload)?;
+             apply_sets(&mut meta, sets)?;
+-            let segments: Vec<_> = match &mut meta {
+-                FileMeta::Nzb(file) => vec![&mut file.segments],
+-                FileMeta::Multipart(file) => {
+-                    file.parts.iter_mut().map(|p| &mut p.segments).collect()
+-                }
+-            };
+-            if segments.len() != posted.len() {
++            apply_posted(&mut meta, posted, Vec::new())?;
++            Ok(meta)
++        }
++        6 => {
++            type V6 = (
++                FileMeta,
++                Vec<Option<[u8; 16]>>,
++                Vec<Option<u64>>,
++                Vec<Option<u32>>,
++            );
++            let (mut meta, sets, posted, names): V6 = postcard::from_bytes(&payload)?;
++            if names.len() != posted.len() {
+                 return Err(Error::PostedSizes);
+             }
+-            for (segments, posted) in segments.into_iter().zip(posted) {
+-                segments.posted_size = posted;
+-            }
++            apply_sets(&mut meta, sets)?;
++            apply_posted(&mut meta, posted, names)?;
+             Ok(meta)
+         }
+         version => Err(Error::UnsupportedVersion {
+@@ -199,6 +216,27 @@ pub fn decode_meta_limited(bytes: &[u8], limit: usize) -> Result<FileMeta, Error
+     }
+ }
+ 
++/// Sets each source's posted size and, when `names` is not empty, its name CRC.
++fn apply_posted(
++    meta: &mut FileMeta,
++    posted: Vec<Option<u64>>,
++    names: Vec<Option<u32>>,
++) -> Result<(), Error> {
++    let segments: Vec<_> = match meta {
++        FileMeta::Nzb(file) => vec![&mut file.segments],
++        FileMeta::Multipart(file) => file.parts.iter_mut().map(|p| &mut p.segments).collect(),
++    };
++    if segments.len() != posted.len() {
++        return Err(Error::PostedSizes);
++    }
++    let names = names.into_iter().chain(std::iter::repeat(None));
++    for ((segments, posted), name) in segments.into_iter().zip(posted).zip(names) {
++        segments.posted_size = posted;
++        segments.name_crc = name;
++    }
++    Ok(())
++}
++
+ fn apply_sets(meta: &mut FileMeta, sets: Vec<Option<[u8; 16]>>) -> Result<(), Error> {
+     let proofs: Vec<_> = match meta {
+         FileMeta::Nzb(file) => vec![&mut file.proof],
+@@ -279,6 +317,7 @@ mod tests {
+             missing: vec![2],
+             corrupt: vec![],
+             posted_size: None,
++            name_crc: None,
+         }
+     }
+ 
+@@ -481,6 +520,43 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn a_name_crc_survives_only_in_version_6() {
++        let mut named = segments(2);
++        named.name_crc = Some(0xDEAD_BEEF);
++        named.posted_size = Some(1_000_000);
++        let metas = [
++            FileMeta::Nzb(NzbFile {
++                segments: named.clone(),
++                proof: None,
++            }),
++            FileMeta::Multipart(MultipartFile {
++                parts: vec![
++                    FilePart {
++                        segments: segments(1),
++                        offset: 0,
++                        data: ByteRange { start: 0, end: 10 },
++                        split_after: true,
++                        proof: None,
++                    },
++                    FilePart {
++                        segments: named,
++                        offset: 0,
++                        data: ByteRange { start: 0, end: 10 },
++                        split_after: false,
++                        proof: None,
++                    },
++                ],
++                crypt: None,
++            }),
++        ];
++        for meta in metas {
++            let bytes = encode_meta(&meta).unwrap();
++            assert_eq!(Blob::parse(&bytes).unwrap().version, 6);
++            assert_eq!(decode_meta(&bytes).unwrap(), meta);
++        }
++    }
++
+     #[test]
+     fn readers_reject_foreign_kinds_and_future_versions() {
+         let nzb = encode_nzb(b"<nzb/>").expect("encodes");
+diff --git a/crates/core/src/meta.rs b/crates/core/src/meta.rs
+index 4676fd2c..db2314dd 100644
+--- a/crates/core/src/meta.rs
++++ b/crates/core/src/meta.rs
+@@ -92,6 +92,9 @@ pub struct Segments {
+     /// poster that wrote a wrong size). Blob version 5 stores it.
+     #[serde(skip)]
+     pub posted_size: Option<u64>,
++    /// CRC-32 of the `=ybegin name=` every article carries. Blob version 6 stores it.
++    #[serde(skip)]
++    pub name_crc: Option<u32>,
+ }
+ 
+ impl Segments {
+diff --git a/crates/import/src/apply.rs b/crates/import/src/apply.rs
+index f0d6a879..54c053aa 100644
+--- a/crates/import/src/apply.rs
++++ b/crates/import/src/apply.rs
+@@ -1727,6 +1727,7 @@ fn segments(
+         missing,
+         corrupt,
+         posted_size: None,
++        name_crc: None,
+     }
+ }
+ 
+diff --git a/crates/import/src/legacy_repairs.rs b/crates/import/src/legacy_repairs.rs
+index 232bc6ce..24576b73 100644
+--- a/crates/import/src/legacy_repairs.rs
++++ b/crates/import/src/legacy_repairs.rs
+@@ -58,6 +58,7 @@ fn body(header: &[u8], bytes: Vec<u8>) -> io::Result<Body> {
+         file_size: header.file_size,
+         part: (header.part_number > 0).then_some(header.part_number),
+         total: (header.total_parts > 0).then_some(header.total_parts),
++        name_crc: None,
+     })
+ }
+ 
+diff --git a/crates/nntp/src/article.rs b/crates/nntp/src/article.rs
+index 75ac9ca5..0e17e180 100644
+--- a/crates/nntp/src/article.rs
++++ b/crates/nntp/src/article.rs
+@@ -17,6 +17,8 @@ pub struct Body {
+     pub part: Option<u32>,
+     /// Number of parts the file was posted in, from `=ybegin total=`.
+     pub total: Option<u32>,
++    /// CRC-32 of the file name from `=ybegin name=`.
++    pub name_crc: Option<u32>,
+ }
+ 
+ pub(crate) const MISMATCH: crate::Error =
+@@ -126,6 +128,12 @@ fn raw_field<'a>(line: &'a [u8], key: &[u8]) -> Option<&'a str> {
+     std::str::from_utf8(value).ok()
+ }
+ 
++/// CRC-32 of the `name=` value that ends a `=ybegin` line, trailing whitespace excluded.
++pub fn name_crc(line: &[u8]) -> Option<u32> {
++    let at = line.windows(6).position(|w| w == b" name=")? + 6;
++    Some(infinidysk_yenc::crc32(0, line[at..].trim_ascii_end()))
++}
++
+ pub fn field<T: FromStr>(line: &[u8], key: &[u8]) -> Option<T> {
+     raw_field(line, key)?.parse().ok()
+ }
+@@ -148,5 +156,10 @@ mod tests {
+             Some(0xabc)
+         );
+         assert_eq!(crc_field(b"end size=5 pcrc32=0aBc\r\n", b"crc32"), None);
++        assert_eq!(
++            name_crc(line),
++            Some(infinidysk_yenc::crc32(0, b"a size=9 b.bin"))
++        );
++        assert_eq!(name_crc(b"=ybegin line=128 size=15\r\n"), None);
+     }
+ }
+diff --git a/crates/nntp/src/connection.rs b/crates/nntp/src/connection.rs
+index 74565cef..948ab712 100644
+--- a/crates/nntp/src/connection.rs
++++ b/crates/nntp/src/connection.rs
+@@ -19,7 +19,9 @@ use tokio_rustls::TlsConnector;
+ use tokio_rustls::client::TlsStream;
+ use tokio_util::either::Either;
+ 
+-use crate::article::{Body, BodyExpectation, MAX_DECODED_LEN, MISMATCH, crc_field, field};
++use crate::article::{
++    Body, BodyExpectation, MAX_DECODED_LEN, MISMATCH, crc_field, field, name_crc,
++};
+ use crate::stages::ConnectTimes;
+ use crate::{Bandwidth, Credentials, Error, Usage, resolve, tls};
+ 
+@@ -830,7 +832,7 @@ impl Connection {
+             code => return Err(self.unexpected(code)),
+         }
+ 
+-        let (file_size, part, total) = loop {
++        let (file_size, part, total, name) = loop {
+             self.read_line().await?;
+             if is_terminator(&self.line) {
+                 return Err(Error::Yenc("missing =ybegin"));
+@@ -840,6 +842,7 @@ impl Connection {
+                     field::<u64>(&self.line, b"size"),
+                     field::<u32>(&self.line, b"part"),
+                     field::<u32>(&self.line, b"total"),
++                    name_crc(&self.line),
+                 );
+             }
+         };
+@@ -978,6 +981,7 @@ impl Connection {
+             file_size,
+             part,
+             total,
++            name_crc: name,
+         })
+     }
+ 
+diff --git a/crates/nntp/src/patch/mod.rs b/crates/nntp/src/patch/mod.rs
+index 0649590a..abec0803 100644
+--- a/crates/nntp/src/patch/mod.rs
++++ b/crates/nntp/src/patch/mod.rs
+@@ -332,6 +332,7 @@ impl Store {
+             file_size: patch.source.file_length,
+             part: patch.source.part,
+             total: patch.source.total,
++            name_crc: None,
+         })
+     }
+ }
+diff --git a/crates/queue/src/import.rs b/crates/queue/src/import.rs
+index 9bbb2c53..db68bfe9 100644
+--- a/crates/queue/src/import.rs
++++ b/crates/queue/src/import.rs
+@@ -1121,6 +1121,7 @@ async fn layout(
+             measure(job, &name, &ids, complete, short).await?
+         }
+     };
++    let name_crc = first.name_crc;
+     cached.push((head, first.data));
+     job.bodies().extend(cached);
+     let end = sizes.iter().map(|&(_, size)| size).sum();
+@@ -1141,6 +1142,7 @@ async fn layout(
+                 missing: Vec::new(),
+                 corrupt: Vec::new(),
+                 posted_size: (trusted && end != total).then_some(total),
++                name_crc,
+             },
+             offset: 0,
+             data: ByteRange { start: 0, end },
+@@ -1392,6 +1394,7 @@ impl Volume {
+                         missing: Vec::new(),
+                         corrupt: Vec::new(),
+                         posted_size: part.segments.posted_size,
++                        name_crc: part.segments.name_crc,
+                     },
+                     offset,
+                     data: ByteRange {
+-- 
+2.56.1
+

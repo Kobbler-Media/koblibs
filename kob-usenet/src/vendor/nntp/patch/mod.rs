@@ -332,6 +332,7 @@ impl Store {
             file_size: patch.source.file_length,
             part: patch.source.part,
             total: patch.source.total,
+            name_crc: None,
         })
     }
 }

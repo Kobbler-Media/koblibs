@@ -17,6 +17,8 @@ pub struct Body {
     pub part: Option<u32>,
     /// Number of parts the file was posted in, from `=ybegin total=`.
     pub total: Option<u32>,
+    /// CRC-32 of the file name from `=ybegin name=`.
+    pub name_crc: Option<u32>,
 }
 
 pub(crate) const MISMATCH: crate::vendor::nntp::Error =
@@ -34,6 +36,11 @@ pub struct BodyExpectation {
     /// When the article was posted, in Unix seconds. Not checked against the body:
     /// providers whose retention it is past are not asked.
     pub posted: Option<i64>,
+    /// CRC-32 of the `=ybegin name=`; checked only before a body streams.
+    pub name_crc: Option<u32>,
+    /// Part number the layout's equal-sized parts imply; checked only before a body
+    /// streams, since a poster's numbering may disagree with a layout that sums right.
+    pub layout_part: Option<u32>,
 }
 impl BodyExpectation {
     /// Nothing known: every body passes.
@@ -44,6 +51,8 @@ impl BodyExpectation {
         offset: None,
         decoded_len: None,
         posted: None,
+        name_crc: None,
+        layout_part: None,
     };
 
     /// Only the expected `=ypart` offset, when known.
@@ -61,6 +70,29 @@ impl BodyExpectation {
             || self
                 .part
                 .is_some_and(|v| part.is_some_and(|actual| actual != v))
+    }
+
+    /// Whether the `=ybegin` and `=ypart` (`range`, as offset and length) headers name
+    /// exactly the article the layout places here, so its bytes may stream before the
+    /// CRC is checked. Needs the layout's offset and length.
+    pub(crate) fn admits_stream(
+        self,
+        file_size: u64,
+        part: Option<u32>,
+        name_crc: Option<u32>,
+        range: Option<(u64, usize)>,
+    ) -> bool {
+        let (begin, len) = match (part, range) {
+            (_, Some(range)) => range,
+            (None, None) => (0, usize::try_from(file_size).unwrap_or(usize::MAX)),
+            (Some(_), None) => return false,
+        };
+        self.offset == Some(begin)
+            && self.decoded_len == Some(len as u64)
+            && self.file_size.is_none_or(|v| v == file_size)
+            && self.part.is_none_or(|v| part == Some(v))
+            && self.layout_part.is_none_or(|v| part == Some(v))
+            && self.name_crc.is_none_or(|v| name_crc == Some(v))
     }
 
     pub(crate) fn validate(self, body: &Body) -> Result<(), crate::vendor::nntp::Error> {
@@ -126,6 +158,12 @@ fn raw_field<'a>(line: &'a [u8], key: &[u8]) -> Option<&'a str> {
     std::str::from_utf8(value).ok()
 }
 
+/// CRC-32 of the `name=` value that ends a `=ybegin` line, trailing whitespace excluded.
+pub fn name_crc(line: &[u8]) -> Option<u32> {
+    let at = line.windows(6).position(|w| w == b" name=")? + 6;
+    Some(crate::vendor::yenc::crc32(0, line[at..].trim_ascii_end()))
+}
+
 pub fn field<T: FromStr>(line: &[u8], key: &[u8]) -> Option<T> {
     raw_field(line, key)?.parse().ok()
 }
@@ -148,5 +186,10 @@ mod tests {
             Some(0xabc)
         );
         assert_eq!(crc_field(b"end size=5 pcrc32=0aBc\r\n", b"crc32"), None);
+        assert_eq!(
+            name_crc(line),
+            Some(crate::vendor::yenc::crc32(0, b"a size=9 b.bin"))
+        );
+        assert_eq!(name_crc(b"=ybegin line=128 size=15\r\n"), None);
     }
 }

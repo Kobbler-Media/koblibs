@@ -56,6 +56,11 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 /// whole: streaming them too would hold a second copy of each body, outside the
 /// budget, until it is read.
 const STREAMED_FETCHES: usize = 2;
+/// Strict playback streams articles at least this large before their CRC is checked. At
+/// the 3.4 MB/s a provider connection gives at 210 ms RTT, the last byte of one this
+/// size lands about 0.45 s after the first, a third of the 1.5 s seek target; smaller
+/// ones (posters' usual 384-768 KB) keep the fully verified path, which meets it.
+const UNVERIFIED_FROM: u64 = 3 << 19;
 /// Reader ids; `0` means none, so the first is 1.
 static NEXT_READER: AtomicU64 = AtomicU64::new(1);
 
@@ -308,12 +313,39 @@ struct Partial {
     /// The fetch's [`Progress::wanted`], set once it is among the first
     /// [`STREAMED_FETCHES`] of the window.
     wanted: Arc<AtomicBool>,
+    /// End of the bytes the reader took from `data`.
+    served: usize,
+    /// The copy the reader took bytes from failed: they were never verified.
+    broken: bool,
+    strict: bool,
 }
 
 impl Partial {
+    fn new(wanted: bool, strict: bool) -> (Progress, Self) {
+        let wanted = Arc::new(AtomicBool::new(wanted));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let progress = Progress {
+            tx,
+            wanted: Arc::clone(&wanted),
+            strict,
+        };
+        let partial = Self {
+            rx,
+            data: Vec::new(),
+            wanted,
+            served: 0,
+            broken: false,
+            strict,
+        };
+        (progress, partial)
+    }
+
     /// Bytes received so far.
     fn poll(&mut self, cx: &mut Context<'_>) -> &[u8] {
         while let Poll::Ready(Some((at, chunk))) = self.rx.poll_recv(cx) {
+            if self.strict && at < self.data.len() && self.served > 0 {
+                self.broken = true;
+            }
             // A retry on another provider resends from offset 0: the copy that failed
             // may differ, so none of its unserved bytes may survive.
             if at <= self.data.len() {
@@ -332,7 +364,8 @@ pub struct SegmentReader {
     layout: Arc<Layout>,
     prefetch: usize,
     prewarm: bool,
-    /// Fails instead of filling, padding or cutting, and serves bodies only once whole.
+    /// Fails instead of filling, padding or cutting, and serves bodies only once whole,
+    /// except large articles playback fetches itself (see [`UNVERIFIED_FROM`]).
     strict: bool,
     workload: Workload,
     /// When the file was posted, in Unix seconds; see [`BodyExpectation::posted`].
@@ -342,6 +375,8 @@ pub struct SegmentReader {
     cache: Option<Arc<Cache>>,
     /// Segments from here on are fetched only when read: the caller's range ends before.
     end: usize,
+    /// Byte offset where the caller's range ends.
+    range_end: u64,
     /// The caller's range ends before the file does, so it is read whole: the window
     /// opens fully at once.
     bounded: bool,
@@ -381,6 +416,7 @@ pub struct SegmentReader {
 impl SegmentReader {
     pub fn new(client: Arc<Client>, layout: Arc<Layout>, prefetch: usize) -> Self {
         let end = layout.segments.len();
+        let range_end = layout.len();
         let prefetch = prefetch.max(1);
         let initial = client
             .max_connections()
@@ -399,6 +435,7 @@ impl SegmentReader {
             budget: None,
             cache: None,
             end,
+            range_end,
             bounded: false,
             acquired: None,
             pos: 0,
@@ -500,6 +537,7 @@ impl SegmentReader {
     /// Limits read-ahead to bytes before `end`, where the caller's range stops. Reads
     /// past it still work, one segment at a time.
     pub fn set_end(&mut self, end: u64) {
+        self.range_end = end;
         self.bounded = end < self.layout.len();
         self.end = match end.min(self.layout.len()) {
             0 => 0,
@@ -543,6 +581,19 @@ impl SegmentReader {
     pub fn with_gaps(mut self, gaps: Arc<Gaps>) -> Self {
         self.gaps = Some(gaps);
         self
+    }
+
+    /// Whether segment `index`'s bytes may be served as they arrive. A strict read
+    /// allows it only for playback's own fetch of a large article whose geometry the
+    /// import measured, so its headers can be checked first.
+    fn streams(&self, index: usize) -> bool {
+        let segment = &self.layout.segments[index];
+        !self.strict
+            || (self.workload == Workload::Stream
+                && segment.size >= UNVERIFIED_FROM
+                && segment.expected.offset.is_some()
+                && segment.expected.decoded_len.is_some()
+                && self.client.streams(&segment.message_id))
     }
 
     fn hole(&self, index: usize) -> Hole {
@@ -740,22 +791,12 @@ impl SegmentReader {
             let probe = self.probe(index, wait.clone(), false);
             probe.step(Step::Queued);
             // Bodies stream in once armed below, so a segment is readable before it
-            // fully arrives; strict reads never stream.
-            let (progress, partial) = if strict {
-                (None, None)
-            } else {
-                let wanted = Arc::new(AtomicBool::new(false));
-                let (tx, rx) = mpsc::unbounded_channel();
-                let progress = Progress {
-                    tx,
-                    wanted: Arc::clone(&wanted),
-                };
-                let partial = Partial {
-                    rx,
-                    data: Vec::new(),
-                    wanted,
-                };
+            // fully arrives.
+            let (progress, partial) = if self.streams(index) {
+                let (progress, partial) = Partial::new(false, self.strict);
                 (Some(progress), Some(partial))
+            } else {
+                (None, None)
             };
             self.pending.push_back(Fetch {
                 task: tokio::spawn(async move {
@@ -839,8 +880,8 @@ impl SegmentReader {
             })
     }
 
-    /// Replaces the head fetch with a new one that skips the budget and, unless strict,
-    /// streams in, as a fetch the reader waits on may.
+    /// Replaces the head fetch with a new one that skips the budget and streams in where
+    /// [`streams`](Self::streams) allows, as a fetch the reader waits on may.
     fn refetch_head(&mut self) {
         let (client, layout, cache, hole, index, workload, strict, posted) = (
             Arc::clone(&self.client),
@@ -855,21 +896,11 @@ impl SegmentReader {
         let wait = Some(Arc::new(Wait::default()));
         let probe = self.probe(index, wait.clone(), false);
         probe.step(Step::Queued);
-        let (progress, partial) = if strict {
-            (None, None)
-        } else {
-            let wanted = Arc::new(AtomicBool::new(true));
-            let (tx, rx) = mpsc::unbounded_channel();
-            let progress = Progress {
-                tx,
-                wanted: Arc::clone(&wanted),
-            };
-            let partial = Partial {
-                rx,
-                data: Vec::new(),
-                wanted,
-            };
+        let (progress, partial) = if self.streams(index) {
+            let (progress, partial) = Partial::new(true, self.strict);
             (Some(progress), Some(partial))
+        } else {
+            (None, None)
         };
         let task = tokio::spawn(async move {
             probe.step(Step::Bypassed);
@@ -932,6 +963,15 @@ impl SegmentReader {
             .as_ref()
             .is_some_and(|wait| matches!(wait.view().stage, Stage::Pipeline | Stage::Reply));
         if let Poll::Ready(result) = Pin::new(&mut head.task).poll(cx) {
+            if let Some(partial) = head.partial.as_mut().filter(|p| p.served > 0) {
+                partial.poll(cx);
+                if partial.broken {
+                    self.pending.pop_front();
+                    self.drop_hedge();
+                    self.clear_head();
+                    return Poll::Ready(Err(unverified()));
+                }
+            }
             // Read-ahead that failed while nobody waited gets one fetch on demand.
             if first
                 && !matches!(self.workload, Workload::Health | Workload::Warm)
@@ -961,8 +1001,23 @@ impl SegmentReader {
             match Pin::new(hedge).poll(cx) {
                 Poll::Ready(Ok(Ok((data, filled)))) => {
                     self.hedge = None;
-                    if let Some(head) = self.pending.pop_front() {
+                    let head = self.pending.pop_front();
+                    // Bytes served from the head's copy are verified only if the hedge's
+                    // checked copy holds the same ones.
+                    let mismatch =
+                        head.as_ref()
+                            .and_then(|h| h.partial.as_ref())
+                            .is_some_and(|p| {
+                                p.strict
+                                    && p.served > 0
+                                    && data.get(..p.served) != p.data.get(..p.served)
+                            });
+                    if let Some(head) = head {
                         head.task.abort();
+                    }
+                    if mismatch {
+                        self.clear_head();
+                        return Poll::Ready(Err(unverified()));
                     }
                     self.clear_head();
                     self.note(Event::HedgeWon {
@@ -1058,7 +1113,7 @@ impl SegmentReader {
                 self.align(index);
                 self.schedule(index);
                 let Poll::Ready(result) = self.poll_head(cx) else {
-                    if self.read_partial(cx, index, buf) {
+                    if self.read_partial(cx, index, buf)? {
                         // Bytes reached the reader: the wait ends here, not when the body does.
                         if let Some((at, since)) = self.waiting.take()
                             && at == index
@@ -1119,26 +1174,50 @@ impl SegmentReader {
     }
 
     /// Serves the head segment's bytes already received; `false` when none are new.
-    // ponytail: streamed bytes are served before the article's CRC is checked, so a
-    // corrupt copy that a later provider replaces leaves its prefix served (a fetch the
-    // reader streamed whole still finishes and reports a segment no provider has intact);
-    // buffer the head whole if that shows up in practice.
-    fn read_partial(&mut self, cx: &mut Context<'_>, index: usize, buf: &mut ReadBuf<'_>) -> bool {
-        let Some(partial) = self.pending.front_mut().and_then(|f| f.partial.as_mut()) else {
-            return false;
-        };
-        let data = partial.poll(cx);
+    /// Fails once the copy it served from fails. A strict read keeps back the last byte
+    /// of the segment and of the caller's range until the body is verified, so neither
+    /// can end without its CRC.
+    // ponytail: a non-strict read's streamed bytes are served before the article's CRC
+    // is checked, so a corrupt copy that a later provider replaces leaves its prefix
+    // served (a fetch the reader streamed whole still finishes and reports a segment no
+    // provider has intact); buffer the head whole if that shows up in practice.
+    fn read_partial(
+        &mut self,
+        cx: &mut Context<'_>,
+        index: usize,
+        buf: &mut ReadBuf<'_>,
+    ) -> io::Result<bool> {
+        let start = self.layout.start(index);
         let size = usize::try_from(self.layout.segments[index].size).unwrap_or(usize::MAX);
-        let offset = usize::try_from(self.pos - self.layout.start(index))
-            .expect("offset lies within a segment held in memory");
-        let available = data.len().min(size);
+        let offset =
+            usize::try_from(self.pos - start).expect("offset lies within a segment held in memory");
+        let limit = if self.strict {
+            let range = usize::try_from(self.range_end.saturating_sub(start)).unwrap_or(usize::MAX);
+            size.min(if range > offset { range } else { size })
+                .saturating_sub(1)
+        } else {
+            size
+        };
+        let Some(fetch) = self.pending.front_mut() else {
+            return Ok(false);
+        };
+        let Some(partial) = fetch.partial.as_mut() else {
+            return Ok(false);
+        };
+        partial.poll(cx);
+        if partial.broken {
+            fetch.partial = None;
+            return Err(unverified());
+        }
+        let available = partial.data.len().min(limit);
         if available <= offset {
-            return false;
+            return Ok(false);
         }
         let n = buf.remaining().min(available - offset);
-        buf.put_slice(&data[offset..offset + n]);
+        buf.put_slice(&partial.data[offset..offset + n]);
+        partial.served = partial.served.max(offset + n);
         self.pos += n as u64;
-        true
+        Ok(true)
     }
 }
 
@@ -1164,6 +1243,15 @@ impl Drop for SegmentReader {
     fn drop(&mut self) {
         self.abort_all();
     }
+}
+
+/// A read that was served bytes from a copy that then failed: nothing may make them
+/// look verified, so it ends in an error.
+fn unverified() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "a streamed article failed verification after bytes were served",
+    )
 }
 
 /// Segment index as recorded in traces.
@@ -1337,6 +1425,9 @@ mod tests {
                 rx,
                 data: Vec::new(),
                 wanted: Arc::new(AtomicBool::new(true)),
+                served: 0,
+                broken: false,
+                strict: false,
             };
             let mut cx = Context::from_waker(std::task::Waker::noop());
             tx.send((0, first.to_vec())).unwrap();

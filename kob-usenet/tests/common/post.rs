@@ -71,14 +71,19 @@ pub struct Posted {
     pub name: String,
     pub data: Vec<u8>,
     pub articles: Vec<Article>,
+    article: usize,
 }
 
 impl Posted {
     pub fn new(prefix: &str, name: &str, data: Vec<u8>) -> Self {
-        let total = data.len().div_ceil(ARTICLE);
+        Self::sized(prefix, name, data, ARTICLE)
+    }
+
+    pub fn sized(prefix: &str, name: &str, data: Vec<u8>, article: usize) -> Self {
+        let total = data.len().div_ceil(article);
         let articles = (0..total)
             .map(|part| {
-                let range = part * ARTICLE..((part + 1) * ARTICLE).min(data.len());
+                let range = part * article..((part + 1) * article).min(data.len());
                 let header = Header {
                     name,
                     part: part + 1,
@@ -97,6 +102,7 @@ impl Posted {
             name: name.to_owned(),
             data,
             articles,
+            article,
         }
     }
 
@@ -126,6 +132,7 @@ impl Posted {
             name: name.to_owned(),
             data,
             articles,
+            article: sizes[0],
         }
     }
 
@@ -154,7 +161,7 @@ impl Posted {
     }
 
     pub fn range(&self, part: usize) -> Range<usize> {
-        part * ARTICLE..((part + 1) * ARTICLE).min(self.data.len())
+        part * self.article..((part + 1) * self.article).min(self.data.len())
     }
 
     pub fn id(&self, part: usize) -> &str {

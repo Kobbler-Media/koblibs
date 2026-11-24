@@ -20,8 +20,9 @@ use tokio_rustls::client::TlsStream;
 use tokio_util::either::Either;
 
 use crate::vendor::nntp::article::{
-    Body, BodyExpectation, MAX_DECODED_LEN, MISMATCH, crc_field, field,
+    Body, BodyExpectation, MAX_DECODED_LEN, MISMATCH, crc_field, field, name_crc,
 };
+use crate::vendor::nntp::lines::{BROKEN, Lines};
 use crate::vendor::nntp::stages::ConnectTimes;
 use crate::vendor::nntp::{Bandwidth, Credentials, Error, Usage, resolve, tls};
 
@@ -363,6 +364,10 @@ pub struct Progress {
     /// Set by the reader once it may read this body before the whole article is in.
     /// Never cleared.
     pub wanted: Arc<AtomicBool>,
+    /// For a reader that must not take a damaged copy's bytes as verified: the headers
+    /// must be admitted, the lines keep their structure, a failed copy sends a rewind as
+    /// soon as that shows, and its article stops streaming for a while.
+    pub strict: bool,
 }
 
 /// How to reach and log in to one provider. Build once and share: TLS sessions are
@@ -807,8 +812,12 @@ impl Connection {
     /// once it is wanted.
     /// An article for another part of the posted file (its `=ypart` offset is not
     /// `expected.offset`), or whose `=ybegin` names another file size or part number,
-    /// fails as [`Error::Yenc`] before any byte reaches `progress`. The rest of
-    /// `expected` is the caller's to check once the body is whole.
+    /// fails as [`Error::Yenc`] before any byte reaches `progress`. With a strict
+    /// `progress`, the headers must also show exactly the article the layout expects
+    /// ([`BodyExpectation::admits_stream`]), and the raw lines keep yEnc's structure while
+    /// the body streams; a copy that fails either, or its CRC, sends `progress` a rewind
+    /// to offset 0 as soon as that shows. The rest of `expected` is the caller's to check
+    /// once the body is whole.
     /// `replied` runs once the status line is in.
     pub async fn read_body_with(
         &mut self,
@@ -816,7 +825,9 @@ impl Connection {
         expected: BodyExpectation,
         replied: impl FnOnce(),
     ) -> Result<Body, Error> {
+        let geometry = expected;
         let begin = expected.offset;
+        let streamed = progress.is_some_and(|p| p.strict);
         self.take_pending()?;
         self.timing = Timing::default();
         let code = self.read_status().await?;
@@ -832,7 +843,7 @@ impl Connection {
             code => return Err(self.unexpected(code)),
         }
 
-        let (file_size, part, total) = loop {
+        let (file_size, part, total, name, line) = loop {
             self.read_line().await?;
             if is_terminator(&self.line) {
                 return Err(Error::Yenc("missing =ybegin"));
@@ -842,6 +853,8 @@ impl Connection {
                     field::<u64>(&self.line, b"size"),
                     field::<u32>(&self.line, b"part"),
                     field::<u32>(&self.line, b"total"),
+                    name_crc(&self.line),
+                    field::<usize>(&self.line, b"line"),
                 );
             }
         };
@@ -851,6 +864,7 @@ impl Connection {
         if expected.rejects_header(file_size, part) {
             return self.fail_drained(MISMATCH).await;
         }
+        let admits = |range| !streamed || geometry.admits_stream(file_size, part, name, range);
 
         let other_part = |offset: u64| begin.is_some_and(|begin| begin != offset);
         let mut offset = 0;
@@ -869,12 +883,16 @@ impl Connection {
             if other_part(offset) {
                 return self.fail_drained(OTHER_PART).await;
             }
+            if !admits(Some((offset, expected))) {
+                return self.fail_drained(MISMATCH).await;
+            }
             checked = true;
         }
 
         let mut data = Vec::with_capacity(expected.min(MAX_DECODED_LEN) + DECODE_SLACK);
         let mut state = DecoderState::default();
         let mut crc = 0;
+        let mut lines = Lines::new(line);
         // Decoded bytes already sent to `progress`.
         let mut sent = 0;
         // Another part found mid-data: decoded to its end and discarded, so the
@@ -882,6 +900,7 @@ impl Connection {
         let mut wrong = false;
         loop {
             if data.len() > MAX_DECODED_LEN {
+                retract(progress, sent);
                 return Err(Error::TooLarge);
             }
             if data.capacity() == data.len() {
@@ -898,11 +917,17 @@ impl Connection {
             let started = Instant::now();
             let (used, end) = decode_incremental(buf, &mut data, &mut state);
             crc = crc32(crc, &data[decoded..]);
+            let broken =
+                streamed && !wrong && (lines.scan(&buf[..used]).is_err() || data.len() > expected);
             self.timing.decode += started.elapsed();
             self.stream.consume(used);
+            if broken {
+                retract(progress, sent);
+                return self.fail_drained(BROKEN).await;
+            }
             if !checked && data.len() > decoded {
                 checked = true;
-                wrong = other_part(offset);
+                wrong = other_part(offset) || !admits(ranged.then_some((offset, expected)));
             }
             if wrong {
                 data.clear();
@@ -922,6 +947,7 @@ impl Connection {
                     }
                     // Without `=yend`, only the length shows the article is whole.
                     if data.len() < expected {
+                        retract(progress, sent);
                         return Err(SHORT);
                     }
                     break;
@@ -930,6 +956,7 @@ impl Connection {
                     // Rest of a `=y…` line; data resumes at a line start.
                     self.read_line().await?;
                     state = DecoderState::default();
+                    lines.control();
                     if wrong {
                         if self.line.starts_with(b"end") {
                             self.drain().await?;
@@ -941,6 +968,9 @@ impl Connection {
                                 return self.fail_drained(OTHER_PART).await;
                             }
                             Some((begin, len)) => {
+                                if !checked && !admits(Some((begin, len))) {
+                                    return self.fail_drained(MISMATCH).await;
+                                }
                                 (offset, expected, ranged) = (begin, len, true);
                                 let fits = len.min(MAX_DECODED_LEN) + DECODE_SLACK;
                                 if data.is_empty() && data.capacity() > fits {
@@ -956,23 +986,29 @@ impl Connection {
                     } else if self.line.starts_with(b"end") {
                         let key: &[u8] = if part.is_some() { b"pcrc32" } else { b"crc32" };
                         let posted = crc_field(&self.line, key);
-                        self.drain().await?;
-                        if !checked && other_part(offset) {
-                            return Err(OTHER_PART);
-                        }
-                        if let Some(expected) = posted
+                        let verdict = if !checked && other_part(offset) {
+                            Err(OTHER_PART)
+                        } else if let Some(expected) = posted
                             && expected != crc
                         {
-                            return Err(Error::CrcMismatch {
+                            Err(Error::CrcMismatch {
                                 expected,
                                 actual: crc,
-                            });
+                            })
+                        } else if ranged && data.len() < expected {
+                            // A CRC over fewer bytes than `=ypart` (or `=ybegin size`)
+                            // announces still leaves the rest of the range unposted.
+                            Err(SHORT)
+                        } else {
+                            Ok(())
+                        };
+                        // Told before the drain, which may take as long as the rest of
+                        // an early `=yend`'s article.
+                        if verdict.is_err() {
+                            retract(progress, sent);
                         }
-                        // A CRC over fewer bytes than `=ypart` (or `=ybegin size`)
-                        // announces still leaves the rest of the range unposted.
-                        if ranged && data.len() < expected {
-                            return Err(SHORT);
-                        }
+                        self.drain().await?;
+                        verdict?;
                         break;
                     }
                 }
@@ -984,6 +1020,7 @@ impl Connection {
             file_size,
             part,
             total,
+            name_crc: name,
         })
     }
 
@@ -1129,6 +1166,16 @@ pub(crate) fn validate_message_id(message_id: &str) -> Result<(), Error> {
         return Err(Error::InvalidArgument("message-id"));
     }
     Ok(())
+}
+
+/// Tells a strict reader that bytes it was sent belong to a copy that failed.
+fn retract(progress: Option<&Progress>, sent: usize) {
+    if let Some(progress) = progress
+        && progress.strict
+        && sent > 0
+    {
+        let _ = progress.tx.send((0, Vec::new()));
+    }
 }
 
 fn is_terminator(line: &[u8]) -> bool {

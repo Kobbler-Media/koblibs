@@ -342,6 +342,7 @@ mod tests {
             file_size: 0,
             part: Some(1),
             total: Some(total),
+            name_crc: None,
         }
     }
 

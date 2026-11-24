@@ -126,14 +126,20 @@ fn prefetch(read_ahead: u64, size: u64, floor: Option<usize>) -> usize {
 /// Stream segments; `offset` is where the first starts in its posted file, so trusted
 /// sizes give each segment's expected `=ypart` offset and decoded length. `whole`: the
 /// segments are the whole posted file, so trusted sizes also give its `=ybegin size`.
+/// Equal-sized segments also give each one's part number.
 fn layout(segments: &Segments, offset: u64, whole: bool) -> impl Iterator<Item = Segment> + '_ {
     let trusted = segments.sizes_trusted;
     let file_size = (trusted && whole).then(|| segments.posted_size());
+    let part_size = part_size(segments);
     segments.items.iter().scan(offset, move |at, s| {
         let expected = BodyExpectation {
             offset: trusted.then_some(*at),
             decoded_len: trusted.then_some(u64::from(s.size)),
             file_size,
+            name_crc: segments.name_crc,
+            layout_part: part_size
+                .filter(|&size| at.is_multiple_of(size))
+                .and_then(|size| u32::try_from(*at / size + 1).ok()),
             ..BodyExpectation::NONE
         };
         *at += u64::from(s.size);
@@ -143,6 +149,14 @@ fn layout(segments: &Segments, offset: u64, whole: bool) -> impl Iterator<Item =
             expected,
         })
     })
+}
+
+/// The size every part but the last was posted at, when trusted sizes show one.
+fn part_size(segments: &Segments) -> Option<u64> {
+    let (last, rest) = segments.items.split_last()?;
+    let size = rest.first()?.size;
+    (segments.sizes_trusted && size > 0 && last.size <= size && rest.iter().all(|s| s.size == size))
+        .then_some(u64::from(size))
 }
 
 impl Reader {

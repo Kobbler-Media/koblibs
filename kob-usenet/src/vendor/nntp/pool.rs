@@ -15,6 +15,7 @@ use crate::vendor::nntp::client::{BodySink, Lane};
 use crate::vendor::nntp::connection::{ConnectionStats, Link, Phase, Timing, validate_message_id};
 use crate::vendor::nntp::downloads::{Downloads, Permit};
 use crate::vendor::nntp::keep_warm::{KEEP_WARM_CONNECTIONS, KEEP_WARM_EVERY, KeepWarm};
+use crate::vendor::nntp::missing::{Missing, UNSTREAMABLE};
 use crate::vendor::nntp::pace::{CacheTurns, Flight, Pace};
 use crate::vendor::nntp::stages::{
     Assigned, ConnectTimes, LoadAtAssign, ReplyTimes, RequestTrace, StageClock,
@@ -301,6 +302,8 @@ pub(crate) struct Tag {
     pub(crate) expected: crate::vendor::nntp::BodyExpectation,
     /// Gets bodies whose caller left before they arrived.
     pub(crate) sink: Option<Arc<OnceLock<BodySink>>>,
+    /// Remembers an article whose streamed copy came damaged; see `Client::streams`.
+    pub(crate) unstreamable: Option<Arc<Missing>>,
     /// Waits for a connection with nothing in flight rather than pipeline behind
     /// another request: a hedge queued behind a slow article is as slow as it.
     pub(crate) fresh: bool,
@@ -322,6 +325,7 @@ impl Tag {
         progress: None,
         expected: crate::vendor::nntp::BodyExpectation::NONE,
         sink: None,
+        unstreamable: None,
         fresh: false,
         remember: true,
         lane: None,
@@ -360,7 +364,18 @@ impl Request {
             Ok(Some(body)) => u32::try_from(body.data.len()).unwrap_or(u32::MAX),
             _ => 0,
         };
+        // A reader that was served part of a damaged copy gives up at once, so the copy
+        // must count against the provider and stop streaming without its caller.
+        let damaged = self.tag.progress.as_ref().is_some_and(|p| p.strict)
+            && matches!(
+                result,
+                Err(Error::CrcMismatch { .. } | Error::Yenc(_) | Error::TooLarge)
+            );
+        if damaged && let Some(unstreamable) = &self.tag.unstreamable {
+            unstreamable.insert(UNSTREAMABLE, &self.message_id);
+        }
         let ended = match &result {
+            Err(error) if damaged => outcome(error),
             // The caller stopped waiting; the reply was drained anyway.
             _ if reply.as_ref().is_none_or(oneshot::Sender::is_closed) => Outcome::Cancelled,
             Ok(_) => Outcome::Retrieved,

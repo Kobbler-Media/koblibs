@@ -25,6 +25,7 @@ mod proxy;
 #[allow(dead_code)]
 #[path = "../common/rar.rs"]
 mod rar;
+mod streamed;
 mod tiers;
 mod tool_output;
 mod warming;

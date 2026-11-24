@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::vendor::nntp::article::Body;
 use crate::vendor::nntp::breaker::{Breaker, Outcome};
 use crate::vendor::nntp::connection::validate_message_id;
-use crate::vendor::nntp::missing::Missing;
+use crate::vendor::nntp::missing::{Missing, UNSTREAMABLE};
 use crate::vendor::nntp::pool::{Command, Failure, Load, Pool, Tag, join_all};
 use crate::vendor::nntp::stages::{StageClock, StageMetrics};
 use crate::vendor::nntp::stats::{self, ProviderStats, Rescue, Stats, Workload};
@@ -73,6 +73,9 @@ pub struct Client {
     /// Every provider ever configured; the index is its id.
     known: Mutex<Vec<Known>>,
     missing: Missing,
+    /// Articles a provider sent damaged while they streamed: they are fetched whole and
+    /// verified until the entry expires, so the next request fails over before serving.
+    unstreamable: Arc<Missing>,
     sink: Arc<OnceLock<BodySink>>,
     /// Rare (a miss followed by a hit), so a lock is fine.
     rescues: Mutex<HashMap<(u16, u16, trace::Outcome), u64>>,
@@ -154,6 +157,7 @@ impl Client {
             providers: RwLock::new(Arc::new([])),
             known: Mutex::default(),
             missing: Missing::default(),
+            unstreamable: Arc::default(),
             sink: Arc::default(),
             rescues: Mutex::default(),
             gate: Arc::default(),
@@ -335,6 +339,13 @@ impl Client {
     #[must_use]
     pub fn foreground_pending(&self) -> bool {
         self.foreground.load(Ordering::Acquire) > 0
+    }
+
+    /// Whether `message_id` may be served as it arrives: no streamed copy of it failed
+    /// recently.
+    #[must_use]
+    pub fn streams(&self, message_id: &str) -> bool {
+        !self.unstreamable.contains(UNSTREAMABLE, message_id)
     }
 
     /// Connection limit of the first priority level.
@@ -817,6 +828,7 @@ impl Client {
                         provider: entry.id,
                         stats: Some(Arc::clone(&entry.stats)),
                         sink: Some(Arc::clone(&self.sink)),
+                        unstreamable: Some(Arc::clone(&self.unstreamable)),
                         ..base.clone()
                     };
                     let result = entry.provider.pool.fetch(command, message_id, &tag).await;

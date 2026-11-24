@@ -80,8 +80,11 @@ which drives upstream's database-backed queue service.
 | 46 | A keep-warm STAT counts only 223, 423, 430 and 451 as warm; any other reply retires the connection | ours, fixes 42 |
 | 47 | An inspection reports the size of each file the block list dropped | ours, extends 36 |
 | 48 | Cache readers take download slots by who holds fewest, with imports as one reader among them, so a new cache-ahead is not queued behind another's backlog | ours, completes 43 |
+| 49 | A loopback server can send part of a body and hold the rest until released, at several points | ours, test only |
+| 50 | Imports record each posted file's `=ybegin name=` as a CRC (blob version 6) | ours, for 51's header check |
+| 51 | Strict playback streams articles of 1.5 MiB or more as they arrive when the layout measured their geometry: the `=ybegin`/`=ypart` headers must name the expected part, offsets, file size and name first, and the raw lines keep yEnc's structure while streaming. The last byte of the article and of the caller's range waits for the CRC. A copy that fails after bytes were served ends the read in an error, counts as a corrupt miss even when the reader has gone, and its article is fetched whole and verified for the next five minutes. Other workloads, small articles and joined flights stay verified | ours |
 
-Patches 5–48 are candidates to offer upstream.
+Patches 5–51 are candidates to offer upstream.
 
 ## Monthly sync
 

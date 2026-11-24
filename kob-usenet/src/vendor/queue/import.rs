@@ -1121,6 +1121,7 @@ async fn layout(
             measure(job, &name, &ids, complete, short).await?
         }
     };
+    let name_crc = first.name_crc;
     cached.push((head, first.data));
     job.bodies().extend(cached);
     let end = sizes.iter().map(|&(_, size)| size).sum();
@@ -1141,6 +1142,7 @@ async fn layout(
                 missing: Vec::new(),
                 corrupt: Vec::new(),
                 posted_size: (trusted && end != total).then_some(total),
+                name_crc,
             },
             offset: 0,
             data: ByteRange { start: 0, end },
@@ -1392,6 +1394,7 @@ impl Volume {
                         missing: Vec::new(),
                         corrupt: Vec::new(),
                         posted_size: part.segments.posted_size,
+                        name_crc: part.segments.name_crc,
                     },
                     offset,
                     data: ByteRange {

@@ -1,0 +1,1099 @@
+From 324314facaa7516db8264ea648493b5bf59bcae5 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Tue, 24 Nov 2026 16:35:00 +1100
+Subject: [PATCH] Playback streams large articles before their CRC is checked,
+ behind header and line-structure checks, and ends in an error if a copy it
+ served from fails
+
+---
+ crates/nntp/src/article.rs        |  30 +++++
+ crates/nntp/src/client.rs         |  15 ++-
+ crates/nntp/src/connection.rs     |  78 ++++++++++---
+ crates/nntp/src/lib.rs            |   1 +
+ crates/nntp/src/lines.rs          | 165 +++++++++++++++++++++++++++
+ crates/nntp/src/missing.rs        |   2 +
+ crates/nntp/src/pool.rs           |  15 +++
+ crates/nntp/tests/client.rs       |   3 +
+ crates/stream/src/lib.rs          | 183 ++++++++++++++++++++++--------
+ crates/stream/tests/unverified.rs | 111 ++++++++++++++++++
+ crates/vfs/src/reader.rs          |  17 +++
+ 11 files changed, 555 insertions(+), 65 deletions(-)
+ create mode 100644 crates/nntp/src/lines.rs
+ create mode 100644 crates/stream/tests/unverified.rs
+
+diff --git a/crates/nntp/src/article.rs b/crates/nntp/src/article.rs
+index 0e17e180..254b2b80 100644
+--- a/crates/nntp/src/article.rs
++++ b/crates/nntp/src/article.rs
+@@ -36,6 +36,11 @@ pub struct BodyExpectation {
+     /// When the article was posted, in Unix seconds. Not checked against the body:
+     /// providers whose retention it is past are not asked.
+     pub posted: Option<i64>,
++    /// CRC-32 of the `=ybegin name=`; checked only before a body streams.
++    pub name_crc: Option<u32>,
++    /// Part number the layout's equal-sized parts imply; checked only before a body
++    /// streams, since a poster's numbering may disagree with a layout that sums right.
++    pub layout_part: Option<u32>,
+ }
+ impl BodyExpectation {
+     /// Nothing known: every body passes.
+@@ -46,6 +51,8 @@ impl BodyExpectation {
+         offset: None,
+         decoded_len: None,
+         posted: None,
++        name_crc: None,
++        layout_part: None,
+     };
+ 
+     /// Only the expected `=ypart` offset, when known.
+@@ -65,6 +72,29 @@ impl BodyExpectation {
+                 .is_some_and(|v| part.is_some_and(|actual| actual != v))
+     }
+ 
++    /// Whether the `=ybegin` and `=ypart` (`range`, as offset and length) headers name
++    /// exactly the article the layout places here, so its bytes may stream before the
++    /// CRC is checked. Needs the layout's offset and length.
++    pub(crate) fn admits_stream(
++        self,
++        file_size: u64,
++        part: Option<u32>,
++        name_crc: Option<u32>,
++        range: Option<(u64, usize)>,
++    ) -> bool {
++        let (begin, len) = match (part, range) {
++            (_, Some(range)) => range,
++            (None, None) => (0, usize::try_from(file_size).unwrap_or(usize::MAX)),
++            (Some(_), None) => return false,
++        };
++        self.offset == Some(begin)
++            && self.decoded_len == Some(len as u64)
++            && self.file_size.is_none_or(|v| v == file_size)
++            && self.part.is_none_or(|v| part == Some(v))
++            && self.layout_part.is_none_or(|v| part == Some(v))
++            && self.name_crc.is_none_or(|v| name_crc == Some(v))
++    }
++
+     pub(crate) fn validate(self, body: &Body) -> Result<(), crate::Error> {
+         let regular = match body.part {
+             Some(1) if body.offset == 0 => Some(body.data.len() as u64),
+diff --git a/crates/nntp/src/client.rs b/crates/nntp/src/client.rs
+index 31776545..966aeb0e 100644
+--- a/crates/nntp/src/client.rs
++++ b/crates/nntp/src/client.rs
+@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
+ use crate::article::Body;
+ use crate::breaker::{Breaker, Outcome};
+ use crate::connection::validate_message_id;
+-use crate::missing::Missing;
++use crate::missing::{Missing, UNSTREAMABLE};
+ use crate::pool::{Command, Failure, Load, Pool, Tag, join_all};
+ use crate::stages::{StageClock, StageMetrics};
+ use crate::stats::{self, ProviderStats, Rescue, Stats, Workload};
+@@ -73,6 +73,9 @@ pub struct Client {
+     /// Every provider ever configured; the index is its id.
+     known: Mutex<Vec<Known>>,
+     missing: Missing,
++    /// Articles a provider sent damaged while they streamed: they are fetched whole and
++    /// verified until the entry expires, so the next request fails over before serving.
++    unstreamable: Arc<Missing>,
+     sink: Arc<OnceLock<BodySink>>,
+     /// Rare (a miss followed by a hit), so a lock is fine.
+     rescues: Mutex<HashMap<(u16, u16, trace::Outcome), u64>>,
+@@ -154,6 +157,7 @@ impl Client {
+             providers: RwLock::new(Arc::new([])),
+             known: Mutex::default(),
+             missing: Missing::default(),
++            unstreamable: Arc::default(),
+             sink: Arc::default(),
+             rescues: Mutex::default(),
+             gate: Arc::default(),
+@@ -334,6 +338,13 @@ impl Client {
+         self.foreground.load(Ordering::Acquire) > 0
+     }
+ 
++    /// Whether `message_id` may be served as it arrives: no streamed copy of it failed
++    /// recently.
++    #[must_use]
++    pub fn streams(&self, message_id: &str) -> bool {
++        !self.unstreamable.contains(UNSTREAMABLE, message_id)
++    }
++
+     /// Connection limit of the first priority level.
+     #[must_use]
+     pub fn max_connections(&self) -> usize {
+@@ -814,6 +825,7 @@ impl Client {
+                         provider: entry.id,
+                         stats: Some(Arc::clone(&entry.stats)),
+                         sink: Some(Arc::clone(&self.sink)),
++                        unstreamable: Some(Arc::clone(&self.unstreamable)),
+                         ..base.clone()
+                     };
+                     let result = entry.provider.pool.fetch(command, message_id, &tag).await;
+@@ -922,6 +934,7 @@ impl Client {
+     }
+ }
+ 
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/nntp/src/connection.rs b/crates/nntp/src/connection.rs
+index 948ab712..5420e668 100644
+--- a/crates/nntp/src/connection.rs
++++ b/crates/nntp/src/connection.rs
+@@ -22,6 +22,7 @@ use tokio_util::either::Either;
+ use crate::article::{
+     Body, BodyExpectation, MAX_DECODED_LEN, MISMATCH, crc_field, field, name_crc,
+ };
++use crate::lines::{BROKEN, Lines};
+ use crate::stages::ConnectTimes;
+ use crate::{Bandwidth, Credentials, Error, Usage, resolve, tls};
+ 
+@@ -363,6 +364,10 @@ pub struct Progress {
+     /// Set by the reader once it may read this body before the whole article is in.
+     /// Never cleared.
+     pub wanted: Arc<AtomicBool>,
++    /// For a reader that must not take a damaged copy's bytes as verified: the headers
++    /// must be admitted, the lines keep their structure, a failed copy sends a rewind as
++    /// soon as that shows, and its article stops streaming for a while.
++    pub strict: bool,
+ }
+ 
+ /// How to reach and log in to one provider. Build once and share: TLS sessions are
+@@ -807,8 +812,12 @@ impl Connection {
+     /// once it is wanted.
+     /// An article for another part of the posted file (its `=ypart` offset is not
+     /// `expected.offset`), or whose `=ybegin` names another file size or part number,
+-    /// fails as [`Error::Yenc`] before any byte reaches `progress`. The rest of
+-    /// `expected` is the caller's to check once the body is whole.
++    /// fails as [`Error::Yenc`] before any byte reaches `progress`. With a strict
++    /// `progress`, the headers must also show exactly the article the layout expects
++    /// ([`BodyExpectation::admits_stream`]), and the raw lines keep yEnc's structure while
++    /// the body streams; a copy that fails either, or its CRC, sends `progress` a rewind
++    /// to offset 0 as soon as that shows. The rest of `expected` is the caller's to check
++    /// once the body is whole.
+     /// `replied` runs once the status line is in.
+     pub async fn read_body_with(
+         &mut self,
+@@ -816,7 +825,9 @@ impl Connection {
+         expected: BodyExpectation,
+         replied: impl FnOnce(),
+     ) -> Result<Body, Error> {
++        let geometry = expected;
+         let begin = expected.offset;
++        let streamed = progress.is_some_and(|p| p.strict);
+         self.take_pending()?;
+         self.timing = Timing::default();
+         let code = self.read_status().await?;
+@@ -832,7 +843,7 @@ impl Connection {
+             code => return Err(self.unexpected(code)),
+         }
+ 
+-        let (file_size, part, total, name) = loop {
++        let (file_size, part, total, name, line) = loop {
+             self.read_line().await?;
+             if is_terminator(&self.line) {
+                 return Err(Error::Yenc("missing =ybegin"));
+@@ -843,6 +854,7 @@ impl Connection {
+                     field::<u32>(&self.line, b"part"),
+                     field::<u32>(&self.line, b"total"),
+                     name_crc(&self.line),
++                    field::<usize>(&self.line, b"line"),
+                 );
+             }
+         };
+@@ -852,6 +864,7 @@ impl Connection {
+         if expected.rejects_header(file_size, part) {
+             return self.fail_drained(MISMATCH).await;
+         }
++        let admits = |range| !streamed || geometry.admits_stream(file_size, part, name, range);
+ 
+         let other_part = |offset: u64| begin.is_some_and(|begin| begin != offset);
+         let mut offset = 0;
+@@ -870,12 +883,16 @@ impl Connection {
+             if other_part(offset) {
+                 return self.fail_drained(OTHER_PART).await;
+             }
++            if !admits(Some((offset, expected))) {
++                return self.fail_drained(MISMATCH).await;
++            }
+             checked = true;
+         }
+ 
+         let mut data = Vec::with_capacity(expected.min(MAX_DECODED_LEN) + DECODE_SLACK);
+         let mut state = DecoderState::default();
+         let mut crc = 0;
++        let mut lines = Lines::new(line);
+         // Decoded bytes already sent to `progress`.
+         let mut sent = 0;
+         // Another part found mid-data: decoded to its end and discarded, so the
+@@ -883,6 +900,7 @@ impl Connection {
+         let mut wrong = false;
+         loop {
+             if data.len() > MAX_DECODED_LEN {
++                retract(progress, sent);
+                 return Err(Error::TooLarge);
+             }
+             if data.capacity() == data.len() {
+@@ -895,11 +913,18 @@ impl Connection {
+             let started = Instant::now();
+             let (used, end) = decode_incremental(buf, &mut data, &mut state);
+             crc = crc32(crc, &data[decoded..]);
++            let broken = streamed
++                && !wrong
++                && (lines.scan(&buf[..used]).is_err() || data.len() > expected);
+             self.timing.decode += started.elapsed();
+             self.stream.consume(used);
++            if broken {
++                retract(progress, sent);
++                return self.fail_drained(BROKEN).await;
++            }
+             if !checked && data.len() > decoded {
+                 checked = true;
+-                wrong = other_part(offset);
++                wrong = other_part(offset) || !admits(ranged.then_some((offset, expected)));
+             }
+             if wrong {
+                 data.clear();
+@@ -919,6 +944,7 @@ impl Connection {
+                     }
+                     // Without `=yend`, only the length shows the article is whole.
+                     if data.len() < expected {
++                        retract(progress, sent);
+                         return Err(SHORT);
+                     }
+                     break;
+@@ -927,6 +953,7 @@ impl Connection {
+                     // Rest of a `=y…` line; data resumes at a line start.
+                     self.read_line().await?;
+                     state = DecoderState::default();
++                    lines.control();
+                     if wrong {
+                         if self.line.starts_with(b"end") {
+                             self.drain().await?;
+@@ -938,6 +965,9 @@ impl Connection {
+                                 return self.fail_drained(OTHER_PART).await;
+                             }
+                             Some((begin, len)) => {
++                                if !checked && !admits(Some((begin, len))) {
++                                    return self.fail_drained(MISMATCH).await;
++                                }
+                                 (offset, expected, ranged) = (begin, len, true);
+                                 let fits = len.min(MAX_DECODED_LEN) + DECODE_SLACK;
+                                 if data.is_empty() && data.capacity() > fits {
+@@ -953,23 +983,29 @@ impl Connection {
+                     } else if self.line.starts_with(b"end") {
+                         let key: &[u8] = if part.is_some() { b"pcrc32" } else { b"crc32" };
+                         let posted = crc_field(&self.line, key);
+-                        self.drain().await?;
+-                        if !checked && other_part(offset) {
+-                            return Err(OTHER_PART);
+-                        }
+-                        if let Some(expected) = posted
++                        let verdict = if !checked && other_part(offset) {
++                            Err(OTHER_PART)
++                        } else if let Some(expected) = posted
+                             && expected != crc
+                         {
+-                            return Err(Error::CrcMismatch {
++                            Err(Error::CrcMismatch {
+                                 expected,
+                                 actual: crc,
+-                            });
+-                        }
+-                        // A CRC over fewer bytes than `=ypart` (or `=ybegin size`)
+-                        // announces still leaves the rest of the range unposted.
+-                        if ranged && data.len() < expected {
+-                            return Err(SHORT);
++                            })
++                        } else if ranged && data.len() < expected {
++                            // A CRC over fewer bytes than `=ypart` (or `=ybegin size`)
++                            // announces still leaves the rest of the range unposted.
++                            Err(SHORT)
++                        } else {
++                            Ok(())
++                        };
++                        // Told before the drain, which may take as long as the rest of
++                        // an early `=yend`'s article.
++                        if verdict.is_err() {
++                            retract(progress, sent);
+                         }
++                        self.drain().await?;
++                        verdict?;
+                         break;
+                     }
+                 }
+@@ -1129,6 +1165,16 @@ pub(crate) fn validate_message_id(message_id: &str) -> Result<(), Error> {
+     Ok(())
+ }
+ 
++/// Tells a strict reader that bytes it was sent belong to a copy that failed.
++fn retract(progress: Option<&Progress>, sent: usize) {
++    if let Some(progress) = progress
++        && progress.strict
++        && sent > 0
++    {
++        let _ = progress.tx.send((0, Vec::new()));
++    }
++}
++
+ fn is_terminator(line: &[u8]) -> bool {
+     matches!(line, b".\r\n" | b".\n")
+ }
+diff --git a/crates/nntp/src/lib.rs b/crates/nntp/src/lib.rs
+index 27ca7e22..9a0be3bd 100644
+--- a/crates/nntp/src/lib.rs
++++ b/crates/nntp/src/lib.rs
+@@ -8,6 +8,7 @@ mod client;
+ mod connection;
+ mod downloads;
+ mod keep_warm;
++mod lines;
+ mod missing;
+ mod pace;
+ pub mod patch;
+diff --git a/crates/nntp/src/lines.rs b/crates/nntp/src/lines.rs
+new file mode 100644
+index 00000000..5f00852e
+--- /dev/null
++++ b/crates/nntp/src/lines.rs
+@@ -0,0 +1,165 @@
++//! Structural checks on a streaming yEnc body's raw lines, so a damaged copy stops
++//! being served before its CRC can be checked at `=yend`.
++
++use crate::Error;
++
++pub(crate) const BROKEN: Error = Error::Yenc("article breaks yEnc line structure");
++
++/// Raw data lines of one article, fed in the chunks the decoder consumed. Lines are
++/// `line=` characters, or one more when an escape pair crosses that length; only a
++/// line before `=yend` or the terminator may be shorter, by more than one.
++pub(crate) struct Lines {
++    line: Option<usize>,
++    /// Raw bytes on the current line, the stuffed dot included.
++    raw: usize,
++    /// Characters on the current line, the stuffed dot excluded.
++    col: usize,
++    lead: u8,
++    /// The last character opened an escape pair.
++    escape: bool,
++    cr: bool,
++    /// The previous line was short, so this one must be a control line or the terminator.
++    short: bool,
++}
++
++impl Lines {
++    pub(crate) const fn new(line: Option<usize>) -> Self {
++        Self {
++            line,
++            raw: 0,
++            col: 0,
++            lead: 0,
++            escape: false,
++            cr: false,
++            short: false,
++        }
++    }
++
++    /// After a `=y` control line, data resumes at a line start.
++    pub(crate) const fn control(&mut self) {
++        *self = Self::new(self.line);
++    }
++
++    pub(crate) fn scan(&mut self, raw: &[u8]) -> Result<(), Error> {
++        for &byte in raw {
++            if self.cr {
++                self.cr = false;
++                if byte != b'\n' {
++                    return Err(BROKEN);
++                }
++                self.end_line()?;
++                continue;
++            }
++            match byte {
++                b'\r' => self.cr = true,
++                b'\n' => self.end_line()?,
++                0 => return Err(BROKEN),
++                byte => self.char(byte)?,
++            }
++        }
++        Ok(())
++    }
++
++    fn char(&mut self, byte: u8) -> Result<(), Error> {
++        let raw = self.raw;
++        self.raw += 1;
++        if raw == 0 {
++            self.lead = byte;
++            if self.short && byte != b'=' && byte != b'.' {
++                return Err(BROKEN);
++            }
++        } else if raw == 1 {
++            if self.short && !(self.lead == b'=' && byte == b'y') {
++                return Err(BROKEN);
++            }
++            if self.lead == b'.' && byte == b'.' {
++                return Ok(());
++            }
++        }
++        if let Some(line) = self.line
++            && (self.col > line || (self.col == line && !self.escape))
++        {
++            return Err(BROKEN);
++        }
++        self.col += 1;
++        self.escape = !self.escape && byte == b'=';
++        Ok(())
++    }
++
++    fn end_line(&mut self) -> Result<(), Error> {
++        let terminator = self.raw == 1 && self.lead == b'.';
++        if self.short && !terminator {
++            return Err(BROKEN);
++        }
++        self.short = self.line.is_some_and(|line| self.col + 1 < line);
++        (self.raw, self.col, self.escape) = (0, 0, false);
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use infinidysk_yenc::encode;
++
++    fn stuffed(data: &[u8], line: u16) -> Vec<u8> {
++        let mut out = Vec::new();
++        let mut start = true;
++        for &b in &encode(data, line) {
++            if start && b == b'.' {
++                out.push(b'.');
++            }
++            out.push(b);
++            start = b == b'\n';
++        }
++        out.extend_from_slice(b"\r\n");
++        out
++    }
++
++    #[test]
++    fn real_encoder_output_passes_in_any_chunking() {
++        let critical: Vec<u8> = [0u8, 10, 13, 19, 214, 224, 227, 4]
++            .iter()
++            .copied()
++            .cycle()
++            .take(5000)
++            .collect();
++        let mixed: Vec<u8> = (0..20_000u32).map(|i| (i * 7919 % 251) as u8).collect();
++        for data in [critical, mixed] {
++            for line in [128u16, 64, 3] {
++                let wire = stuffed(&data, line);
++                for chunk in [1, 7, 4096] {
++                    let mut lines = Lines::new(Some(usize::from(line)));
++                    for part in wire.chunks(chunk) {
++                        lines.scan(part).unwrap();
++                    }
++                    lines.scan(b"=y").unwrap();
++                    lines.control();
++                    lines.scan(b".\r\n").unwrap();
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn damage_is_found_at_the_byte_that_shows_it() {
++        let wire = stuffed(&[7u8; 1000], 128);
++        let cases: [(&str, fn(&mut Vec<u8>)); 5] = [
++            ("nul", |w| w[300] = 0),
++            ("bare cr", |w| w[300] = b'\r'),
++            ("short line", |w| {
++                w.drain(200..203);
++            }),
++            ("long line", |w| {
++                w.splice(200..200, *b"xx");
++            }),
++            ("bare lf mid-line", |w| w[300] = b'\n'),
++        ];
++        for (case, damage) in cases {
++            let mut wire = wire.clone();
++            damage(&mut wire);
++            let mut lines = Lines::new(Some(128));
++            assert!(lines.scan(&wire).is_err(), "{case}");
++        }
++    }
++}
+diff --git a/crates/nntp/src/missing.rs b/crates/nntp/src/missing.rs
+index 5407983d..ed0928e9 100644
+--- a/crates/nntp/src/missing.rs
++++ b/crates/nntp/src/missing.rs
+@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, PoisonError};
+ use std::time::{Duration, Instant};
+ 
+ const TTL: Duration = Duration::from_secs(300);
++/// The group for articles that must not stream; not a provider key.
++pub(crate) const UNSTREAMABLE: &str = "";
+ const MAX_ENTRIES: usize = 10_000;
+ 
+ #[derive(Default)]
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index b396df73..20ceb912 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -15,6 +15,7 @@ use crate::client::{BodySink, Lane};
+ use crate::connection::{ConnectionStats, Link, Phase, Timing, validate_message_id};
+ use crate::downloads::{Downloads, Permit};
+ use crate::keep_warm::{KEEP_WARM_CONNECTIONS, KEEP_WARM_EVERY, KeepWarm};
++use crate::missing::{Missing, UNSTREAMABLE};
+ use crate::pace::{CacheTurns, Flight, Pace};
+ use crate::stages::{Assigned, ConnectTimes, LoadAtAssign, ReplyTimes, RequestTrace, StageClock};
+ use crate::stats::{Stats, Workload, outcome};
+@@ -293,6 +294,8 @@ pub(crate) struct Tag {
+     pub(crate) expected: crate::BodyExpectation,
+     /// Gets bodies whose caller left before they arrived.
+     pub(crate) sink: Option<Arc<OnceLock<BodySink>>>,
++    /// Remembers an article whose streamed copy came damaged; see `Client::streams`.
++    pub(crate) unstreamable: Option<Arc<Missing>>,
+     /// Waits for a connection with nothing in flight rather than pipeline behind
+     /// another request: a hedge queued behind a slow article is as slow as it.
+     pub(crate) fresh: bool,
+@@ -314,6 +317,7 @@ impl Tag {
+         progress: None,
+         expected: crate::BodyExpectation::NONE,
+         sink: None,
++        unstreamable: None,
+         fresh: false,
+         remember: true,
+         lane: None,
+@@ -352,7 +356,18 @@ impl Request {
+             Ok(Some(body)) => u32::try_from(body.data.len()).unwrap_or(u32::MAX),
+             _ => 0,
+         };
++        // A reader that was served part of a damaged copy gives up at once, so the copy
++        // must count against the provider and stop streaming without its caller.
++        let damaged = self.tag.progress.as_ref().is_some_and(|p| p.strict)
++            && matches!(
++                result,
++                Err(Error::CrcMismatch { .. } | Error::Yenc(_) | Error::TooLarge)
++            );
++        if damaged && let Some(unstreamable) = &self.tag.unstreamable {
++            unstreamable.insert(UNSTREAMABLE, &self.message_id);
++        }
+         let ended = match &result {
++            Err(error) if damaged => outcome(error),
+             // The caller stopped waiting; the reply was drained anyway.
+             _ if reply.as_ref().is_none_or(oneshot::Sender::is_closed) => Outcome::Cancelled,
+             Ok(_) => Outcome::Retrieved,
+diff --git a/crates/nntp/tests/client.rs b/crates/nntp/tests/client.rs
+index 933e39d4..3159098d 100644
+--- a/crates/nntp/tests/client.rs
++++ b/crates/nntp/tests/client.rs
+@@ -435,6 +435,7 @@ async fn another_files_first_part_fails_over_before_any_byte_streams() {
+     let progress = Progress {
+         tx,
+         wanted: Arc::new(AtomicBool::new(true)),
++        strict: false,
+     };
+ 
+     let result = only_wrong
+@@ -602,6 +603,7 @@ async fn check_identity(chunks: Vec<Vec<u8>>, data: &[u8], begin: u64, wrong: u6
+     let progress = Progress {
+         tx,
+         wanted: Arc::new(AtomicBool::new(true)),
++        strict: false,
+     };
+     let fetch = |begin| {
+         client.body_with(
+@@ -718,6 +720,7 @@ async fn progress_copies_nothing_until_wanted_then_sends_from_the_start() {
+     let progress = Progress {
+         tx,
+         wanted: Arc::new(AtomicBool::new(false)),
++        strict: false,
+     };
+     let id = &corpus.articles[0].message_id;
+ 
+diff --git a/crates/stream/src/lib.rs b/crates/stream/src/lib.rs
+index b383f0f1..b58f3c21 100644
+--- a/crates/stream/src/lib.rs
++++ b/crates/stream/src/lib.rs
+@@ -56,6 +56,11 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(1);
+ /// whole: streaming them too would hold a second copy of each body, outside the
+ /// budget, until it is read.
+ const STREAMED_FETCHES: usize = 2;
++/// Strict playback streams articles at least this large before their CRC is checked. At
++/// the 3.4 MB/s a provider connection gives at 210 ms RTT, the last byte of one this
++/// size lands about 0.45 s after the first, a third of the 1.5 s seek target; smaller
++/// ones (posters' usual 384-768 KB) keep the fully verified path, which meets it.
++const UNVERIFIED_FROM: u64 = 3 << 19;
+ /// Reader ids; `0` means none, so the first is 1.
+ static NEXT_READER: AtomicU64 = AtomicU64::new(1);
+ 
+@@ -308,12 +313,39 @@ struct Partial {
+     /// The fetch's [`Progress::wanted`], set once it is among the first
+     /// [`STREAMED_FETCHES`] of the window.
+     wanted: Arc<AtomicBool>,
++    /// End of the bytes the reader took from `data`.
++    served: usize,
++    /// The copy the reader took bytes from failed: they were never verified.
++    broken: bool,
++    strict: bool,
+ }
+ 
+ impl Partial {
++    fn new(wanted: bool, strict: bool) -> (Progress, Self) {
++        let wanted = Arc::new(AtomicBool::new(wanted));
++        let (tx, rx) = mpsc::unbounded_channel();
++        let progress = Progress {
++            tx,
++            wanted: Arc::clone(&wanted),
++            strict,
++        };
++        let partial = Self {
++            rx,
++            data: Vec::new(),
++            wanted,
++            served: 0,
++            broken: false,
++            strict,
++        };
++        (progress, partial)
++    }
++
+     /// Bytes received so far.
+     fn poll(&mut self, cx: &mut Context<'_>) -> &[u8] {
+         while let Poll::Ready(Some((at, chunk))) = self.rx.poll_recv(cx) {
++            if self.strict && at < self.data.len() && self.served > 0 {
++                self.broken = true;
++            }
+             // A retry on another provider resends from offset 0: the copy that failed
+             // may differ, so none of its unserved bytes may survive.
+             if at <= self.data.len() {
+@@ -332,7 +364,8 @@ pub struct SegmentReader {
+     layout: Arc<Layout>,
+     prefetch: usize,
+     prewarm: bool,
+-    /// Fails instead of filling, padding or cutting, and serves bodies only once whole.
++    /// Fails instead of filling, padding or cutting, and serves bodies only once whole,
++    /// except large articles playback fetches itself (see [`UNVERIFIED_FROM`]).
+     strict: bool,
+     workload: Workload,
+     /// When the file was posted, in Unix seconds; see [`BodyExpectation::posted`].
+@@ -342,6 +375,8 @@ pub struct SegmentReader {
+     cache: Option<Arc<Cache>>,
+     /// Segments from here on are fetched only when read: the caller's range ends before.
+     end: usize,
++    /// Byte offset where the caller's range ends.
++    range_end: u64,
+     /// The caller's range ends before the file does, so it is read whole: the window
+     /// opens fully at once.
+     bounded: bool,
+@@ -381,6 +416,7 @@ pub struct SegmentReader {
+ impl SegmentReader {
+     pub fn new(client: Arc<Client>, layout: Arc<Layout>, prefetch: usize) -> Self {
+         let end = layout.segments.len();
++        let range_end = layout.len();
+         let prefetch = prefetch.max(1);
+         let initial = client
+             .max_connections()
+@@ -399,6 +435,7 @@ impl SegmentReader {
+             budget: None,
+             cache: None,
+             end,
++            range_end,
+             bounded: false,
+             acquired: None,
+             pos: 0,
+@@ -500,6 +537,7 @@ impl SegmentReader {
+     /// Limits read-ahead to bytes before `end`, where the caller's range stops. Reads
+     /// past it still work, one segment at a time.
+     pub fn set_end(&mut self, end: u64) {
++        self.range_end = end;
+         self.bounded = end < self.layout.len();
+         self.end = match end.min(self.layout.len()) {
+             0 => 0,
+@@ -545,6 +583,19 @@ impl SegmentReader {
+         self
+     }
+ 
++    /// Whether segment `index`'s bytes may be served as they arrive. A strict read
++    /// allows it only for playback's own fetch of a large article whose geometry the
++    /// import measured, so its headers can be checked first.
++    fn streams(&self, index: usize) -> bool {
++        let segment = &self.layout.segments[index];
++        !self.strict
++            || (self.workload == Workload::Stream
++                && segment.size >= UNVERIFIED_FROM
++                && segment.expected.offset.is_some()
++                && segment.expected.decoded_len.is_some()
++                && self.client.streams(&segment.message_id))
++    }
++
+     fn hole(&self, index: usize) -> Hole {
+         Hole {
+             index,
+@@ -740,22 +791,12 @@ impl SegmentReader {
+             let probe = self.probe(index, wait.clone(), false);
+             probe.step(Step::Queued);
+             // Bodies stream in once armed below, so a segment is readable before it
+-            // fully arrives; strict reads never stream.
+-            let (progress, partial) = if strict {
+-                (None, None)
+-            } else {
+-                let wanted = Arc::new(AtomicBool::new(false));
+-                let (tx, rx) = mpsc::unbounded_channel();
+-                let progress = Progress {
+-                    tx,
+-                    wanted: Arc::clone(&wanted),
+-                };
+-                let partial = Partial {
+-                    rx,
+-                    data: Vec::new(),
+-                    wanted,
+-                };
++            // fully arrives.
++            let (progress, partial) = if self.streams(index) {
++                let (progress, partial) = Partial::new(false, self.strict);
+                 (Some(progress), Some(partial))
++            } else {
++                (None, None)
+             };
+             self.pending.push_back(Fetch {
+                 task: tokio::spawn(async move {
+@@ -839,8 +880,8 @@ impl SegmentReader {
+             })
+     }
+ 
+-    /// Replaces the head fetch with a new one that skips the budget and, unless strict,
+-    /// streams in, as a fetch the reader waits on may.
++    /// Replaces the head fetch with a new one that skips the budget and streams in where
++    /// [`streams`](Self::streams) allows, as a fetch the reader waits on may.
+     fn refetch_head(&mut self) {
+         let (client, layout, cache, hole, index, workload, strict, posted) = (
+             Arc::clone(&self.client),
+@@ -855,21 +896,11 @@ impl SegmentReader {
+         let wait = Some(Arc::new(Wait::default()));
+         let probe = self.probe(index, wait.clone(), false);
+         probe.step(Step::Queued);
+-        let (progress, partial) = if strict {
+-            (None, None)
+-        } else {
+-            let wanted = Arc::new(AtomicBool::new(true));
+-            let (tx, rx) = mpsc::unbounded_channel();
+-            let progress = Progress {
+-                tx,
+-                wanted: Arc::clone(&wanted),
+-            };
+-            let partial = Partial {
+-                rx,
+-                data: Vec::new(),
+-                wanted,
+-            };
++        let (progress, partial) = if self.streams(index) {
++            let (progress, partial) = Partial::new(true, self.strict);
+             (Some(progress), Some(partial))
++        } else {
++            (None, None)
+         };
+         let task = tokio::spawn(async move {
+             probe.step(Step::Bypassed);
+@@ -932,6 +963,15 @@ impl SegmentReader {
+             .as_ref()
+             .is_some_and(|wait| matches!(wait.view().stage, Stage::Pipeline | Stage::Reply));
+         if let Poll::Ready(result) = Pin::new(&mut head.task).poll(cx) {
++            if let Some(partial) = head.partial.as_mut().filter(|p| p.served > 0) {
++                partial.poll(cx);
++                if partial.broken {
++                    self.pending.pop_front();
++                    self.drop_hedge();
++                    self.clear_head();
++                    return Poll::Ready(Err(unverified()));
++                }
++            }
+             // Read-ahead that failed while nobody waited gets one fetch on demand.
+             if first
+                 && !matches!(self.workload, Workload::Health | Workload::Warm)
+@@ -961,9 +1001,19 @@ impl SegmentReader {
+             match Pin::new(hedge).poll(cx) {
+                 Poll::Ready(Ok(Ok((data, filled)))) => {
+                     self.hedge = None;
+-                    if let Some(head) = self.pending.pop_front() {
++                    let head = self.pending.pop_front();
++                    // Bytes served from the head's copy are verified only if the hedge's
++                    // checked copy holds the same ones.
++                    let mismatch = head.as_ref().and_then(|h| h.partial.as_ref()).is_some_and(
++                        |p| p.strict && p.served > 0 && data.get(..p.served) != p.data.get(..p.served),
++                    );
++                    if let Some(head) = head {
+                         head.task.abort();
+                     }
++                    if mismatch {
++                        self.clear_head();
++                        return Poll::Ready(Err(unverified()));
++                    }
+                     self.clear_head();
+                     self.note(Event::HedgeWon {
+                         segment: segment_id(self.head),
+@@ -1058,7 +1108,7 @@ impl SegmentReader {
+                 self.align(index);
+                 self.schedule(index);
+                 let Poll::Ready(result) = self.poll_head(cx) else {
+-                    if self.read_partial(cx, index, buf) {
++                    if self.read_partial(cx, index, buf)? {
+                         // Bytes reached the reader: the wait ends here, not when the body does.
+                         if let Some((at, since)) = self.waiting.take()
+                             && at == index
+@@ -1119,26 +1169,51 @@ impl SegmentReader {
+     }
+ 
+     /// Serves the head segment's bytes already received; `false` when none are new.
+-    // ponytail: streamed bytes are served before the article's CRC is checked, so a
+-    // corrupt copy that a later provider replaces leaves its prefix served (a fetch the
+-    // reader streamed whole still finishes and reports a segment no provider has intact);
+-    // buffer the head whole if that shows up in practice.
+-    fn read_partial(&mut self, cx: &mut Context<'_>, index: usize, buf: &mut ReadBuf<'_>) -> bool {
+-        let Some(partial) = self.pending.front_mut().and_then(|f| f.partial.as_mut()) else {
+-            return false;
+-        };
+-        let data = partial.poll(cx);
++    /// Fails once the copy it served from fails. A strict read keeps back the last byte
++    /// of the segment and of the caller's range until the body is verified, so neither
++    /// can end without its CRC.
++    // ponytail: a non-strict read's streamed bytes are served before the article's CRC
++    // is checked, so a corrupt copy that a later provider replaces leaves its prefix
++    // served (a fetch the reader streamed whole still finishes and reports a segment no
++    // provider has intact); buffer the head whole if that shows up in practice.
++    fn read_partial(
++        &mut self,
++        cx: &mut Context<'_>,
++        index: usize,
++        buf: &mut ReadBuf<'_>,
++    ) -> io::Result<bool> {
++        let start = self.layout.start(index);
+         let size = usize::try_from(self.layout.segments[index].size).unwrap_or(usize::MAX);
+-        let offset = usize::try_from(self.pos - self.layout.start(index))
++        let offset = usize::try_from(self.pos - start)
+             .expect("offset lies within a segment held in memory");
+-        let available = data.len().min(size);
++        let limit = if self.strict {
++            let range = usize::try_from(self.range_end.saturating_sub(start))
++                .unwrap_or(usize::MAX);
++            size.min(if range > offset { range } else { size })
++                .saturating_sub(1)
++        } else {
++            size
++        };
++        let Some(fetch) = self.pending.front_mut() else {
++            return Ok(false);
++        };
++        let Some(partial) = fetch.partial.as_mut() else {
++            return Ok(false);
++        };
++        partial.poll(cx);
++        if partial.broken {
++            fetch.partial = None;
++            return Err(unverified());
++        }
++        let available = partial.data.len().min(limit);
+         if available <= offset {
+-            return false;
++            return Ok(false);
+         }
+         let n = buf.remaining().min(available - offset);
+-        buf.put_slice(&data[offset..offset + n]);
++        buf.put_slice(&partial.data[offset..offset + n]);
++        partial.served = partial.served.max(offset + n);
+         self.pos += n as u64;
+-        true
++        Ok(true)
+     }
+ }
+ 
+@@ -1166,6 +1241,15 @@ impl Drop for SegmentReader {
+     }
+ }
+ 
++/// A read that was served bytes from a copy that then failed: nothing may make them
++/// look verified, so it ends in an error.
++fn unverified() -> io::Error {
++    io::Error::new(
++        io::ErrorKind::InvalidData,
++        "a streamed article failed verification after bytes were served",
++    )
++}
++
+ /// Segment index as recorded in traces.
+ fn segment_id(index: usize) -> u32 {
+     u32::try_from(index).unwrap_or(u32::MAX)
+@@ -1337,6 +1421,9 @@ mod tests {
+                 rx,
+                 data: Vec::new(),
+                 wanted: Arc::new(AtomicBool::new(true)),
++                served: 0,
++                broken: false,
++                strict: false,
+             };
+             let mut cx = Context::from_waker(std::task::Waker::noop());
+             tx.send((0, first.to_vec())).unwrap();
+diff --git a/crates/stream/tests/unverified.rs b/crates/stream/tests/unverified.rs
+new file mode 100644
+index 00000000..cc00d334
+--- /dev/null
++++ b/crates/stream/tests/unverified.rs
+@@ -0,0 +1,111 @@
++#![allow(clippy::unwrap_used)] // Test helpers outside `#[test]` fns; panics are the assertions.
++
++use std::io::SeekFrom;
++use std::sync::Arc;
++use std::time::Duration;
++
++use infinidysk_nntp::{
++    BodyExpectation, Client, Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode, Workload,
++};
++use infinidysk_stream::{Layout, Segment, SegmentReader};
++use infinidysk_testkit::{Corpus, LoopbackServer};
++use tokio::io::{AsyncReadExt, AsyncSeekExt};
++
++const SIZE: usize = 2 << 20;
++
++#[tokio::test]
++async fn only_playback_reads_a_large_article_before_it_is_verified() {
++    let corpus = Corpus::generate(1025, 3, SIZE);
++    let target = &corpus.articles[1];
++    for workload in Workload::ALL {
++        let server = LoopbackServer::start(corpus.articles.clone()).await.unwrap();
++        let (_, release) = server.hold_article_after(&target.message_id, target.wire.len() / 2);
++        let mut reader = SegmentReader::new(client(&server), measured(&corpus), 2)
++            .with_workload(workload)
++            .strict(true);
++        reader.seek(SeekFrom::Start(SIZE as u64)).await.unwrap();
++
++        let mut head = vec![0; 64 * 1024];
++        let early = tokio::time::timeout(
++            Duration::from_millis(if workload == Workload::Stream { 3000 } else { 400 }),
++            reader.read_exact(&mut head),
++        )
++        .await;
++        assert_eq!(early.is_ok(), workload == Workload::Stream, "{workload:?}");
++        release.send(()).unwrap();
++        if early.is_err() {
++            reader.read_exact(&mut head).await.unwrap();
++        }
++        assert_eq!(head, corpus.data[SIZE..SIZE + head.len()], "{workload:?}");
++    }
++}
++
++#[tokio::test]
++async fn a_streamed_article_keeps_its_last_byte_and_the_range_end_until_verified() {
++    let corpus = Corpus::generate(1025, 3, SIZE);
++    let target = &corpus.articles[1];
++    let range_end = SIZE + SIZE / 2;
++    for (end, held) in [(corpus.data.len(), 2 * SIZE - 1), (range_end, range_end - 1)] {
++        let server = LoopbackServer::start(corpus.articles.clone()).await.unwrap();
++        let (_, release) = server.hold_article_after(&target.message_id, target.wire.len() - 40);
++        let mut reader = SegmentReader::new(client(&server), measured(&corpus), 2)
++            .with_workload(Workload::Stream)
++            .strict(true);
++        reader.set_end(end as u64);
++        reader.seek(SeekFrom::Start(SIZE as u64)).await.unwrap();
++
++        let mut got = vec![0; held - SIZE];
++        reader.read_exact(&mut got).await.unwrap();
++        let last = tokio::time::timeout(Duration::from_millis(400), reader.read(&mut [0; 1])).await;
++        assert!(last.is_err(), "the byte before {end} waits for the CRC");
++        release.send(()).unwrap();
++        let mut byte = [0; 1];
++        reader.read_exact(&mut byte).await.unwrap();
++        assert_eq!(byte[0], corpus.data[held]);
++    }
++}
++
++fn client(server: &LoopbackServer) -> Arc<Client> {
++    let config = PoolConfig {
++        max_connections: 4,
++        pipeline_depth: 4,
++        idle_timeout: Duration::from_secs(5),
++        min_connections: 0,
++    };
++    let endpoint = Endpoint::new(
++        "127.0.0.1",
++        server.addr().port(),
++        TlsMode::Plain,
++        None,
++        Duration::from_secs(5),
++    )
++    .unwrap();
++    Arc::new(Client::new([Provider {
++        pool: Pool::new(endpoint, config, Downloads::new(32)).unwrap(),
++        key: "p0".to_owned(),
++        name: String::new(),
++        priority: 0,
++        backbone: None,
++    }]))
++}
++
++/// The corpus's layout with the geometry an import measures.
++fn measured(corpus: &Corpus) -> Arc<Layout> {
++    Arc::new(Layout::new(
++        corpus
++            .articles
++            .iter()
++            .enumerate()
++            .map(|(i, a)| Segment {
++                message_id: a.message_id.clone(),
++                size: SIZE as u64,
++                expected: BodyExpectation {
++                    offset: Some((i * SIZE) as u64),
++                    decoded_len: Some(SIZE as u64),
++                    file_size: Some(corpus.data.len() as u64),
++                    ..BodyExpectation::NONE
++                },
++            })
++            .collect(),
++    ))
++}
+diff --git a/crates/vfs/src/reader.rs b/crates/vfs/src/reader.rs
+index fe5c958b..be3308a3 100644
+--- a/crates/vfs/src/reader.rs
++++ b/crates/vfs/src/reader.rs
+@@ -126,14 +126,20 @@ fn prefetch(read_ahead: u64, size: u64, floor: Option<usize>) -> usize {
+ /// Stream segments; `offset` is where the first starts in its posted file, so trusted
+ /// sizes give each segment's expected `=ypart` offset and decoded length. `whole`: the
+ /// segments are the whole posted file, so trusted sizes also give its `=ybegin size`.
++/// Equal-sized segments also give each one's part number.
+ fn layout(segments: &Segments, offset: u64, whole: bool) -> impl Iterator<Item = Segment> + '_ {
+     let trusted = segments.sizes_trusted;
+     let file_size = (trusted && whole).then(|| segments.posted_size());
++    let part_size = part_size(segments);
+     segments.items.iter().scan(offset, move |at, s| {
+         let expected = BodyExpectation {
+             offset: trusted.then_some(*at),
+             decoded_len: trusted.then_some(u64::from(s.size)),
+             file_size,
++            name_crc: segments.name_crc,
++            layout_part: part_size
++                .filter(|&size| at.is_multiple_of(size))
++                .and_then(|size| u32::try_from(*at / size + 1).ok()),
+             ..BodyExpectation::NONE
+         };
+         *at += u64::from(s.size);
+@@ -145,6 +151,17 @@ fn layout(segments: &Segments, offset: u64, whole: bool) -> impl Iterator<Item =
+     })
+ }
+ 
++/// The size every part but the last was posted at, when trusted sizes show one.
++fn part_size(segments: &Segments) -> Option<u64> {
++    let (last, rest) = segments.items.split_last()?;
++    let size = rest.first()?.size;
++    (segments.sizes_trusted
++        && size > 0
++        && last.size <= size
++        && rest.iter().all(|s| s.size == size))
++        .then_some(u64::from(size))
++}
++
+ impl Reader {
+     /// Fills unavailable segments of the file `name` with its container's filler.
+     #[must_use]
+-- 
+2.56.1
+

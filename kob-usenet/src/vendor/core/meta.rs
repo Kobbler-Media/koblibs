@@ -92,6 +92,9 @@ pub struct Segments {
     /// poster that wrote a wrong size). Blob version 5 stores it.
     #[serde(skip)]
     pub posted_size: Option<u64>,
+    /// CRC-32 of the `=ybegin name=` every article carries. Blob version 6 stores it.
+    #[serde(skip)]
+    pub name_crc: Option<u32>,
 }
 
 impl Segments {
