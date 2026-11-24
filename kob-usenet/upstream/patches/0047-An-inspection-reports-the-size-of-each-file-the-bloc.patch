@@ -1,0 +1,182 @@
+From 10933ce5c4de979b9c5b93a062345c62df77afec Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Tue, 24 Nov 2026 14:07:03 +1100
+Subject: [PATCH 47/47] An inspection reports the size of each file the block
+ list dropped
+
+---
+ crates/queue/src/import.rs         | 18 +++++++++--------
+ crates/queue/src/import/inspect.rs | 31 +++++++++++++++++++++---------
+ 2 files changed, 32 insertions(+), 17 deletions(-)
+
+diff --git a/crates/queue/src/import.rs b/crates/queue/src/import.rs
+index bcd6585b..9bbb2c53 100644
+--- a/crates/queue/src/import.rs
++++ b/crates/queue/src/import.rs
+@@ -30,7 +30,7 @@ use crate::nzb::{self, Nzb};
+ mod inspect;
+ 
+ pub use inspect::{
+-    Access, ArchiveSet, ArchiveType, Encrypted, Failure, FailureKind, Inspected, Inspection,
++    Access, ArchiveSet, ArchiveType, BlockedFile, Encrypted, Failure, FailureKind, Inspected, Inspection,
+     Inspector, Level, Timings,
+ };
+ 
+@@ -303,6 +303,7 @@ pub trait Verifier: Send + Sync {
+ 
+ /// One NZB file entry.
+ struct Input {
++    size: u64,
+     name: String,
+     source: NameSource,
+     kind: Kind,
+@@ -354,10 +355,10 @@ struct Job {
+ }
+ 
+ impl Job {
+-    fn blocks(&self, name: &str) -> bool {
++    fn blocks(&self, name: &str, size: Option<u64>) -> bool {
+         let blocked = names::is_blocked(name, &self.blocklist);
+         if blocked {
+-            self.note_blocked(name);
++            self.note_blocked(name, size);
+         }
+         blocked
+     }
+@@ -564,6 +565,7 @@ async fn plan(
+                 },
+             };
+             Input {
++                size: file.bytes(),
+                 name,
+                 source: if matched.is_some() {
+                     NameSource::Par2
+@@ -583,7 +585,7 @@ async fn plan(
+             let input = &inputs[i];
+             match input.kind {
+                 Kind::Par2 => false,
+-                Kind::Plain => !job.blocks(&input.name),
++                Kind::Plain => !job.blocks(&input.name, Some(input.size)),
+                 _ => true,
+             }
+         })
+@@ -810,7 +812,7 @@ async fn inner_nzb(job: &Job, outputs: &[Output]) -> Result<Option<Vec<u8>>, Err
+         let Some(name) = output.path.last() else {
+             continue;
+         };
+-        if job.blocks(name) {
++        if job.blocks(name, Some(output.meta.size())) {
+             continue;
+         }
+         if !is_nzb(name) {
+@@ -1582,7 +1584,7 @@ async fn rar_set(
+     let mut out = Vec::new();
+     for (i, m) in members.into_iter().enumerate() {
+         // A member never imported needs no streamable flags.
+-        if job.blocks(&m.name) {
++        if job.blocks(&m.name, m.size) {
+             continue;
+         }
+         if m.open || headless.contains(&i) {
+@@ -1774,7 +1776,7 @@ async fn sevenzip_set(
+         // Mapping an entry rescans every volume's segments and may not await, so a large
+         // archive would otherwise run past the inspection deadline without a cancel point.
+         tokio::task::consume_budget().await;
+-        if job.blocks(&e.name) {
++        if job.blocks(&e.name, Some(e.size)) {
+             continue;
+         }
+         if e.encrypted {
+@@ -2146,7 +2148,7 @@ fn filter(outputs: Vec<Output>, job: &Job) -> Vec<Output> {
+         .into_iter()
+         .filter(|output| {
+             let (file, dirs) = output.path.split_last().expect("paths are never empty");
+-            if job.blocks(file) {
++            if job.blocks(file, Some(output.meta.size())) {
+                 return false;
+             }
+             let Some(size) = video_size(output) else {
+diff --git a/crates/queue/src/import/inspect.rs b/crates/queue/src/import/inspect.rs
+index 8dac40cb..aed88bfd 100644
+--- a/crates/queue/src/import/inspect.rs
++++ b/crates/queue/src/import/inspect.rs
+@@ -1,7 +1,7 @@
+ //! Inspection: the planner run on an NZB that is never imported, and the report of what
+ //! it saw.
+ 
+-use std::collections::{BTreeSet, HashSet};
++use std::collections::{BTreeMap, HashSet};
+ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+ use std::time::{Duration, Instant};
+@@ -81,8 +81,8 @@ struct Notes {
+     opaque: bool,
+     /// A limit was reached; stays set whatever became of the error.
+     exceeded: bool,
+-    /// Files and members the block list dropped.
+-    blocked: BTreeSet<String>,
++    /// Files and members the block list dropped, with the largest size seen for the name.
++    blocked: BTreeMap<String, Option<u64>>,
+     /// Filtering left nothing to import.
+     emptied: bool,
+ }
+@@ -276,6 +276,14 @@ pub struct Inspected {
+     pub set: Option<usize>,
+ }
+ 
++/// A file or member the block list dropped.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct BlockedFile {
++    pub name: String,
++    /// `None` when its archive does not record a size.
++    pub size: Option<u64>,
++}
++
+ /// What an inspection established about an NZB.
+ #[derive(Debug, Clone, Default, PartialEq, Eq)]
+ #[allow(
+@@ -298,7 +306,7 @@ pub struct Inspection {
+     /// An archive inside an archive stayed a file, so its members are not listed.
+     pub nested_archive_opaque: bool,
+     /// Files and members the block list dropped, which [`Self::files`] leaves out.
+-    pub blocked: Vec<String>,
++    pub blocked: Vec<BlockedFile>,
+     /// Every name was read and the block list dropped all of them, so an import finds
+     /// nothing; [`Self::manifest_complete`] is false for that failure.
+     pub only_blocked: bool,
+@@ -333,14 +341,16 @@ impl Job {
+             .is_some_and(|run| run.notes().failure.is_some())
+     }
+ 
+-    pub(super) fn note_blocked(&self, name: &str) {
++    pub(super) fn note_blocked(&self, name: &str, size: Option<u64>) {
+         let Some(run) = &self.inspection else {
+             return;
+         };
+         let mut notes = run.notes();
+-        if notes.blocked.len() < run.limits.reported {
+-            notes.blocked.insert(name.to_owned());
+-        } else if !notes.blocked.contains(name) {
++        if let Some(known) = notes.blocked.get_mut(name) {
++            *known = (*known).max(size);
++        } else if notes.blocked.len() < run.limits.reported {
++            notes.blocked.insert(name.to_owned(), size);
++        } else {
+             notes.exceeded = true;
+         }
+     }
+@@ -628,7 +638,10 @@ impl Inspector {
+                 && !notes.opaque
+                 && !notes.exceeded
+                 && !notes.blocked.is_empty(),
+-            blocked: std::mem::take(&mut notes.blocked).into_iter().collect(),
++            blocked: std::mem::take(&mut notes.blocked)
++                .into_iter()
++                .map(|(name, size)| BlockedFile { name, size })
++                .collect(),
+             files,
+             password_not_validated: notes
+                 .sets
+-- 
+2.56.1
+

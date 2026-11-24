@@ -3,8 +3,11 @@
 //! small and grows while more in flight buys more throughput, as it does on a provider that
 //! caps each connection.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+
+use tokio::sync::{Notify, OwnedMutexGuard};
 
 const INITIAL: u64 = 20 << 20;
 /// Quarters of the bound a cache-ahead keeps while a seek runs.
@@ -20,6 +23,7 @@ const SEEK_DRAIN_SECS: f64 = 0.5;
 struct State {
     limit: u64,
     in_flight: u64,
+    readers: HashMap<u64, u64>,
     tried: Option<(u64, f64)>,
     settled: bool,
     window: Instant,
@@ -29,15 +33,12 @@ struct State {
     last: Instant,
 }
 
-#[derive(Debug)]
-pub(crate) struct Pace(Mutex<State>);
-
-impl Default for Pace {
-    fn default() -> Self {
-        let now = Instant::now();
-        Self(Mutex::new(State {
+impl State {
+    fn fresh(now: Instant) -> Self {
+        Self {
             limit: INITIAL,
             in_flight: 0,
+            readers: HashMap::new(),
             tried: None,
             settled: false,
             window: now,
@@ -45,18 +46,50 @@ impl Default for Pace {
             bound: false,
             seeking: false,
             last: now,
-        }))
+        }
+    }
+
+    fn release(&mut self, bytes: u64, reader: u64) {
+        self.in_flight = self.in_flight.saturating_sub(bytes);
+        if let Some(held) = self.readers.get_mut(&reader) {
+            *held = held.saturating_sub(bytes);
+            if *held == 0 {
+                self.readers.remove(&reader);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Pace {
+    state: Mutex<State>,
+    changed: Arc<Notify>,
+}
+
+impl Default for Pace {
+    fn default() -> Self {
+        Self::waking(Arc::default())
     }
 }
 
 impl Pace {
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    /// `changed` hears of bytes given back without ever having landed.
+    pub(crate) fn waking(changed: Arc<Notify>) -> Self {
+        Self {
+            state: Mutex::new(State::fresh(Instant::now())),
+            changed,
+        }
     }
 
-    /// Whether another request must wait. While a seek runs the bound halves; a lone request
-    /// always goes, so an article larger than the bound still moves.
-    pub(crate) fn full(&self, seeking: bool) -> bool {
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether `reader`'s next request must wait. While a seek runs the bound shrinks; a lone
+    /// request always goes, so an article larger than the bound still moves. A reader under
+    /// its even share of the bound goes too: one that just started would otherwise wait
+    /// for the whole backlog of a reader already filling it.
+    pub(crate) fn full(&self, seeking: bool, reader: u64) -> bool {
         let mut state = self.lock();
         state.seeking |= seeking;
         let limit = if seeking {
@@ -64,7 +97,10 @@ impl Pace {
         } else {
             state.limit
         };
-        let full = state.in_flight > 0 && state.in_flight >= limit;
+        let own = state.readers.get(&reader).copied().unwrap_or(0);
+        let others = state.readers.len() - usize::from(own > 0);
+        let share = limit / (others as u64 + 1);
+        let full = state.in_flight > 0 && state.in_flight >= limit && own >= share;
         state.bound |= full;
         full
     }
@@ -75,9 +111,19 @@ impl Pace {
         (state.in_flight, state.limit * SEEKING_SHARE / 4)
     }
 
-    fn landed(&self, bytes: u64, now: Instant) {
+    #[cfg(test)]
+    pub(crate) fn landed_in_window(&self) -> u64 {
+        self.lock().landed
+    }
+
+    fn refund(&self, bytes: u64, reader: u64) {
+        self.lock().release(bytes, reader);
+        self.changed.notify_waiters();
+    }
+
+    fn landed(&self, bytes: u64, reader: u64, now: Instant) {
         let mut state = self.lock();
-        state.in_flight = state.in_flight.saturating_sub(bytes);
+        state.release(bytes, reader);
         state.landed += bytes;
         state.last = now;
         let elapsed = now.duration_since(state.window);
@@ -105,52 +151,108 @@ impl Pace {
         state.seeking = false;
     }
 
-    fn charge(&self, bytes: u64, now: Instant) {
+    fn charge(&self, bytes: u64, reader: u64, now: Instant) {
         let mut state = self.lock();
         if state.in_flight == 0 && now.duration_since(state.last) >= IDLE_RESET {
-            *state = State {
-                in_flight: 0,
-                window: now,
-                last: now,
-                ..Self::default()
-                    .0
-                    .into_inner()
-                    .unwrap_or_else(PoisonError::into_inner)
-            };
+            *state = State::fresh(now);
         }
         state.in_flight += bytes;
+        if bytes > 0 {
+            *state.readers.entry(reader).or_default() += bytes;
+        }
     }
 }
 
-/// One cache request's bytes, counted in flight from when it takes a connection.
+/// One cache request's bytes, counted in flight from when it takes a connection, or reserves
+/// one it is opening. A request that never got one gives them back as not having landed.
 #[derive(Debug, Default)]
 pub(crate) struct Flight {
     pace: Option<Arc<Pace>>,
     bytes: u64,
+    reader: u64,
     charged: bool,
+    assigned: bool,
 }
 
 impl Flight {
-    pub(crate) fn of(pace: &Arc<Pace>, bytes: u64) -> Self {
+    pub(crate) fn of(pace: &Arc<Pace>, bytes: u64, reader: u64) -> Self {
         Self {
             pace: Some(Arc::clone(pace)),
             bytes,
+            reader,
             charged: false,
+            assigned: false,
         }
     }
 
     pub(crate) fn charge(&mut self) {
         if let (Some(pace), false) = (&self.pace, self.charged) {
-            pace.charge(self.bytes, Instant::now());
+            pace.charge(self.bytes, self.reader, Instant::now());
             self.charged = true;
+        }
+    }
+
+    pub(crate) const fn assign(&mut self) {
+        self.assigned = true;
+    }
+
+    pub(crate) fn refund(&mut self) {
+        if let (Some(pace), true) = (&self.pace, std::mem::take(&mut self.charged)) {
+            pace.refund(self.bytes, self.reader);
         }
     }
 }
 
 impl Drop for Flight {
     fn drop(&mut self) {
-        if let (Some(pace), true) = (&self.pace, self.charged) {
-            pace.landed(self.bytes, Instant::now());
+        if !self.assigned {
+            self.refund();
+        } else if let (Some(pace), true) = (&self.pace, self.charged) {
+            pace.landed(self.bytes, self.reader, Instant::now());
+        }
+    }
+}
+
+/// Each cache reader chooses connections in its own request order. Readers do not queue
+/// behind each other: a new one would wait out everything the other has parked.
+#[derive(Debug, Default)]
+pub(crate) struct CacheTurns(Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>);
+
+impl CacheTurns {
+    fn lock(&self) -> MutexGuard<'_, HashMap<u64, Arc<tokio::sync::Mutex<()>>>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) async fn take(self: &Arc<Self>, reader: u64) -> CacheTurn {
+        let queue = Arc::clone(self.lock().entry(reader).or_default());
+        let mut turn = CacheTurn {
+            turns: Arc::clone(self),
+            reader,
+            queue: Some(Arc::clone(&queue)),
+            guard: None,
+        };
+        turn.guard = Some(queue.lock_owned().await);
+        turn
+    }
+}
+
+pub(crate) struct CacheTurn {
+    turns: Arc<CacheTurns>,
+    reader: u64,
+    queue: Option<Arc<tokio::sync::Mutex<()>>>,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for CacheTurn {
+    fn drop(&mut self) {
+        self.guard.take();
+        self.queue.take();
+        let mut queues = self.turns.lock();
+        if queues
+            .get(&self.reader)
+            .is_some_and(|queue| Arc::strong_count(queue) == 1)
+        {
+            queues.remove(&self.reader);
         }
     }
 }
@@ -160,14 +262,15 @@ mod tests {
     use super::*;
 
     const ARTICLE: u64 = 1 << 20;
+    const READER: u64 = 7;
 
     fn window(pace: &Pace, at: &mut Instant, rate: u64) -> u64 {
-        pace.charge(ARTICLE, *at);
-        assert!(!pace.full(false) || pace.lock().limit <= ARTICLE);
+        pace.charge(ARTICLE, READER, *at);
+        assert!(!pace.full(false, READER) || pace.lock().limit <= ARTICLE);
         pace.lock().bound = true;
         pace.lock().landed = rate * PROBE.as_secs() - ARTICLE;
         *at += PROBE;
-        pace.landed(ARTICLE, *at);
+        pace.landed(ARTICLE, READER, *at);
         pace.lock().limit
     }
 
@@ -192,7 +295,7 @@ mod tests {
         ] {
             let pace = Pace::default();
             let mut at = pace.lock().window;
-            assert!(!pace.full(true));
+            assert!(!pace.full(true, READER));
             assert_eq!(window(&pace, &mut at, rate), grown, "{rate} B/s");
         }
     }
@@ -201,9 +304,9 @@ mod tests {
     fn a_lone_request_always_goes_and_a_seek_halves_the_bound() {
         let pace = Pace::default();
         let now = Instant::now();
-        assert!(!pace.full(true));
-        pace.charge(INITIAL * SEEKING_SHARE / 4, now);
-        assert!(!pace.full(false));
-        assert!(pace.full(true));
+        assert!(!pace.full(true, READER));
+        pace.charge(INITIAL * SEEKING_SHARE / 4, READER, now);
+        assert!(!pace.full(false, READER));
+        assert!(pace.full(true, READER));
     }
 }

@@ -1,7 +1,7 @@
 //! Inspection: the planner run on an NZB that is never imported, and the report of what
 //! it saw.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -81,8 +81,8 @@ struct Notes {
     opaque: bool,
     /// A limit was reached; stays set whatever became of the error.
     exceeded: bool,
-    /// Files and members the block list dropped.
-    blocked: BTreeSet<String>,
+    /// Files and members the block list dropped, with the largest size seen for the name.
+    blocked: BTreeMap<String, Option<u64>>,
     /// Filtering left nothing to import.
     emptied: bool,
 }
@@ -276,6 +276,14 @@ pub struct Inspected {
     pub set: Option<usize>,
 }
 
+/// A file or member the block list dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedFile {
+    pub name: String,
+    /// `None` when its archive does not record a size.
+    pub size: Option<u64>,
+}
+
 /// What an inspection established about an NZB.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[allow(
@@ -298,7 +306,7 @@ pub struct Inspection {
     /// An archive inside an archive stayed a file, so its members are not listed.
     pub nested_archive_opaque: bool,
     /// Files and members the block list dropped, which [`Self::files`] leaves out.
-    pub blocked: Vec<String>,
+    pub blocked: Vec<BlockedFile>,
     /// Every name was read and the block list dropped all of them, so an import finds
     /// nothing; [`Self::manifest_complete`] is false for that failure.
     pub only_blocked: bool,
@@ -333,14 +341,16 @@ impl Job {
             .is_some_and(|run| run.notes().failure.is_some())
     }
 
-    pub(super) fn note_blocked(&self, name: &str) {
+    pub(super) fn note_blocked(&self, name: &str, size: Option<u64>) {
         let Some(run) = &self.inspection else {
             return;
         };
         let mut notes = run.notes();
-        if notes.blocked.len() < run.limits.reported {
-            notes.blocked.insert(name.to_owned());
-        } else if !notes.blocked.contains(name) {
+        if let Some(known) = notes.blocked.get_mut(name) {
+            *known = (*known).max(size);
+        } else if notes.blocked.len() < run.limits.reported {
+            notes.blocked.insert(name.to_owned(), size);
+        } else {
             notes.exceeded = true;
         }
     }
@@ -628,7 +638,10 @@ impl Inspector {
                 && !notes.opaque
                 && !notes.exceeded
                 && !notes.blocked.is_empty(),
-            blocked: std::mem::take(&mut notes.blocked).into_iter().collect(),
+            blocked: std::mem::take(&mut notes.blocked)
+                .into_iter()
+                .map(|(name, size)| BlockedFile { name, size })
+                .collect(),
             files,
             password_not_validated: notes
                 .sets

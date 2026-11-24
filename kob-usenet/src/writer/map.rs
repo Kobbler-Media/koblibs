@@ -63,6 +63,15 @@ impl SegmentMap {
         })
     }
 
+    pub fn invalidate(path: &Path) -> io::Result<()> {
+        let file = match OpenOptions::new().write(true).open(path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            opened => opened?,
+        };
+        file.set_len(0)?;
+        file.sync_data()
+    }
+
     pub fn stamp(&self, data: Identity) -> io::Result<()> {
         let mut bytes = data.bytes().to_vec();
         bytes.extend(self.marks.iter().map(|&m| m as u8));

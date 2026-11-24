@@ -1,0 +1,632 @@
+From b88ca8a3a946d708f9c53ad2ca23ff0ec9a217c3 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Tue, 24 Nov 2026 14:00:00 +1100
+Subject: [PATCH 43/47] Cache-ahead gives back the pacing charge of a connect
+ that got nothing, and a new cache reader shares the bound instead of queuing
+ behind another
+
+---
+ crates/nntp/src/pace.rs                  | 173 ++++++++++++++++-----
+ crates/nntp/src/pool.rs                  |  44 ++++--
+ crates/nntp/src/pool_contention_tests.rs | 189 +++++++++++++++++++++++
+ 3 files changed, 359 insertions(+), 47 deletions(-)
+ create mode 100644 crates/nntp/src/pool_contention_tests.rs
+
+diff --git a/crates/nntp/src/pace.rs b/crates/nntp/src/pace.rs
+index f038ab8e..85d1fc0b 100644
+--- a/crates/nntp/src/pace.rs
++++ b/crates/nntp/src/pace.rs
+@@ -3,9 +3,12 @@
+ //! small and grows while more in flight buys more throughput, as it does on a provider that
+ //! caps each connection.
+ 
++use std::collections::HashMap;
+ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+ use std::time::{Duration, Instant};
+ 
++use tokio::sync::{Notify, OwnedMutexGuard};
++
+ const INITIAL: u64 = 20 << 20;
+ /// Quarters of the bound a cache-ahead keeps while a seek runs.
+ const SEEKING_SHARE: u64 = 3;
+@@ -20,6 +23,7 @@ const SEEK_DRAIN_SECS: f64 = 0.5;
+ struct State {
+     limit: u64,
+     in_flight: u64,
++    readers: HashMap<u64, u64>,
+     tried: Option<(u64, f64)>,
+     settled: bool,
+     window: Instant,
+@@ -29,15 +33,12 @@ struct State {
+     last: Instant,
+ }
+ 
+-#[derive(Debug)]
+-pub(crate) struct Pace(Mutex<State>);
+-
+-impl Default for Pace {
+-    fn default() -> Self {
+-        let now = Instant::now();
+-        Self(Mutex::new(State {
++impl State {
++    fn fresh(now: Instant) -> Self {
++        Self {
+             limit: INITIAL,
+             in_flight: 0,
++            readers: HashMap::new(),
+             tried: None,
+             settled: false,
+             window: now,
+@@ -45,22 +46,54 @@ impl Default for Pace {
+             bound: false,
+             seeking: false,
+             last: now,
+-        }))
++        }
++    }
++
++    fn release(&mut self, bytes: u64, reader: u64) {
++        self.in_flight = self.in_flight.saturating_sub(bytes);
++        if let Some(held) = self.readers.get_mut(&reader) {
++            *held = held.saturating_sub(bytes);
++            if *held == 0 {
++                self.readers.remove(&reader);
++            }
++        }
++    }
++}
++
++#[derive(Debug)]
++pub(crate) struct Pace {
++    state: Mutex<State>,
++    changed: Arc<Notify>,
++}
++
++impl Default for Pace {
++    fn default() -> Self {
++        Self::waking(Arc::default())
+     }
+ }
+ 
+ impl Pace {
++    /// `changed` hears of bytes given back without ever having landed.
++    pub(crate) fn waking(changed: Arc<Notify>) -> Self {
++        Self { state: Mutex::new(State::fresh(Instant::now())), changed }
++    }
++
+     fn lock(&self) -> MutexGuard<'_, State> {
+-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
++        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+     }
+ 
+-    /// Whether another request must wait. While a seek runs the bound halves; a lone request
+-    /// always goes, so an article larger than the bound still moves.
+-    pub(crate) fn full(&self, seeking: bool) -> bool {
++    /// Whether `reader`'s next request must wait. While a seek runs the bound shrinks; a lone
++    /// request always goes, so an article larger than the bound still moves. A reader under
++    /// its even share of the bound goes too: one that just started would otherwise wait
++    /// for the whole backlog of a reader already filling it.
++    pub(crate) fn full(&self, seeking: bool, reader: u64) -> bool {
+         let mut state = self.lock();
+         state.seeking |= seeking;
+         let limit = if seeking { state.limit * SEEKING_SHARE / 4 } else { state.limit };
+-        let full = state.in_flight > 0 && state.in_flight >= limit;
++        let own = state.readers.get(&reader).copied().unwrap_or(0);
++        let others = state.readers.len() - usize::from(own > 0);
++        let share = limit / (others as u64 + 1);
++        let full = state.in_flight > 0 && state.in_flight >= limit && own >= share;
+         state.bound |= full;
+         full
+     }
+@@ -71,9 +104,19 @@ impl Pace {
+         (state.in_flight, state.limit * SEEKING_SHARE / 4)
+     }
+ 
+-    fn landed(&self, bytes: u64, now: Instant) {
++    #[cfg(test)]
++    pub(crate) fn landed_in_window(&self) -> u64 {
++        self.lock().landed
++    }
++
++    fn refund(&self, bytes: u64, reader: u64) {
++        self.lock().release(bytes, reader);
++        self.changed.notify_waiters();
++    }
++
++    fn landed(&self, bytes: u64, reader: u64, now: Instant) {
+         let mut state = self.lock();
+-        state.in_flight = state.in_flight.saturating_sub(bytes);
++        state.release(bytes, reader);
+         state.landed += bytes;
+         state.last = now;
+         let elapsed = now.duration_since(state.window);
+@@ -101,49 +144,108 @@ impl Pace {
+         state.seeking = false;
+     }
+ 
+-    fn charge(&self, bytes: u64, now: Instant) {
++    fn charge(&self, bytes: u64, reader: u64, now: Instant) {
+         let mut state = self.lock();
+         if state.in_flight == 0 && now.duration_since(state.last) >= IDLE_RESET {
+-            *state = State {
+-                in_flight: 0,
+-                window: now,
+-                last: now,
+-                ..Self::default().0.into_inner().unwrap_or_else(PoisonError::into_inner)
+-            };
++            *state = State::fresh(now);
+         }
+         state.in_flight += bytes;
++        if bytes > 0 {
++            *state.readers.entry(reader).or_default() += bytes;
++        }
+     }
+ }
+ 
+-/// One cache request's bytes, counted in flight from when it takes a connection.
++/// One cache request's bytes, counted in flight from when it takes a connection, or reserves
++/// one it is opening. A request that never got one gives them back as not having landed.
+ #[derive(Debug, Default)]
+ pub(crate) struct Flight {
+     pace: Option<Arc<Pace>>,
+     bytes: u64,
++    reader: u64,
+     charged: bool,
++    assigned: bool,
+ }
+ 
+ impl Flight {
+-    pub(crate) fn of(pace: &Arc<Pace>, bytes: u64) -> Self {
++    pub(crate) fn of(pace: &Arc<Pace>, bytes: u64, reader: u64) -> Self {
+         Self {
+             pace: Some(Arc::clone(pace)),
+             bytes,
++            reader,
+             charged: false,
++            assigned: false,
+         }
+     }
+ 
+     pub(crate) fn charge(&mut self) {
+         if let (Some(pace), false) = (&self.pace, self.charged) {
+-            pace.charge(self.bytes, Instant::now());
++            pace.charge(self.bytes, self.reader, Instant::now());
+             self.charged = true;
+         }
+     }
++
++    pub(crate) const fn assign(&mut self) {
++        self.assigned = true;
++    }
++
++    pub(crate) fn refund(&mut self) {
++        if let (Some(pace), true) = (&self.pace, std::mem::take(&mut self.charged)) {
++            pace.refund(self.bytes, self.reader);
++        }
++    }
+ }
+ 
+ impl Drop for Flight {
+     fn drop(&mut self) {
+-        if let (Some(pace), true) = (&self.pace, self.charged) {
+-            pace.landed(self.bytes, Instant::now());
++        if !self.assigned {
++            self.refund();
++        } else if let (Some(pace), true) = (&self.pace, self.charged) {
++            pace.landed(self.bytes, self.reader, Instant::now());
++        }
++    }
++}
++
++/// Each cache reader chooses connections in its own request order. Readers do not queue
++/// behind each other: a new one would wait out everything the other has parked.
++#[derive(Debug, Default)]
++pub(crate) struct CacheTurns(Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>);
++
++impl CacheTurns {
++    fn lock(&self) -> MutexGuard<'_, HashMap<u64, Arc<tokio::sync::Mutex<()>>>> {
++        self.0.lock().unwrap_or_else(PoisonError::into_inner)
++    }
++
++    pub(crate) async fn take(self: &Arc<Self>, reader: u64) -> CacheTurn {
++        let queue = Arc::clone(self.lock().entry(reader).or_default());
++        let mut turn = CacheTurn {
++            turns: Arc::clone(self),
++            reader,
++            queue: Some(Arc::clone(&queue)),
++            guard: None,
++        };
++        turn.guard = Some(queue.lock_owned().await);
++        turn
++    }
++}
++
++pub(crate) struct CacheTurn {
++    turns: Arc<CacheTurns>,
++    reader: u64,
++    queue: Option<Arc<tokio::sync::Mutex<()>>>,
++    guard: Option<OwnedMutexGuard<()>>,
++}
++
++impl Drop for CacheTurn {
++    fn drop(&mut self) {
++        self.guard.take();
++        self.queue.take();
++        let mut queues = self.turns.lock();
++        if queues
++            .get(&self.reader)
++            .is_some_and(|queue| Arc::strong_count(queue) == 1)
++        {
++            queues.remove(&self.reader);
+         }
+     }
+ }
+@@ -153,14 +255,15 @@ mod tests {
+     use super::*;
+ 
+     const ARTICLE: u64 = 1 << 20;
++    const READER: u64 = 7;
+ 
+     fn window(pace: &Pace, at: &mut Instant, rate: u64) -> u64 {
+-        pace.charge(ARTICLE, *at);
+-        assert!(!pace.full(false) || pace.lock().limit <= ARTICLE);
++        pace.charge(ARTICLE, READER, *at);
++        assert!(!pace.full(false, READER) || pace.lock().limit <= ARTICLE);
+         pace.lock().bound = true;
+         pace.lock().landed = rate * PROBE.as_secs() - ARTICLE;
+         *at += PROBE;
+-        pace.landed(ARTICLE, *at);
++        pace.landed(ARTICLE, READER, *at);
+         pace.lock().limit
+     }
+ 
+@@ -185,7 +288,7 @@ mod tests {
+         ] {
+             let pace = Pace::default();
+             let mut at = pace.lock().window;
+-            assert!(!pace.full(true));
++            assert!(!pace.full(true, READER));
+             assert_eq!(window(&pace, &mut at, rate), grown, "{rate} B/s");
+         }
+     }
+@@ -194,9 +297,9 @@ mod tests {
+     fn a_lone_request_always_goes_and_a_seek_halves_the_bound() {
+         let pace = Pace::default();
+         let now = Instant::now();
+-        assert!(!pace.full(true));
+-        pace.charge(INITIAL * SEEKING_SHARE / 4, now);
+-        assert!(!pace.full(false));
+-        assert!(pace.full(true));
++        assert!(!pace.full(true, READER));
++        pace.charge(INITIAL * SEEKING_SHARE / 4, READER, now);
++        assert!(!pace.full(false, READER));
++        assert!(pace.full(true, READER));
+     }
+ }
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index 752697ca..bf13e17d 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -15,7 +15,7 @@ use crate::client::{BodySink, Lane};
+ use crate::connection::{ConnectionStats, Link, Phase, Timing, validate_message_id};
+ use crate::downloads::{Downloads, Permit};
+ use crate::keep_warm::{KEEP_WARM_CONNECTIONS, KEEP_WARM_EVERY, KeepWarm};
+-use crate::pace::{Flight, Pace};
++use crate::pace::{CacheTurns, Flight, Pace};
+ use crate::stages::{Assigned, ConnectTimes, LoadAtAssign, ReplyTimes, RequestTrace, StageClock};
+ use crate::stats::{Stats, Workload, outcome};
+ use crate::{Connection, Endpoint, Error, Progress, Usage};
+@@ -123,9 +123,9 @@ pub struct Pool {
+     /// [`Workload::Cache`] requests holding a download slot and waiting for a
+     /// connection; lower-ranked background work takes none meanwhile.
+     cache_parked: Arc<AtomicUsize>,
+-    /// Taken in request order by [`Workload::Cache`] requests choosing a connection, so a
+-    /// reader's next segment is not outrun by the read-ahead parked behind it.
+-    cache_turn: Arc<tokio::sync::Mutex<()>>,
++    /// Taken in request order by each reader's [`Workload::Cache`] requests choosing a
++    /// connection, so its next segment is not outrun by the read-ahead parked behind it.
++    cache_turns: Arc<CacheTurns>,
+     /// Requests of a job holding no connection yet, under [`YIELD_DEPTH`]: jobs that hold
+     /// some let theirs drain, or their backlog refills every slot before it is ever idle.
+     lanes_waiting: Arc<AtomicUsize>,
+@@ -442,6 +442,7 @@ impl Pool {
+         if config.max_connections == 0 || config.pipeline_depth == 0 {
+             return Err(Error::InvalidArgument("pool config"));
+         }
++        let changed: Arc<Notify> = Arc::default();
+         let keep = Arc::new(KeepWarm::new(
+             Arc::clone(downloads.viewers()),
+             KEEP_WARM_CONNECTIONS.min(seek_connections(config.max_connections)),
+@@ -456,12 +457,12 @@ impl Pool {
+             stream_waiting: Arc::default(),
+             stream_parked: Arc::default(),
+             cache_parked: Arc::default(),
+-            cache_turn: Arc::default(),
++            cache_turns: Arc::default(),
+             lanes_waiting: Arc::default(),
+-            pace: Arc::default(),
++            pace: Arc::new(Pace::waking(Arc::clone(&changed))),
+             live: Arc::default(),
+             state: Arc::default(),
+-            changed: Arc::default(),
++            changed,
+             stats: Arc::default(),
+             stream_wait: STREAM_WAIT,
+             weight_large: false,
+@@ -805,7 +806,11 @@ impl Pool {
+             };
+             let mut flight = if tag.workload == Workload::Cache {
+                 let size = tag.probe.as_ref().map(|probe| u64::from(probe.size));
+-                Flight::of(&self.pace, size.or(tag.expected.decoded_len).unwrap_or(0))
++                Flight::of(
++                    &self.pace,
++                    size.or(tag.expected.decoded_len).unwrap_or(0),
++                    lane.map_or(0, |lane| lane.0),
++                )
+             } else {
+                 Flight::default()
+             };
+@@ -825,6 +830,7 @@ impl Pool {
+             let Some((tx, load, ahead, connection, taken)) = picked else {
+                 continue;
+             };
++            flight.assign();
+             let Taken {
+                 opened,
+                 warm,
+@@ -978,8 +984,9 @@ impl Pool {
+         let viewers = self.downloads.viewers();
+         let (mut impatient, mut first) = (false, true);
+         let mut lane_waiting = None;
++        let reader = lane.map_or(0, |lane| lane.0);
+         let mut turn = if workload == Workload::Cache {
+-            Some(self.cache_turn.lock().await)
++            Some(self.cache_turns.take(reader).await)
+         } else {
+             None
+         };
+@@ -1095,8 +1102,16 @@ impl Pool {
+                 // cache request, which never pipelines behind it.
+                 let yielding = outranked && self.cache_parked.load(Ordering::Relaxed) > 0;
+                 let capped = starved || share.is_some_and(|(busy, room)| busy >= room);
+-                let spare =
+-                    open < limit && !hold_headroom && !capped && !yielding && held.is_none();
++                // With the account's connections all in use a connect only waits out its timeout,
++                // while the request could be running on a connection this pool already has.
++                let account_free =
++                    state.workers.is_empty() || self.account.available_permits() > 0;
++                let spare = open < limit
++                    && !hold_headroom
++                    && !capped
++                    && !yielding
++                    && held.is_none()
++                    && account_free;
+                 let live = !state.workers.is_empty();
+                 let own_depth = if outranked && limit >= CACHE_HEADROOM_MIN_CONNECTIONS {
+                     YIELD_DEPTH.min(self.config.pipeline_depth)
+@@ -1122,7 +1137,7 @@ impl Pool {
+                     && holds_some
+                     && self.lanes_waiting.load(Ordering::Relaxed) > 0;
+                 let cache_room = cache_depth(limit, self.config.pipeline_depth);
+-                let paced = workload == Workload::Cache && self.pace.full(streaming);
++                let paced = workload == Workload::Cache && self.pace.full(streaming, reader);
+                 let spare = spare && !paced && !lets_lane_in;
+                 let moved = |worker: &Worker| worker.link.since_body();
+                 let is_warm = |worker: &Worker| {
+@@ -1300,6 +1315,7 @@ impl Pool {
+                     };
+                     return Ok(Some((tx, load, 0, id, taken)));
+                 }
++                flight.refund();
+                 continue;
+             }
+             let wake = match (held.map(tokio::time::Instant::from), deadline) {
+@@ -2014,6 +2030,10 @@ fn enqueue(conn: &mut Connection, in_flight: &mut VecDeque<Request>, request: Re
+     }
+ }
+ 
++#[cfg(test)]
++#[path = "pool_contention_tests.rs"]
++mod contention_tests;
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/nntp/src/pool_contention_tests.rs b/crates/nntp/src/pool_contention_tests.rs
+new file mode 100644
+index 00000000..34ca86ea
+--- /dev/null
++++ b/crates/nntp/src/pool_contention_tests.rs
+@@ -0,0 +1,189 @@
++use std::task::Poll;
++
++use infinidysk_testkit::{Corpus, LoopbackServer};
++
++use super::*;
++use crate::{BodyExpectation, TlsMode};
++
++const ARTICLE: usize = 16 * 1024;
++
++fn pool_on(server: &LoopbackServer, max_connections: usize, timeout: Duration) -> Pool {
++    let endpoint = Endpoint::new(
++        "127.0.0.1",
++        server.addr().port(),
++        TlsMode::Plain,
++        None,
++        timeout,
++    )
++    .unwrap();
++    let config = PoolConfig {
++        max_connections,
++        pipeline_depth: 4,
++        idle_timeout: Duration::from_secs(60),
++        min_connections: 0,
++    };
++    Pool::new(endpoint, config, Downloads::new(128)).unwrap()
++}
++
++async fn served(articles: usize) -> (LoopbackServer, Vec<String>) {
++    let corpus = Corpus::generate(93, articles, ARTICLE);
++    let ids = corpus
++        .articles
++        .iter()
++        .map(|a| a.message_id.clone())
++        .collect();
++    let server = LoopbackServer::start(corpus.articles).await.unwrap();
++    (server, ids)
++}
++
++fn cache_tag(reader: u64, decoded_len: Option<u64>) -> Tag {
++    Tag {
++        workload: Workload::Cache,
++        lane: Some(Lane::reader(reader)),
++        expected: BodyExpectation {
++            decoded_len,
++            ..BodyExpectation::NONE
++        },
++        ..Tag::UNTRACKED
++    }
++}
++
++async fn still_waiting<F: Future + Unpin>(future: &mut F) -> bool {
++    tokio::time::sleep(Duration::from_millis(50)).await;
++    poll_fn(|cx| Poll::Ready(Pin::new(&mut *future).poll(cx).is_pending())).await
++}
++
++#[tokio::test]
++async fn cache_requests_turned_away_by_a_connect_give_back_their_pace_charge() {
++    let (server, ids) = served(31).await;
++    let pool = pool_on(&server, 40, Duration::from_secs(1))
++        .with_account(Arc::new(Semaphore::new(1)));
++    let (arrived, release) = server.hold_article(&ids[0]);
++    let first = {
++        let (pool, id) = (pool.clone(), ids[0].clone());
++        tokio::spawn(async move {
++            pool.fetch(Command::Body, &id, &cache_tag(1, None))
++                .await
++                .is_ok()
++        })
++    };
++    timeout(Duration::from_secs(2), arrived)
++        .await
++        .unwrap()
++        .unwrap();
++    let rest: Vec<_> = ids[1..]
++        .iter()
++        .map(|id| {
++            let (pool, id) = (pool.clone(), id.clone());
++            tokio::spawn(async move {
++                let _ = pool
++                    .fetch(Command::Body, &id, &cache_tag(1, Some(750_000)))
++                    .await;
++            })
++        })
++        .collect();
++    tokio::time::sleep(Duration::from_millis(700)).await;
++    release.send(()).unwrap();
++    assert!(first.await.unwrap());
++    let all = async {
++        for request in rest {
++            request.await.unwrap();
++        }
++    };
++    let finished = timeout(Duration::from_secs(5), all).await;
++    let (in_flight, _) = pool.pace.during_seek();
++    assert!(
++        finished.is_ok(),
++        "cache requests parked on their own charge, {in_flight} bytes still counted"
++    );
++    assert_eq!(in_flight, 0);
++}
++
++#[tokio::test]
++async fn a_cancelled_cache_connect_gives_back_its_charge_and_wakes_the_next_request() {
++    let (server, _) = served(1).await;
++    let account = Arc::new(Semaphore::new(0));
++    let pool = pool_on(&server, 4, Duration::from_secs(5)).with_account(account);
++    let mut flight = Flight::of(&pool.pace, 21_000_000, Lane::reader(1).0);
++    let mut connecting = Box::pin(pool.worker(
++        Workload::Cache,
++        false,
++        None,
++        Some(Lane::reader(1)),
++        &mut flight,
++    ));
++    assert!(still_waiting(&mut connecting).await);
++    assert_eq!(pool.pace.during_seek().0, 21_000_000);
++    drop(connecting);
++    let woken = pool.changed.notified();
++    tokio::pin!(woken);
++    woken.as_mut().enable();
++    drop(flight);
++    assert_eq!(pool.pace.during_seek().0, 0);
++    assert_eq!(pool.pace.landed_in_window(), 0, "a refund is not throughput");
++    timeout(Duration::from_millis(100), woken)
++        .await
++        .expect("waiting requests hear of the refund");
++}
++
++#[tokio::test]
++async fn a_new_cache_reader_starts_while_another_holds_the_bound_and_they_share_it() {
++    let (server, _) = served(1).await;
++    let pool = pool_on(&server, 8, Duration::from_secs(5));
++    let (one, two) = (Lane::reader(1), Lane::reader(2));
++    let mut flight = Flight::of(&pool.pace, 21_000_000, one.0);
++    let held = pool
++        .worker(Workload::Cache, false, None, Some(one), &mut flight)
++        .await
++        .ok()
++        .flatten()
++        .expect("the first reader gets a connection");
++
++    let mut next_of_first = Flight::of(&pool.pace, 1_000_000, one.0);
++    let mut parked = Box::pin(pool.worker(
++        Workload::Cache,
++        false,
++        None,
++        Some(one),
++        &mut next_of_first,
++    ));
++    assert!(still_waiting(&mut parked).await, "the bound holds the first reader");
++
++    let mut first_of_second = Flight::of(&pool.pace, 1_000_000, two.0);
++    let started = timeout(
++        Duration::from_millis(500),
++        pool.worker(
++            Workload::Cache,
++            false,
++            None,
++            Some(two),
++            &mut first_of_second,
++        ),
++    )
++    .await
++    .expect("a new reader does not queue behind the first one's read-ahead");
++    assert!(matches!(started, Ok(Some(_))));
++    assert!(
++        still_waiting(&mut parked).await,
++        "the first reader, over its share, keeps waiting"
++    );
++
++    let mut over_share = Flight::of(&pool.pace, 20_000_000, two.0);
++    let second = pool
++        .worker(Workload::Cache, false, None, Some(two), &mut over_share)
++        .await;
++    assert!(matches!(second, Ok(Some(_))), "still under its share");
++    let mut past_share = Flight::of(&pool.pace, 1_000_000, two.0);
++    let mut stopped = Box::pin(pool.worker(
++        Workload::Cache,
++        false,
++        None,
++        Some(two),
++        &mut past_share,
++    ));
++    assert!(
++        still_waiting(&mut stopped).await,
++        "past its share the second reader waits too"
++    );
++    drop(held);
++}
+-- 
+2.56.1
+

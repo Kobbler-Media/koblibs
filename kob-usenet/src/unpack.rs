@@ -5,8 +5,10 @@ mod tree;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::disk::{JobDisk, sync_parent, sync_tree};
 use crate::jobs::failure::Failure;
 use crate::space::SpaceGate;
 use scan::{Family, Set};
@@ -20,6 +22,7 @@ pub struct Unpack<'a> {
     pub passwords: &'a [String],
     pub space: &'a SpaceGate,
     pub stall: Duration,
+    pub disk: &'a Arc<dyn JobDisk>,
 }
 
 impl Unpack<'_> {
@@ -49,6 +52,7 @@ impl Unpack<'_> {
                     if !landing.exists() {
                         self.unpack(&set, &landing).await?;
                     }
+                    self.make_durable(&landing).await?;
                     extracted.push(key);
                     record(&extracted)?;
                 }
@@ -68,8 +72,11 @@ impl Unpack<'_> {
             fs::create_dir(&into)
                 .map_err(|e| Failure::io(&format!("creating {}", into.display()), e))?;
             let joined = tree::join(&into, &set.name, &set.volumes)
-                .map_err(|e| Failure::io(&format!("joining {}", set.name), e))
-                .and_then(|()| seal(&into, landing));
+                .map_err(|e| Failure::io(&format!("joining {}", set.name), e));
+            let joined = match joined {
+                Ok(()) => self.seal(&into, landing).await,
+                failed => failed,
+            };
             let _ = fs::remove_dir_all(&into);
             return joined;
         }
@@ -107,7 +114,7 @@ impl Unpack<'_> {
             )
             .await;
             let landed = match attempt {
-                Attempt::Extracted => Some(seal(&into, landing)),
+                Attempt::Extracted => Some(self.seal(&into, landing).await),
                 Attempt::WrongPassword(reason) => {
                     refused = reason;
                     None
@@ -133,6 +140,36 @@ impl Unpack<'_> {
         Err(Failure::Content(crate::jobs::password_failure(
             given, &refused,
         )))
+    }
+
+    // Synced before the rename so a landing that exists is always whole, including one a
+    // resumed job finds and records without extracting.
+    async fn seal(&self, into: &Path, landing: &Path) -> Result<(), Failure> {
+        let disk = Arc::clone(self.disk);
+        let (into, landing) = (into.to_path_buf(), landing.to_path_buf());
+        tokio::task::spawn_blocking(move || {
+            tree::confined(&into)?;
+            tree::unreserve(&into)
+                .map_err(|e| Failure::io(&format!("naming files in {}", into.display()), e))?;
+            sync_tree(disk.as_ref(), &into)
+                .map_err(|e| Failure::io(&format!("syncing {}", into.display()), e))?;
+            fs::rename(&into, &landing)
+                .map_err(|e| Failure::io(&format!("moving to {}", landing.display()), e))
+        })
+        .await
+        .map_err(|e| Failure::io("sealing the unpacked files", e))?
+    }
+
+    async fn make_durable(&self, landing: &Path) -> Result<(), Failure> {
+        let disk = Arc::clone(self.disk);
+        let landing = landing.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            sync_tree(disk.as_ref(), &landing)?;
+            sync_parent(disk.as_ref(), &landing)
+        })
+        .await
+        .map_err(|e| Failure::io("syncing the unpacked files", e))?
+        .map_err(|e| Failure::io("syncing the unpacked files", e))
     }
 }
 
@@ -176,14 +213,6 @@ async fn off_runtime<T: Send + 'static>(
         .map_err(|e| Failure::io(&format!("reading {what}"), e))
 }
 
-fn seal(into: &Path, landing: &Path) -> Result<(), Failure> {
-    tree::confined(into)?;
-    tree::unreserve(into)
-        .map_err(|e| Failure::io(&format!("naming files in {}", into.display()), e))?;
-    fs::rename(into, landing)
-        .map_err(|e| Failure::io(&format!("moving to {}", landing.display()), e))
-}
-
 fn remove(volumes: &[PathBuf]) -> Result<(), Failure> {
     for path in volumes.iter().skip(1).chain(volumes.first()) {
         match fs::remove_file(path) {
@@ -200,11 +229,12 @@ fn remove(volumes: &[PathBuf]) -> Result<(), Failure> {
 mod tests {
     use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
+    use crate::disk::DirectDisk;
     use crate::space::Statvfs;
 
     fn archive(dir: &Path, name: &str, member: &str) -> PathBuf {
@@ -226,6 +256,7 @@ mod tests {
             passwords: &[],
             space: &gate,
             stall: Duration::from_mins(1),
+            disk: &(Arc::new(DirectDisk) as Arc<dyn JobDisk>),
         };
         let records = AtomicUsize::new(0);
         let record = |_: &[String]| {
@@ -244,6 +275,118 @@ mod tests {
             .collect();
         all.sort();
         all
+    }
+
+    #[derive(Default)]
+    struct Log(Mutex<Vec<String>>);
+
+    impl Log {
+        fn push(&self, event: String) {
+            self.0.lock().unwrap().push(event);
+        }
+
+        fn at(&self, wanted: &str) -> usize {
+            let events = self.0.lock().unwrap();
+            events
+                .iter()
+                .position(|e| e == wanted)
+                .unwrap_or_else(|| panic!("no {wanted} in {events:?}"))
+        }
+    }
+
+    struct Recording(Arc<Log>);
+
+    impl JobDisk for Recording {
+        fn sync_path(&self, path: &Path) -> std::io::Result<()> {
+            let leaf = path.file_name().unwrap_or_default().to_string_lossy();
+            let stage = if leaf.starts_with(".extract-") {
+                "scratch"
+            } else if leaf.starts_with(".unpacked-") {
+                "landing"
+            } else {
+                "entry"
+            };
+            self.0.push(format!("sync {stage}"));
+            self.0.push(format!("sync {leaf}"));
+            Ok(())
+        }
+    }
+
+    async fn run_logged(dir: &Path, volume: &Path) -> Arc<Log> {
+        let log = Arc::new(Log::default());
+        let gate = SpaceGate::new(Arc::new(Statvfs), 0);
+        let disk: Arc<dyn JobDisk> = Arc::new(Recording(Arc::clone(&log)));
+        let unpack = Unpack {
+            unrar: Path::new("/nonexistent/unrar"),
+            sevenzip: Path::new("7z"),
+            passwords: &[],
+            space: &gate,
+            stall: Duration::from_mins(1),
+            disk: &disk,
+        };
+        let record = |_: &[String]| {
+            assert!(volume.exists(), "volumes outlive the durable mark");
+            log.push("record".to_owned());
+            Ok(())
+        };
+        unpack.run(dir, Vec::new(), &record).await.ok().unwrap();
+        log
+    }
+
+    #[tokio::test]
+    async fn extracted_files_are_durable_before_the_mark_and_the_volume_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("sub");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("inner.bin"), b"inner").unwrap();
+        fs::write(dir.path().join("movie.bin"), b"movie").unwrap();
+        let made = Command::new("7z")
+            .args(["a", "-bd", "a.7z", "movie.bin", "sub"])
+            .current_dir(dir.path())
+            .output();
+        assert!(made.is_ok_and(|o| o.status.success()), "7z is required");
+        fs::remove_file(dir.path().join("movie.bin")).unwrap();
+        fs::remove_dir_all(&nested).unwrap();
+        let volume = dir.path().join("a.7z");
+
+        let log = run_logged(dir.path(), &volume).await;
+
+        let record = log.at("record");
+        for synced in [
+            "sync movie.bin",
+            "sync inner.bin",
+            "sync sub",
+            "sync scratch",
+        ] {
+            assert!(log.at(synced) < record, "{synced}");
+        }
+        let parent = format!("sync {}", dir.path().file_name().unwrap().to_string_lossy());
+        let events = log.0.lock().unwrap();
+        let after_rename = events[..record].iter().rposition(|e| *e == parent);
+        assert!(
+            after_rename
+                .is_some_and(|at| at > events.iter().position(|e| e == "sync scratch").unwrap()),
+            "the parent is synced after the rename: {events:?}"
+        );
+        drop(events);
+        assert!(!volume.exists());
+        assert_eq!(names(dir.path()), ["movie.bin", "sub"]);
+    }
+
+    #[tokio::test]
+    async fn a_landing_found_on_resume_is_synced_before_it_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = archive(dir.path(), "a.7z", "movie.bin");
+        let key =
+            scan::identity(dir.path(), Family::SevenZip, std::slice::from_ref(&first)).unwrap();
+        let landing = scan::landing(dir.path(), &key);
+        fs::create_dir(&landing).unwrap();
+        fs::write(landing.join("movie.bin"), b"landed").unwrap();
+
+        let log = run_logged(dir.path(), &first).await;
+
+        assert!(log.at("sync movie.bin") < log.at("record"));
+        assert!(log.at("sync landing") < log.at("record"));
     }
 
     #[tokio::test]

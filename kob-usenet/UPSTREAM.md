@@ -74,8 +74,14 @@ which drives upstream's database-backed queue service.
 | 40 | A seek takes an idle or openable connection instead of pipelining behind abandoned bodies, and an open-ended read fetches 4 MB ahead until 8 MB in order prove it sequential. Cache-ahead no longer yields free connections to a parked seek, and its bound grows on what it keeps in flight during one. Work below viewers runs while none of their requests waits for a connection, one body deep and on at most half the pool beside playback | ours, reworks 34, 37 and 38 |
 | 41 | A seek prefers a connection that moved body data within the last second: idle if one is, else behind the one wanted body on a depth-1 connection, never an abandoned one; cache-ahead reuses the connections it just used. Work below viewers starts nothing while a viewer request is outstanding, and keeps two bodies per connection on pools of 16 or more, where a job holding connections lets them drain for a job holding none | ours, reworks 40 |
 | 42 | While a Stream or Cache reader is active, up to 4 idle connections per primary provider that just moved a body get a STAT every 250 ms, outside health, miss, breaker and quota accounting; seeks prefer them. One command behind the current body is written during its read | ours, extends 41 |
+| 43 | A cache request gives back its pacing charge when its connect gets nothing or it is cancelled, and no connect starts while the account has no free connection. Each cache reader keeps its own request order and may go up to an even share of the bound, so a new reader starts at once beside one already filling it | ours, fixes 37 and 41 |
+| 44 | Any workload takes a kept idle connection when nothing else is usable, a kept slot's release wakes waiters, and waiters on a throttled pool wake as it regrows | ours, fixes 42 |
+| 45 | The viewer hold's one-hour ceiling applies to each request's age, so a wedged request is bounded and a long film keeps holding | ours, fixes 34 |
+| 46 | A keep-warm STAT counts only 223, 423, 430 and 451 as warm; any other reply retires the connection | ours, fixes 42 |
+| 47 | An inspection reports the size of each file the block list dropped | ours, extends 36 |
+| 48 | Cache readers take download slots by who holds fewest, with imports as one reader among them, so a new cache-ahead is not queued behind another's backlog | ours, completes 43 |
 
-Patches 5–42 are candidates to offer upstream.
+Patches 5–48 are candidates to offer upstream.
 
 ## Monthly sync
 

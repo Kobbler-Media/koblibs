@@ -6,7 +6,7 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::jobs::failure::Failure;
 use crate::jobs::fetch::Fetcher;
-use crate::jobs::finish::{finish, moved};
+use crate::jobs::finish::{finish, make_durable, moved};
 use crate::jobs::plan::{self, Next};
 use crate::jobs::settle::{Settled, settle};
 use crate::jobs::store::{Phase, Plan, StoredSpec};
@@ -81,7 +81,7 @@ async fn execute(
     let staging = spec.staging();
     let phase = stored(shared.store.phase(&spec.id))?;
     if let Phase::Moving(target) = &phase {
-        return moved(shared, spec, &staging, target);
+        return moved(shared, spec, &staging, target).await;
     }
     let mut nested = 0;
     let (nzb, mut plan, par2) = loop {
@@ -155,6 +155,7 @@ async fn execute(
         passwords: &passwords,
         space: &shared.gate,
         stall: shared.config.unpack_stall,
+        disk: &shared.config.disk,
     };
     let record = |extracted: &[String]| {
         stored(shared.store.put_phase(
@@ -166,7 +167,7 @@ async fn execute(
     };
     record(&extracted)?;
     unpack.run(&staging, extracted, &record).await?;
-    finish(shared, spec, &staging)
+    finish(shared, spec, &staging).await
 }
 
 async fn download(job: &Job<'_>, plan: &mut Plan) -> Result<(), Failure> {
@@ -192,6 +193,7 @@ async fn download(job: &Job<'_>, plan: &mut Plan) -> Result<(), Failure> {
     }
     std::fs::create_dir_all(job.staging)
         .map_err(|e| Failure::io(&format!("creating {}", job.staging.display()), e))?;
+    make_durable(shared, job.staging).await?;
     stored(shared.store.put_phase(&spec.id, &Phase::Downloaded))
 }
 

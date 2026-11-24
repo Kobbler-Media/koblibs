@@ -51,7 +51,7 @@ pub async fn direct(
             _ => break imported,
         }
     };
-    let password = passwords.last().map(String::as_str);
+    let password = passwords.get(tried - 1).map(String::as_str);
     let unproven = match &imported {
         Ok(Imported::Files { outputs, .. }) => !payload::proven(outputs),
         Err(ImportError::Password(_) | ImportError::Unsupported(_) | ImportError::Failed(_)) => {

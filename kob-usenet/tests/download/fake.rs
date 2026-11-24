@@ -1,6 +1,6 @@
 use kob_usenet::{JobFailure, JobStatus};
 
-use crate::nzb;
+use crate::nzb::{self, nzb_with};
 use crate::obfuscated::hash;
 use crate::post::{ARTICLE, Posted, articles, noise, video};
 use crate::rar::{self, Member};
@@ -53,7 +53,12 @@ async fn loose_executables_with_only_sidecars_are_refused_before_their_bodies() 
         "exe", "msi", "bat", "cmd", "scr", "com", "lnk", "pif", "ps1", "vbs", "jar", "apk",
     ] {
         let name = format!("FLUX.2026.1080p.WEB-DL.{ext}");
-        let fake = Posted::new("fake", &name, payload(1));
+        let body = if ext == "com" {
+            noise(64 << 10, 1)
+        } else {
+            payload(1)
+        };
+        let fake = Posted::new("fake", &name, body);
         let info = Posted::new("nfo", "FLUX.nfo", noise(900, 2));
         let cover = Posted::new("img", "cover.jpg", noise(900, 3));
         let (rig, status) = run(&[&fake, &info, &cover]).await;
@@ -173,4 +178,85 @@ async fn a_release_without_any_executable_is_unaffected() {
     let only_images = Posted::new("img", "scan-001.jpg", noise(3 * ARTICLE, 14));
     let (_rig, status) = run(&[&only_images]).await;
     assert_file(&completed(&status), "scan-001.jpg", &only_images.data);
+}
+
+#[tokio::test]
+async fn images_or_text_that_outweigh_a_stray_program_still_download() {
+    let cases: [(&str, Vec<u8>, &str, Vec<u8>); 3] = [
+        (
+            "Artbook/001.jpg",
+            noise(6 * ARTICLE, 20),
+            "Artbook/viewer.exe",
+            noise(ARTICLE, 21),
+        ),
+        (
+            "Novel.txt",
+            noise(3 * ARTICLE, 22),
+            "www.example.com",
+            noise(120, 23),
+        ),
+        (
+            "Scans.png",
+            noise(3 * ARTICLE, 24),
+            "Visit www.example.com",
+            noise(80, 25),
+        ),
+    ];
+    for (name, data, junk, extra) in cases {
+        let real = Posted::new("real", name, data);
+        let stray = Posted::new("stray", junk, extra);
+        let (_rig, status) = run(&[&real, &stray]).await;
+        assert_file(&completed(&status), name, &real.data);
+    }
+}
+
+#[tokio::test]
+async fn a_program_with_small_images_and_text_is_still_refused() {
+    let fake = Posted::new("fake", "Movie.2026.1080p.exe", payload(30));
+    let cover = Posted::new("img", "cover.jpg", noise(900, 31));
+    let notes = Posted::new("txt", "readme.txt", noise(700, 32));
+    let (rig, status) = run(&[&fake, &cover, &notes]).await;
+    assert_refused(&rig, &status, "Movie.2026.1080p.exe");
+}
+
+#[tokio::test]
+async fn a_fake_behind_an_earlier_password_is_inspected_with_the_password_that_opened_it() {
+    if !extractor_on_path() {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    std::fs::write(work.path().join("Setup.exe"), payload(40)).unwrap();
+    sevenzip(
+        work.path(),
+        &[
+            "a",
+            "-t7z",
+            "-mx=0",
+            "-mhe=on",
+            "-pright",
+            "Locked.7z",
+            "Setup.exe",
+        ],
+    );
+    let packed = Posted::new(
+        "sz",
+        "Locked.7z",
+        std::fs::read(work.path().join("Locked.7z")).unwrap(),
+    );
+    let rig = Rig::new(packed.articles.clone()).await;
+    let engine = rig.engine().await;
+    let spec = rig.spec(
+        "Release",
+        nzb_with(&[("password", "right")], &[packed.listed()]),
+        Some("wrong"),
+    );
+    let id = spec.id.clone();
+    engine.add_job(spec).await.unwrap();
+    let status = finish(&engine, &id).await;
+    let reason = failed_as(&status, JobFailure::Content);
+    assert!(
+        reason.contains("only executable") && reason.contains("Setup.exe"),
+        "{reason}"
+    );
+    assert_eq!(status.bytes_done, 0, "{status:?}");
 }

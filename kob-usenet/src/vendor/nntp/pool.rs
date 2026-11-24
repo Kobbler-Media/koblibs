@@ -15,7 +15,7 @@ use crate::vendor::nntp::client::{BodySink, Lane};
 use crate::vendor::nntp::connection::{ConnectionStats, Link, Phase, Timing, validate_message_id};
 use crate::vendor::nntp::downloads::{Downloads, Permit};
 use crate::vendor::nntp::keep_warm::{KEEP_WARM_CONNECTIONS, KEEP_WARM_EVERY, KeepWarm};
-use crate::vendor::nntp::pace::{Flight, Pace};
+use crate::vendor::nntp::pace::{CacheTurns, Flight, Pace};
 use crate::vendor::nntp::stages::{
     Assigned, ConnectTimes, LoadAtAssign, ReplyTimes, RequestTrace, StageClock,
 };
@@ -125,9 +125,9 @@ pub struct Pool {
     /// [`Workload::Cache`] requests holding a download slot and waiting for a
     /// connection; lower-ranked background work takes none meanwhile.
     cache_parked: Arc<AtomicUsize>,
-    /// Taken in request order by [`Workload::Cache`] requests choosing a connection, so a
-    /// reader's next segment is not outrun by the read-ahead parked behind it.
-    cache_turn: Arc<tokio::sync::Mutex<()>>,
+    /// Taken in request order by each reader's [`Workload::Cache`] requests choosing a
+    /// connection, so its next segment is not outrun by the read-ahead parked behind it.
+    cache_turns: Arc<CacheTurns>,
     /// Requests of a job holding no connection yet, under [`YIELD_DEPTH`]: jobs that hold
     /// some let theirs drain, or their backlog refills every slot before it is ever idle.
     lanes_waiting: Arc<AtomicUsize>,
@@ -204,6 +204,15 @@ impl State {
             limit
                 .saturating_add(usize::try_from(steps).unwrap_or(usize::MAX))
                 .min(max)
+        })
+    }
+
+    /// When a throttled limit next rises; nothing announces it, so waiters set a timer.
+    fn next_growth(&self, max: usize) -> Option<Instant> {
+        let (_, since) = self.throttle?;
+        (self.limit(max) < max).then(|| {
+            let steps = since.elapsed().as_secs() / THROTTLE_STEP.as_secs();
+            since + THROTTLE_STEP * u32::try_from(steps + 1).unwrap_or(u32::MAX)
         })
     }
 
@@ -450,9 +459,11 @@ impl Pool {
         if config.max_connections == 0 || config.pipeline_depth == 0 {
             return Err(Error::InvalidArgument("pool config"));
         }
+        let changed: Arc<Notify> = Arc::default();
         let keep = Arc::new(KeepWarm::new(
             Arc::clone(downloads.viewers()),
             KEEP_WARM_CONNECTIONS.min(seek_connections(config.max_connections)),
+            Arc::clone(&changed),
         ));
         Ok(Self {
             endpoint,
@@ -464,12 +475,12 @@ impl Pool {
             stream_waiting: Arc::default(),
             stream_parked: Arc::default(),
             cache_parked: Arc::default(),
-            cache_turn: Arc::default(),
+            cache_turns: Arc::default(),
             lanes_waiting: Arc::default(),
-            pace: Arc::default(),
+            pace: Arc::new(Pace::waking(Arc::clone(&changed))),
             live: Arc::default(),
             state: Arc::default(),
-            changed: Arc::default(),
+            changed,
             stats: Arc::default(),
             stream_wait: STREAM_WAIT,
             weight_large: false,
@@ -813,7 +824,11 @@ impl Pool {
             };
             let mut flight = if tag.workload == Workload::Cache {
                 let size = tag.probe.as_ref().map(|probe| u64::from(probe.size));
-                Flight::of(&self.pace, size.or(tag.expected.decoded_len).unwrap_or(0))
+                Flight::of(
+                    &self.pace,
+                    size.or(tag.expected.decoded_len).unwrap_or(0),
+                    lane.map_or(0, |lane| lane.0),
+                )
             } else {
                 Flight::default()
             };
@@ -833,6 +848,7 @@ impl Pool {
             let Some((tx, load, ahead, connection, taken)) = picked else {
                 continue;
             };
+            flight.assign();
             let Taken {
                 opened,
                 warm,
@@ -990,8 +1006,9 @@ impl Pool {
         let viewers = self.downloads.viewers();
         let (mut impatient, mut first) = (false, true);
         let mut lane_waiting = None;
+        let reader = lane.map_or(0, |lane| lane.0);
         let mut turn = if workload == Workload::Cache {
-            Some(self.cache_turn.lock().await)
+            Some(self.cache_turns.take(reader).await)
         } else {
             None
         };
@@ -1108,8 +1125,15 @@ impl Pool {
                 // cache request, which never pipelines behind it.
                 let yielding = outranked && self.cache_parked.load(Ordering::Relaxed) > 0;
                 let capped = starved || share.is_some_and(|(busy, room)| busy >= room);
-                let spare =
-                    open < limit && !hold_headroom && !capped && !yielding && held.is_none();
+                // With the account's connections all in use a connect only waits out its timeout,
+                // while the request could be running on a connection this pool already has.
+                let account_free = state.workers.is_empty() || self.account.available_permits() > 0;
+                let spare = open < limit
+                    && !hold_headroom
+                    && !capped
+                    && !yielding
+                    && held.is_none()
+                    && account_free;
                 let live = !state.workers.is_empty();
                 let own_depth = if outranked && limit >= CACHE_HEADROOM_MIN_CONNECTIONS {
                     YIELD_DEPTH.min(self.config.pipeline_depth)
@@ -1135,7 +1159,7 @@ impl Pool {
                     && holds_some
                     && self.lanes_waiting.load(Ordering::Relaxed) > 0;
                 let cache_room = cache_depth(limit, self.config.pipeline_depth);
-                let paced = workload == Workload::Cache && self.pace.full(streaming);
+                let paced = workload == Workload::Cache && self.pace.full(streaming, reader);
                 let spare = spare && !paced && !lets_lane_in;
                 let moved = |worker: &Worker| worker.link.since_body();
                 let is_warm = |worker: &Worker| {
@@ -1186,43 +1210,56 @@ impl Pool {
                         },
                     )));
                 }
-                let best = state
-                    .workers
-                    .iter()
-                    .filter(|_| !paced && !lets_lane_in)
-                    .filter(|worker| stream || !worker.link.kept())
-                    .filter(|worker| {
-                        !(outranked && depth_capped)
-                            || worker.load.load(Ordering::Relaxed) < own_depth
-                    })
-                    .filter(|worker| {
-                        let load = worker.load.load(Ordering::Relaxed);
-                        !bounded
-                            || (load == 0 && !capped)
-                            || (!starved && load < room_beside && background(worker))
-                    })
-                    .filter(|_| !yielding)
-                    // A cache reader past a full pipeline parks instead, so work below it
-                    // yields connections and its read-ahead spreads over them.
-                    .filter(|worker| {
-                        workload != Workload::Cache
-                            || worker.load.load(Ordering::Relaxed) < cache_room
-                    })
-                    .filter(|worker| !hold_headroom || worker.load.load(Ordering::Relaxed) > 0)
-                    .filter(|worker| {
-                        lane.is_none_or(|lane| {
-                            worker.load.load(Ordering::Relaxed) == 0
-                                || worker.lane.load(Ordering::Relaxed) == lane.0
+                let candidate = |evicting: bool| {
+                    state
+                        .workers
+                        .iter()
+                        .filter(|_| !paced && !lets_lane_in)
+                        .filter(|worker| {
+                            stream
+                                || !worker.link.kept()
+                                || (evicting && worker.load.load(Ordering::Relaxed) == 0)
                         })
-                    })
-                    // Cache-ahead reuses what moved data last, which keeps a few warm. Other
-                    // work keeps its order: a job's lane needs the rest to drain in turn.
-                    .min_by_key(|w| {
-                        let coldness = (workload == Workload::Cache)
-                            .then(|| moved(w).unwrap_or(Duration::MAX))
-                            .unwrap_or_default();
-                        (w.load.load(Ordering::Relaxed), coldness)
-                    });
+                        .filter(|worker| {
+                            !(outranked && depth_capped)
+                                || worker.load.load(Ordering::Relaxed) < own_depth
+                        })
+                        .filter(|worker| {
+                            let load = worker.load.load(Ordering::Relaxed);
+                            !bounded
+                                || (load == 0 && !capped)
+                                || (!starved && load < room_beside && background(worker))
+                        })
+                        .filter(|_| !yielding)
+                        // A cache reader past a full pipeline parks instead, so work below it
+                        // yields connections and its read-ahead spreads over them.
+                        .filter(|worker| {
+                            workload != Workload::Cache
+                                || worker.load.load(Ordering::Relaxed) < cache_room
+                        })
+                        .filter(|worker| !hold_headroom || worker.load.load(Ordering::Relaxed) > 0)
+                        .filter(|worker| {
+                            lane.is_none_or(|lane| {
+                                worker.load.load(Ordering::Relaxed) == 0
+                                    || worker.lane.load(Ordering::Relaxed) == lane.0
+                            })
+                        })
+                        // Cache-ahead reuses what moved data last, which keeps a few warm. Other
+                        // work keeps its order: a job's lane needs the rest to drain in turn.
+                        .min_by_key(|w| {
+                            let coldness = (workload == Workload::Cache)
+                                .then(|| moved(w).unwrap_or(Duration::MAX))
+                                .unwrap_or_default();
+                            (w.load.load(Ordering::Relaxed), coldness)
+                        })
+                };
+                // Kept connections are a seek's first choice, never a reason for work to
+                // wait when a throttled pool has nothing else.
+                let best = candidate(false).or_else(|| {
+                    (!spare && state.connecting == 0)
+                        .then(|| candidate(true))
+                        .flatten()
+                });
                 let reserved = match best {
                     // Spread before pipelining: providers cap bandwidth per connection,
                     // and a slot still connecting is idle soon (a cold start's prewarm).
@@ -1276,12 +1313,17 @@ impl Pool {
                     lane_waiting
                         .get_or_insert_with(|| Load::watched(&self.lanes_waiting, &self.changed));
                 }
+                let regrowth = state.next_growth(self.config.max_connections);
                 drop(state);
                 let beside = viewers.held_until(now).filter(|_| outranked);
                 (
                     reserved,
                     live,
-                    held.into_iter().chain(linger).chain(beside).min(),
+                    held.into_iter()
+                        .chain(linger)
+                        .chain(beside)
+                        .chain(regrowth)
+                        .min(),
                 )
             };
             if reserved {
@@ -1317,6 +1359,7 @@ impl Pool {
                     };
                     return Ok(Some((tx, load, 0, id, taken)));
                 }
+                flight.refund();
                 continue;
             }
             let wake = match (held.map(tokio::time::Instant::from), deadline) {
@@ -2027,6 +2070,10 @@ fn enqueue(conn: &mut Connection, in_flight: &mut VecDeque<Request>, request: Re
         Err(error) => request.answer(Err(error), Duration::ZERO),
     }
 }
+
+#[cfg(test)]
+#[path = "pool_contention_tests.rs"]
+mod contention_tests;
 
 #[cfg(test)]
 mod tests {

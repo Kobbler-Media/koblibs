@@ -19,6 +19,8 @@ pub struct Downloads {
 }
 
 const BORROW_DIVISOR: usize = 4;
+/// Imports share rank 0 with cache readers, and take their turn as one reader among them.
+const IMPORT_READER: u64 = u64::MAX;
 
 /// Slots wanted, the reader asking (`0`: none of its own), and where to send the permit.
 type Waiter = (usize, u64, oneshot::Sender<Permit>);
@@ -78,10 +80,9 @@ impl Lanes {
         self.owed += weight - paid;
     }
 
-    /// The playback waiter to admit next: the oldest of the reader holding fewest slots.
-    fn next_urgent(&self) -> Option<usize> {
-        self.urgent
-            .iter()
+    /// The waiter in `lane` to admit next: the oldest of the reader holding fewest slots.
+    fn next_in(&self, lane: &VecDeque<Waiter>) -> Option<usize> {
+        lane.iter()
             .enumerate()
             .filter(|(_, (_, _, tx))| !tx.is_closed())
             .min_by_key(|&(i, &(_, reader, _))| {
@@ -201,7 +202,11 @@ impl Downloads {
         weight: usize,
         reader: u64,
     ) -> Option<Permit> {
-        let reader = if workload.rank().is_none() { reader } else { 0 };
+        let reader = match workload {
+            Workload::Stream | Workload::Cache => reader,
+            Workload::Import => IMPORT_READER,
+            _ => 0,
+        };
         let rx = {
             let mut lanes = self.lock();
             let weight = weight.clamp(1, lanes.total.max(1));
@@ -239,12 +244,13 @@ impl Downloads {
                     lane.pop_front();
                 }
             }
-            let urgent = lanes.next_urgent();
+            let urgent = lanes.next_in(&lanes.urgent);
             let rank = lanes.background.iter().position(|lane| !lane.is_empty());
-            let (at, wanted) = match (urgent, rank) {
-                (Some(at), _) => (at, lanes.urgent[at].0),
-                (None, Some(rank)) => (0, lanes.background[rank][0].0),
-                (None, None) => return,
+            let queued = rank.and_then(|rank| lanes.next_in(&lanes.background[rank]));
+            let (at, wanted) = match (urgent, rank, queued) {
+                (Some(at), _, _) => (at, lanes.urgent[at].0),
+                (None, Some(rank), Some(at)) => (at, lanes.background[rank][at].0),
+                _ => return,
             };
             if !lanes.fits(urgent.is_some(), wanted) {
                 return;
@@ -294,6 +300,54 @@ mod tests {
         assert!(!downloads.can_acquire(Workload::Queue, 1));
         queue.pop();
         assert_eq!(downloads.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_new_cache_reader_is_admitted_ahead_of_another_readers_backlog() {
+        let downloads = Downloads::new(2);
+        let first = downloads.acquire_for(Workload::Cache, 1, 1).await;
+        let second = downloads.acquire_for(Workload::Cache, 1, 1).await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut waiters = Vec::new();
+        for reader in [1, 1, 1, 2] {
+            let (downloads, order) = (Arc::clone(&downloads), Arc::clone(&order));
+            waiters.push(tokio::spawn(async move {
+                let permit = downloads.acquire_for(Workload::Cache, 1, reader).await;
+                order.lock().unwrap().push(reader);
+                drop(permit);
+            }));
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        drop(first);
+        drop(second);
+        for waiter in waiters {
+            waiter.await.unwrap();
+        }
+        let order = order.lock().unwrap().clone();
+        assert_eq!(order[0], 2, "{order:?}");
+    }
+
+    #[tokio::test]
+    async fn an_import_keeps_its_turn_beside_cache_readers() {
+        let downloads = Downloads::new(1);
+        let held = downloads.acquire_for(Workload::Cache, 1, 1).await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut waiters = Vec::new();
+        for (workload, reader) in [(Workload::Import, 0), (Workload::Cache, 1)] {
+            let (downloads, order) = (Arc::clone(&downloads), Arc::clone(&order));
+            waiters.push(tokio::spawn(async move {
+                let permit = downloads.acquire_for(workload, 1, reader).await;
+                order.lock().unwrap().push(workload);
+                drop(permit);
+            }));
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        for waiter in waiters {
+            waiter.await.unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), [Workload::Import, Workload::Cache]);
     }
 
     #[tokio::test]

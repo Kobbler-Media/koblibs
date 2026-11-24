@@ -30,8 +30,8 @@ use crate::vendor::queue::nzb::{self, Nzb};
 mod inspect;
 
 pub use inspect::{
-    Access, ArchiveSet, ArchiveType, Encrypted, Failure, FailureKind, Inspected, Inspection,
-    Inspector, Level, Timings,
+    Access, ArchiveSet, ArchiveType, BlockedFile, Encrypted, Failure, FailureKind, Inspected,
+    Inspection, Inspector, Level, Timings,
 };
 
 /// Requests in flight per import, across all its steps, unless [`Rules`] say otherwise.
@@ -303,6 +303,7 @@ pub trait Verifier: Send + Sync {
 
 /// One NZB file entry.
 struct Input {
+    size: u64,
     name: String,
     source: NameSource,
     kind: Kind,
@@ -354,10 +355,10 @@ struct Job {
 }
 
 impl Job {
-    fn blocks(&self, name: &str) -> bool {
+    fn blocks(&self, name: &str, size: Option<u64>) -> bool {
         let blocked = names::is_blocked(name, &self.blocklist);
         if blocked {
-            self.note_blocked(name);
+            self.note_blocked(name, size);
         }
         blocked
     }
@@ -564,6 +565,7 @@ async fn plan(
                 },
             };
             Input {
+                size: file.bytes(),
                 name,
                 source: if matched.is_some() {
                     NameSource::Par2
@@ -583,7 +585,7 @@ async fn plan(
             let input = &inputs[i];
             match input.kind {
                 Kind::Par2 => false,
-                Kind::Plain => !job.blocks(&input.name),
+                Kind::Plain => !job.blocks(&input.name, Some(input.size)),
                 _ => true,
             }
         })
@@ -810,7 +812,7 @@ async fn inner_nzb(job: &Job, outputs: &[Output]) -> Result<Option<Vec<u8>>, Err
         let Some(name) = output.path.last() else {
             continue;
         };
-        if job.blocks(name) {
+        if job.blocks(name, Some(output.meta.size())) {
             continue;
         }
         if !is_nzb(name) {
@@ -1582,7 +1584,7 @@ async fn rar_set(
     let mut out = Vec::new();
     for (i, m) in members.into_iter().enumerate() {
         // A member never imported needs no streamable flags.
-        if job.blocks(&m.name) {
+        if job.blocks(&m.name, m.size) {
             continue;
         }
         if m.open || headless.contains(&i) {
@@ -1774,7 +1776,7 @@ async fn sevenzip_set(
         // Mapping an entry rescans every volume's segments and may not await, so a large
         // archive would otherwise run past the inspection deadline without a cancel point.
         tokio::task::consume_budget().await;
-        if job.blocks(&e.name) {
+        if job.blocks(&e.name, Some(e.size)) {
             continue;
         }
         if e.encrypted {
@@ -2146,7 +2148,7 @@ fn filter(outputs: Vec<Output>, job: &Job) -> Vec<Output> {
         .into_iter()
         .filter(|output| {
             let (file, dirs) = output.path.split_last().expect("paths are never empty");
-            if job.blocks(file) {
+            if job.blocks(file, Some(output.meta.size())) {
                 return false;
             }
             let Some(size) = video_size(output) else {

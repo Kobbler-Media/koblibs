@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use tokio::sync::Notify;
+
 use crate::vendor::nntp::connection::Link;
 use crate::vendor::nntp::stats::Stats;
 use crate::vendor::nntp::viewers::Viewers;
@@ -24,10 +26,11 @@ pub(crate) struct KeepWarm {
     primary: AtomicBool,
     id: Mutex<Option<Arc<str>>>,
     stats: Mutex<Arc<Stats>>,
+    changed: Arc<Notify>,
 }
 
 impl KeepWarm {
-    pub(crate) fn new(viewers: Arc<Viewers>, target: usize) -> Self {
+    pub(crate) fn new(viewers: Arc<Viewers>, target: usize, changed: Arc<Notify>) -> Self {
         Self {
             viewers,
             target,
@@ -35,6 +38,7 @@ impl KeepWarm {
             primary: AtomicBool::new(false),
             id: Mutex::new(None),
             stats: Mutex::default(),
+            changed,
         }
     }
 
@@ -108,5 +112,6 @@ impl Drop for KeptSlot {
     fn drop(&mut self) {
         self.link.set_kept(false);
         self.keep.members.fetch_sub(1, Ordering::Relaxed);
+        self.keep.changed.notify_waiters();
     }
 }

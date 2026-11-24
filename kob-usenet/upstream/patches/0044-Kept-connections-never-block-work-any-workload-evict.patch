@@ -1,0 +1,226 @@
+From 1cb33a43948761d56a31b37a0d945fbc17ca97c5 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Tue, 24 Nov 2026 14:02:03 +1100
+Subject: [PATCH 44/47] Kept connections never block work: any workload evicts
+ one when nothing else is usable, a slot's release wakes waiters, and a
+ throttled pool wakes them as it regrows
+
+---
+ crates/nntp/src/keep_warm.rs             |  7 +-
+ crates/nntp/src/pool.rs                  | 25 ++++++-
+ crates/nntp/src/pool_contention_tests.rs | 92 ++++++++++++++++++++++++
+ 3 files changed, 120 insertions(+), 4 deletions(-)
+
+diff --git a/crates/nntp/src/keep_warm.rs b/crates/nntp/src/keep_warm.rs
+index f2e7427c..8568d2d1 100644
+--- a/crates/nntp/src/keep_warm.rs
++++ b/crates/nntp/src/keep_warm.rs
+@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+ use std::time::Duration;
+ 
++use tokio::sync::Notify;
++
+ use crate::connection::Link;
+ use crate::stats::Stats;
+ use crate::viewers::Viewers;
+@@ -24,10 +26,11 @@ pub(crate) struct KeepWarm {
+     primary: AtomicBool,
+     id: Mutex<Option<Arc<str>>>,
+     stats: Mutex<Arc<Stats>>,
++    changed: Arc<Notify>,
+ }
+ 
+ impl KeepWarm {
+-    pub(crate) fn new(viewers: Arc<Viewers>, target: usize) -> Self {
++    pub(crate) fn new(viewers: Arc<Viewers>, target: usize, changed: Arc<Notify>) -> Self {
+         Self {
+             viewers,
+             target,
+@@ -35,6 +38,7 @@ impl KeepWarm {
+             primary: AtomicBool::new(false),
+             id: Mutex::new(None),
+             stats: Mutex::default(),
++            changed,
+         }
+     }
+ 
+@@ -108,5 +112,6 @@ impl Drop for KeptSlot {
+     fn drop(&mut self) {
+         self.link.set_kept(false);
+         self.keep.members.fetch_sub(1, Ordering::Relaxed);
++        self.keep.changed.notify_waiters();
+     }
+ }
+diff --git a/crates/nntp/src/pool.rs b/crates/nntp/src/pool.rs
+index bf13e17d..b396df73 100644
+--- a/crates/nntp/src/pool.rs
++++ b/crates/nntp/src/pool.rs
+@@ -205,6 +205,15 @@ impl State {
+         })
+     }
+ 
++    /// When a throttled limit next rises; nothing announces it, so waiters set a timer.
++    fn next_growth(&self, max: usize) -> Option<Instant> {
++        let (_, since) = self.throttle?;
++        (self.limit(max) < max).then(|| {
++            let steps = since.elapsed().as_secs() / THROTTLE_STEP.as_secs();
++            since + THROTTLE_STEP * u32::try_from(steps + 1).unwrap_or(u32::MAX)
++        })
++    }
++
+     /// Holds back new connects after one that `started` failed to reach the provider;
+     /// `true` when this starts a new run of failures.
+     fn back_off(&mut self, started: Instant, now: Instant) -> bool {
+@@ -446,6 +455,7 @@ impl Pool {
+         let keep = Arc::new(KeepWarm::new(
+             Arc::clone(downloads.viewers()),
+             KEEP_WARM_CONNECTIONS.min(seek_connections(config.max_connections)),
++            Arc::clone(&changed),
+         ));
+         Ok(Self {
+             endpoint,
+@@ -1188,11 +1198,15 @@ impl Pool {
+                         },
+                     )));
+                 }
+-                let best = state
++                let candidate = |evicting: bool| state
+                     .workers
+                     .iter()
+                     .filter(|_| !paced && !lets_lane_in)
+-                    .filter(|worker| stream || !worker.link.kept())
++                    .filter(|worker| {
++                        stream
++                            || !worker.link.kept()
++                            || (evicting && worker.load.load(Ordering::Relaxed) == 0)
++                    })
+                     .filter(|worker| {
+                         !(outranked && depth_capped)
+                             || worker.load.load(Ordering::Relaxed) < own_depth
+@@ -1225,6 +1239,10 @@ impl Pool {
+                             .unwrap_or_default();
+                         (w.load.load(Ordering::Relaxed), coldness)
+                     });
++                // Kept connections are a seek's first choice, never a reason for work to
++                // wait when a throttled pool has nothing else.
++                let best = candidate(false)
++                    .or_else(|| (!spare && state.connecting == 0).then(|| candidate(true)).flatten());
+                 let reserved = match best {
+                     // Spread before pipelining: providers cap bandwidth per connection,
+                     // and a slot still connecting is idle soon (a cold start's prewarm).
+@@ -1278,9 +1296,10 @@ impl Pool {
+                     lane_waiting
+                         .get_or_insert_with(|| Load::watched(&self.lanes_waiting, &self.changed));
+                 }
++                let regrowth = state.next_growth(self.config.max_connections);
+                 drop(state);
+                 let beside = viewers.held_until(now).filter(|_| outranked);
+-                (reserved, live, held.into_iter().chain(linger).chain(beside).min())
++                (reserved, live, held.into_iter().chain(linger).chain(beside).chain(regrowth).min())
+             };
+             if reserved {
+                 // Connects run side by side; only choosing a connection is in order.
+diff --git a/crates/nntp/src/pool_contention_tests.rs b/crates/nntp/src/pool_contention_tests.rs
+index 34ca86ea..85fab1ea 100644
+--- a/crates/nntp/src/pool_contention_tests.rs
++++ b/crates/nntp/src/pool_contention_tests.rs
+@@ -187,3 +187,95 @@ async fn a_new_cache_reader_starts_while_another_holds_the_bound_and_they_share_
+     );
+     drop(held);
+ }
++
++async fn two_kept(pool: &Pool, ids: &[String]) -> crate::viewers::Viewing {
++    pool.set_keep_warm(true);
++    pool.lock().throttle = Some((2, Instant::now()));
++    let viewing = pool.downloads.viewers().enter();
++    pool.note_viewer(&ids[0]);
++    let (a, b) = tokio::join!(
++        pool.fetch(Command::Body, &ids[0], &Tag::UNTRACKED),
++        pool.fetch(Command::Body, &ids[1], &Tag::UNTRACKED)
++    );
++    assert!(a.is_ok() && b.is_ok());
++    tokio::time::sleep(KEEP_WARM_EVERY + Duration::from_millis(200)).await;
++    let state = pool.lock();
++    let kept = state.workers.iter().filter(|w| w.link.kept()).count();
++    assert_eq!((state.workers.len(), kept), (2, 2));
++    drop(state);
++    viewing
++}
++
++#[tokio::test]
++async fn a_cache_read_evicts_a_kept_connection_when_nothing_else_is_usable() {
++    let (server, ids) = served(8).await;
++    let pool = pool_on(&server, 8, Duration::from_secs(5));
++    let viewing = two_kept(&pool, &ids).await;
++    drop(viewing);
++    let got = timeout(
++        Duration::from_secs(2),
++        pool.fetch(Command::Body, &ids[2], &cache_tag(1, None)),
++    )
++    .await;
++    assert!(got.is_ok(), "cache read hung behind kept connections");
++}
++
++#[tokio::test]
++async fn a_queue_read_evicts_a_kept_connection_after_the_viewer_leaves() {
++    let (server, ids) = served(8).await;
++    let pool = pool_on(&server, 8, Duration::from_secs(5));
++    let viewing = two_kept(&pool, &ids).await;
++    tokio::time::sleep(STREAM_LINGER + Duration::from_millis(100)).await;
++    let tag = Tag {
++        workload: Workload::Queue,
++        ..Tag::UNTRACKED
++    };
++    let mut queued = Box::pin(pool.fetch(Command::Body, &ids[2], &tag));
++    assert!(still_waiting(&mut queued).await, "a viewer holds the queue");
++    pool.lock().throttle = Some((2, Instant::now()));
++    drop(viewing);
++    let got = timeout(STREAM_LINGER + Duration::from_secs(2), &mut queued).await;
++    assert!(got.is_ok(), "download stayed parked after the viewer left");
++}
++
++#[tokio::test]
++async fn a_kept_connection_leaving_the_set_wakes_waiters() {
++    let (server, ids) = served(8).await;
++    let pool = pool_on(&server, 8, Duration::from_secs(5));
++    let viewing = two_kept(&pool, &ids).await;
++    drop(viewing);
++    let woken = pool.changed.notified();
++    tokio::pin!(woken);
++    woken.as_mut().enable();
++    timeout(STREAM_LINGER + KEEP_WARM_EVERY * 4, woken)
++        .await
++        .expect("the slot's release is announced");
++}
++
++#[tokio::test]
++async fn a_waiter_wakes_when_a_throttled_pool_may_grow_again() {
++    let (server, _) = served(1).await;
++    let pool = pool_on(&server, 4, Duration::from_secs(5));
++    let mut flight = Flight::default();
++    let first = pool
++        .worker(Workload::Queue, true, None, None, &mut flight)
++        .await
++        .ok()
++        .flatten()
++        .expect("a first connection");
++    pool.lock().throttle = Some((
++        1,
++        Instant::now() - THROTTLE_STEP + Duration::from_millis(300),
++    ));
++    let mut second = Flight::default();
++    let grown = timeout(
++        Duration::from_secs(2),
++        pool.worker(Workload::Queue, true, None, None, &mut second),
++    )
++    .await;
++    assert!(
++        matches!(grown, Ok(Ok(Some(_)))),
++        "regrowth went unnoticed by a parked request"
++    );
++    drop(first);
++}
+-- 
+2.56.1
+

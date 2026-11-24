@@ -291,10 +291,13 @@ fn open(
     let size = meta.size();
     let fresh = !existed || file.metadata()?.len() != size;
     if fresh {
-        file.set_len(0)?;
-        if !reserve(&file, dir, size, gate) {
-            file.set_len(size)?;
-        }
+        reset(map_path, &file, |file| {
+            file.set_len(0)?;
+            if !reserve(file, dir, size, gate) {
+                file.set_len(size)?;
+            }
+            Ok(())
+        })?;
     }
     let stat = file.metadata()?;
     let identity = Identity {
@@ -312,6 +315,16 @@ fn open(
         },
         map,
     ))
+}
+
+// The map goes first: a crash mid-reset must not leave old Done marks trusted over zeros.
+fn reset(
+    map_path: &Path,
+    file: &File,
+    resize: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
+    SegmentMap::invalidate(map_path)?;
+    resize(file)
 }
 
 fn reserve(file: &File, dir: &Path, size: u64, gate: &SpaceGate) -> bool {
@@ -341,6 +354,39 @@ fn damaged(ledger: &Ledger, o: usize, output: &Output) -> Vec<Range<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_crash_while_resetting_a_truncated_file_leaves_no_done_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (data, map_path) = (dir.path().join("data"), dir.path().join("map"));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&data)
+            .unwrap();
+        file.set_len(4096).unwrap();
+        let identity = Identity {
+            inode: file.metadata().unwrap().ino(),
+            len: 4096,
+        };
+        let mut map = SegmentMap::open(&map_path, 2, None).unwrap();
+        map.set(0, Mark::Done).unwrap();
+        map.stamp(identity).unwrap();
+        drop(map);
+        file.set_len(1).unwrap();
+
+        let crashed = reset(&map_path, &file, |file| {
+            file.set_len(0)?;
+            file.set_len(4096)?;
+            Err(io::Error::other("power cut"))
+        });
+
+        assert!(crashed.is_err());
+        let reopened = SegmentMap::open(&map_path, 2, Some(identity)).unwrap();
+        assert_eq!(reopened.get(0), Mark::Pending, "old marks over zeroed data");
+    }
 
     #[tokio::test]
     async fn a_full_disk_is_a_disk_failure_not_a_provider_failure() {

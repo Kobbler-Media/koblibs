@@ -1,0 +1,88 @@
+From 92c4da72e79cc4a6ca83e8d2db87bf6a434282d3 Mon Sep 17 00:00:00 2001
+From: kob <kob@invalid>
+Date: Tue, 24 Nov 2026 14:04:01 +1100
+Subject: [PATCH 46/47] A keep-warm STAT counts only an article status as warm;
+ any other reply retires the connection
+
+---
+ crates/nntp/src/connection.rs | 50 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 47 insertions(+), 3 deletions(-)
+
+diff --git a/crates/nntp/src/connection.rs b/crates/nntp/src/connection.rs
+index 4d1f3ae7..74565cef 100644
+--- a/crates/nntp/src/connection.rs
++++ b/crates/nntp/src/connection.rs
+@@ -689,8 +689,9 @@ impl Connection {
+         self.queue(b"STAT <", message_id)
+     }
+ 
+-    /// Any answer keeps the connection warm, a 430 included. The reply is not the account's
+-    /// traffic, so it comes off the quota and the bandwidth bill.
++    /// An article status keeps the connection warm, a 430 included; anything else means the
++    /// session is not usable and it retires. The reply is not the account's traffic, so it
++    /// comes off the quota and the bandwidth bill.
+     pub(crate) async fn read_keep_warm(&mut self) -> Result<(), Error> {
+         self.take_pending()?;
+         let code = self.read_status().await?;
+@@ -700,7 +701,7 @@ impl Connection {
+         if let Some(usage) = &metered.usage {
+             usage.refund(reply);
+         }
+-        if code == 400 {
++        if !matches!(code, 223 | 423 | 430 | 451) {
+             return Err(self.unexpected(code));
+         }
+         self.link().mark_kept();
+@@ -1141,6 +1142,49 @@ mod tests {
+     use super::*;
+     use infinidysk_testkit::LoopbackServer;
+ 
++    #[tokio::test]
++    async fn only_an_article_status_counts_as_a_warm_reply() {
++        for (code, warm) in [
++            (223, true),
++            (423, true),
++            (430, true),
++            (451, true),
++            (400, false),
++            (480, false),
++            (502, false),
++            (500, false),
++        ] {
++            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++            let port = listener.local_addr().unwrap().port();
++            let server = tokio::spawn(async move {
++                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
++                let (socket, _) = listener.accept().await.unwrap();
++                let (read, mut write) = socket.into_split();
++                write.write_all(b"200 hello\r\n").await.unwrap();
++                let mut lines = BufReader::new(read).lines();
++                while let Ok(Some(line)) = lines.next_line().await {
++                    if line.starts_with("STAT") {
++                        let reply = format!("{code} status\r\n");
++                        write.write_all(reply.as_bytes()).await.unwrap();
++                    }
++                }
++            });
++            let endpoint = Endpoint::new(
++                "127.0.0.1",
++                port,
++                crate::TlsMode::Plain,
++                None,
++                Duration::from_secs(2),
++            )
++            .unwrap();
++            let mut conn = Connection::connect(&endpoint).await.unwrap();
++            conn.send_keep_warm("a@b").unwrap();
++            conn.flush().await.unwrap();
++            assert_eq!(conn.read_keep_warm().await.is_ok(), warm, "{code}");
++            server.abort();
++        }
++    }
++
+     struct Dropped(Arc<AtomicBool>);
+ 
+     impl Drop for Dropped {
+-- 
+2.56.1
+

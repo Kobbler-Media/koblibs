@@ -691,8 +691,9 @@ impl Connection {
         self.queue(b"STAT <", message_id)
     }
 
-    /// Any answer keeps the connection warm, a 430 included. The reply is not the account's
-    /// traffic, so it comes off the quota and the bandwidth bill.
+    /// An article status keeps the connection warm, a 430 included; anything else means the
+    /// session is not usable and it retires. The reply is not the account's traffic, so it
+    /// comes off the quota and the bandwidth bill.
     pub(crate) async fn read_keep_warm(&mut self) -> Result<(), Error> {
         self.take_pending()?;
         let code = self.read_status().await?;
@@ -702,7 +703,7 @@ impl Connection {
         if let Some(usage) = &metered.usage {
             usage.refund(reply);
         }
-        if code == 400 {
+        if !matches!(code, 223 | 423 | 430 | 451) {
             return Err(self.unexpected(code));
         }
         self.link().mark_kept();
@@ -1146,6 +1147,49 @@ fn parse_ypart(line: &[u8]) -> Option<(u64, usize)> {
 mod tests {
     use super::*;
     use crate::vendor::testkit::LoopbackServer;
+
+    #[tokio::test]
+    async fn only_an_article_status_counts_as_a_warm_reply() {
+        for (code, warm) in [
+            (223, true),
+            (423, true),
+            (430, true),
+            (451, true),
+            (400, false),
+            (480, false),
+            (502, false),
+            (500, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                let (socket, _) = listener.accept().await.unwrap();
+                let (read, mut write) = socket.into_split();
+                write.write_all(b"200 hello\r\n").await.unwrap();
+                let mut lines = BufReader::new(read).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if line.starts_with("STAT") {
+                        let reply = format!("{code} status\r\n");
+                        write.write_all(reply.as_bytes()).await.unwrap();
+                    }
+                }
+            });
+            let endpoint = Endpoint::new(
+                "127.0.0.1",
+                port,
+                crate::vendor::nntp::TlsMode::Plain,
+                None,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            let mut conn = Connection::connect(&endpoint).await.unwrap();
+            conn.send_keep_warm("a@b").unwrap();
+            conn.flush().await.unwrap();
+            assert_eq!(conn.read_keep_warm().await.is_ok(), warm, "{code}");
+            server.abort();
+        }
+    }
 
     struct Dropped(Arc<AtomicBool>);
 
