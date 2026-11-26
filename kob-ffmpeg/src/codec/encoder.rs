@@ -57,6 +57,7 @@ pub fn default_audio_sample_format(codec_name: &str) -> Result<crate::types::Sam
 /// `Send` but not `Sync` — encoder contexts are not thread-safe.
 pub struct Encoder {
     ptr: *mut ffi::AVCodecContext,
+    short_tail: Option<Frame>,
 }
 
 unsafe impl Send for Encoder {}
@@ -200,7 +201,10 @@ impl Encoder {
             )?;
         }
 
-        Ok(Self { ptr })
+        Ok(Self {
+            ptr,
+            short_tail: None,
+        })
     }
 
     /// Create a video encoder from configuration.
@@ -308,13 +312,32 @@ impl Encoder {
             }
         }
 
-        Ok(Self { ptr })
+        Ok(Self {
+            ptr,
+            short_tail: None,
+        })
     }
 
     /// Send a frame to the encoder.
     /// Returns `Ok(true)` if accepted, `Ok(false)` if the encoder is full (EAGAIN).
+    ///
+    /// A fixed-frame-size audio encoder accepts one short frame, as its last: libavcodec
+    /// rejects any frame after it with EINVAL. A filter graph rebuilt mid-stream flushes
+    /// exactly such a frame, so a short frame is held back until `send_eof`, and dropped
+    /// (under a frame's worth of audio) if more audio follows.
     pub fn send_frame(&mut self, frame: &Frame) -> Result<bool> {
-        let ret = unsafe { ffi::avcodec_send_frame(self.ptr, frame.as_ptr()) };
+        if self.takes_fixed_size_audio_frames() {
+            self.short_tail = None;
+            if frame.nb_samples() < self.frame_size() {
+                self.short_tail = Some(frame.clone_ref()?);
+                return Ok(true);
+            }
+        }
+        self.send_to_codec(frame.as_ptr())
+    }
+
+    fn send_to_codec(&mut self, frame: *const ffi::AVFrame) -> Result<bool> {
+        let ret = unsafe { ffi::avcodec_send_frame(self.ptr, frame) };
         if ret == ffi::AVERROR_EAGAIN {
             return Ok(false);
         }
@@ -322,9 +345,16 @@ impl Encoder {
         Ok(true)
     }
 
+    fn takes_fixed_size_audio_frames(&self) -> bool {
+        unsafe { (*self.ptr).codec_type == ffi::AVMEDIA_TYPE_AUDIO && (*self.ptr).frame_size > 0 }
+    }
+
     /// Send a flush signal to the encoder (NULL frame).
     /// Call this when there are no more frames to encode.
     pub fn send_eof(&mut self) -> Result<()> {
+        if let Some(tail) = self.short_tail.take() {
+            self.send_to_codec(tail.as_ptr())?;
+        }
         let ret = unsafe { ffi::avcodec_send_frame(self.ptr, ptr::null()) };
         if ret == ffi::AVERROR_EOF {
             return Ok(());

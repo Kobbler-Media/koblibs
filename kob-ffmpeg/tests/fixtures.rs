@@ -15,6 +15,7 @@ static AUDIO_SILENCE: OnceLock<PathBuf> = OnceLock::new();
 static CHAPTERED_M4B: OnceLock<PathBuf> = OnceLock::new();
 static CORRUPT_AUDIO_AVI: OnceLock<PathBuf> = OnceLock::new();
 static AC3_CHANNEL_CHANGE: OnceLock<PathBuf> = OnceLock::new();
+static AC3_CHANNEL_CHANGE_WITH_VIDEO: OnceLock<PathBuf> = OnceLock::new();
 static INTERLACED_TS: OnceLock<PathBuf> = OnceLock::new();
 static NEAR_BLACK_VIDEO: OnceLock<PathBuf> = OnceLock::new();
 static MINUTE_VIDEO: OnceLock<PathBuf> = OnceLock::new();
@@ -412,6 +413,40 @@ pub fn ac3_channel_change_mkv() -> PathBuf {
                 .status()
                 .expect("ffmpeg");
             assert!(status.success(), "failed to generate channel_change.mkv");
+            path
+        })
+        .clone()
+}
+
+/// [`ac3_channel_change_mkv`] under two seconds of H.264, for pipelines that want a video track.
+pub fn ac3_channel_change_with_video_mkv() -> PathBuf {
+    AC3_CHANNEL_CHANGE_WITH_VIDEO
+        .get_or_init(|| {
+            let path = fixture_dir().join("channel_change_video.mkv");
+            run_ffmpeg(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=duration=2:size=320x240:rate=25",
+                    "-i",
+                    ac3_channel_change_mkv().to_str().unwrap(),
+                    "-map",
+                    "0:v",
+                    "-map",
+                    "1:a",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-g",
+                    "25",
+                    "-c:a",
+                    "copy",
+                    "-shortest",
+                ],
+                &path,
+            );
             path
         })
         .clone()

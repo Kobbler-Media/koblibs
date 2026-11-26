@@ -836,12 +836,19 @@ fn test_jpeg_thumbnail_is_full_range() {
     )
     .unwrap();
     let mut child = Command::new("ffmpeg")
-        .args(["-v", "error", "-i", "-", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        .args([
+            "-v", "error", "-i", "-", "-f", "rawvideo", "-pix_fmt", "gray", "-",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(&frames[0].jpeg_data).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&frames[0].jpeg_data)
+        .unwrap();
     let gray = child.wait_with_output().unwrap().stdout;
     let bottom_row = &gray[gray.len() - 8..];
     assert!(
