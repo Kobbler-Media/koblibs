@@ -1,4 +1,5 @@
 use crate::codec::encoder::{EncodeResult, Encoder, VideoEncoderConfig};
+use crate::filter::graph::VideoColorInfo;
 use crate::frame::Frame;
 use crate::packet::Packet;
 use crate::scale::Scaler;
@@ -68,6 +69,8 @@ pub(crate) fn encode_jpeg(frame: &Frame, quality: i32) -> Result<(Vec<u8>, i32, 
         let scaler = Scaler::bilinear(src_w, src_h, src_fmt, src_w, src_h, target_fmt)?;
         let mut converted = Frame::new()?;
         scaler.scale_frame(frame, &mut converted)?;
+        // swscale 9 hands back the deprecated yuvj format as plain yuv420p (full range
+        // applied), and the encoder rejects a frame whose format differs from its own.
         converted_holder = converted;
         &converted_holder
     };
@@ -76,7 +79,7 @@ pub(crate) fn encode_jpeg(frame: &Frame, quality: i32) -> Result<(Vec<u8>, i32, 
         codec_name: "mjpeg".to_string(),
         width: src_w,
         height: src_h,
-        pixel_format: PixelFormat::from_raw(target_fmt),
+        pixel_format: PixelFormat::from_raw(frame_ref.format() as ffi::AVPixelFormat),
         time_base: TimeBase::new(1, 25),
         bit_rate: None,
         gop_size: None,
@@ -85,7 +88,10 @@ pub(crate) fn encode_jpeg(frame: &Frame, quality: i32) -> Result<(Vec<u8>, i32, 
         hw_frames_ctx: None,
         sample_aspect_ratio: None,
         frame_rate: None,
-        color: Default::default(),
+        color: VideoColorInfo {
+            color_range: ffi::AVCOL_RANGE_JPEG,
+            ..Default::default()
+        },
         options: Vec::new(),
     })?;
     encoder.send_frame(frame_ref)?;

@@ -819,6 +819,37 @@ fn test_extract_jpeg_thumbnails_magic_bytes() {
     }
 }
 
+#[test]
+fn test_jpeg_thumbnail_is_full_range() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let frames = kob_ffmpeg::thumbnails::extract_frames_sequential_with_hw(
+        &fixtures::near_black_video(),
+        0.0,
+        0.5,
+        1.0,
+        None,
+        31,
+        false,
+        None,
+    )
+    .unwrap();
+    let mut child = Command::new("ffmpeg")
+        .args(["-v", "error", "-i", "-", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&frames[0].jpeg_data).unwrap();
+    let gray = child.wait_with_output().unwrap().stdout;
+    let bottom_row = &gray[gray.len() - 8..];
+    assert!(
+        bottom_row.iter().all(|&y| y < 8),
+        "black must decode as full-range 0, not limited-range 16: {bottom_row:?}"
+    );
+}
+
 // --- Cancellation test ---
 
 #[test]
